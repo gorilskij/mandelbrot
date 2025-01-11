@@ -1,13 +1,14 @@
 use std::f64::consts::E;
 use num::complex::{Complex};
-use image::{ImageBuffer, Rgb};
+use image::{ImageBuffer, Rgb, imageops::sample_bilinear};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-const ITERATIONS: usize = 2000;
+const ITERATIONS: usize = 1000;
+const OVERSAMPLE: u32 = 2;
 
 fn calculate(c: Complex<f64>) -> f64 {
     let mut z: Complex<f64> = Complex::ZERO;
@@ -21,10 +22,10 @@ fn calculate(c: Complex<f64>) -> f64 {
 }
 
 fn main() {
-    let (w, h) = (10000, 10000);
+    let (w, h) = (6000, 6000);
 
-    let (x_min, x_max) = (-1.5, 0.5);
-    let (y_min, y_max) = (-1.0, 1.0);
+    let (x_min, x_max) = (-2.25, 0.75);
+    let (y_min, y_max) = (-1.5, 1.5);
 
     let x_range = x_max - x_min;
     let y_range = y_max - y_min;
@@ -44,10 +45,17 @@ fn main() {
                 let pixel = if val == 0.0 {
                     Rgb([0, 0, 0])
                 } else {
-                    // [0, 1]
-                    let red = val;
-                    let green = E.powf(-0.5 * ((val - 0.5) / 0.1).powi(2));
-                    let blue = E.powf(-0.5 * ((val - 0.2) / 0.1).powi(2));
+                    const SHARPNESS: f64 = 15.0; // [2,]
+
+                    let val = if val < 1.0 / SHARPNESS {
+                        SHARPNESS * val
+                    } else {
+                        -1.0 / (1.0 - 1.0 / SHARPNESS) * (val - 1.0)
+                    };
+
+                    let red = 0.0;
+                    let green = val;
+                    let blue = val;
 
                     Rgb([
                         (red * 255.0) as u8,
@@ -79,5 +87,17 @@ fn main() {
     pbar.finish();
     println!("ELAPSED {:?}", pbar.elapsed());
 
-    buffer.lock().unwrap().save("test.png").unwrap();
+    let mut buffer = buffer.lock().unwrap();
+
+    let mut new_buffer = ImageBuffer::new(w * OVERSAMPLE, h * OVERSAMPLE);
+    for r in 0..h * OVERSAMPLE {
+        for c in 0..w * OVERSAMPLE {
+            let y = r as f32 / (h * OVERSAMPLE) as f32;
+            let x = c as f32 / (w * OVERSAMPLE) as f32;
+            let px = sample_bilinear(&*buffer, x, y).unwrap();
+            new_buffer.put_pixel(c, r, px);
+        }
+    }
+
+    new_buffer.save("test.png").unwrap();
 }
