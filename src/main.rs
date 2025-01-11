@@ -9,7 +9,7 @@ use std::thread;
 use hsl::HSL;
 
 const ITERATIONS: usize = 2000;
-const OVERSAMPLE: u32 = 1;
+const OVERSAMPLE: u32 = 2;
 
 fn calculate(c: Complex<f64>) -> f64 {
     let mut z: Complex<f64> = Complex::ZERO;
@@ -34,24 +34,24 @@ fn apply_sharpness(val: f64, sharpness: f64) -> f64 {
 }
 
 fn main() {
-    let (w, h) = (12000, 12000);
+    let (w, h) = (6000, 6000);
 
-    let (x_min, x_max) = (-2.5, 1.0);
-    let (y_min, y_max) = (-1.75, 1.75);
+    let (x_min, x_max) = (-0.25, 0.0);
+    let (y_min, y_max) = (0.75, 1.0);
 
     let x_range = x_max - x_min;
     let y_range = y_max - y_min;
 
     let (tx, rx) = channel::<(u32, Vec<f64>)>();
 
-    let pbar = ProgressBar::new((h / 2 + 1) as u64);
+    let pbar = ProgressBar::new(h as u64);
 
     let buffer: ImageBuffer<Rgb<u8>, _> = ImageBuffer::new(w, h);
     let buffer = Arc::new(Mutex::new(buffer));
     let buffer_clone = Arc::clone(&buffer);
     let inserter = thread::spawn(move || {
         let mut buffer = buffer_clone.lock().unwrap();
-        for _ in 0..h / 2 + 1 {
+        for _ in 0..h {
             let (r, row) = rx.recv().unwrap();
             for (c, val) in row.into_iter().enumerate() {
                 let pixel = if val == 0.0 {
@@ -71,13 +71,13 @@ fn main() {
                     Rgb([r, g, b])
                 };
 
-                buffer.put_pixel(c as u32, r, pixel);
+                // buffer.put_pixel(c as u32, r, pixel);
                 buffer.put_pixel(c as u32, h - r - 1, pixel);
             }
         }
     });
 
-    (0..h / 2 + 1).into_par_iter().for_each(|r| {
+    (0..h).into_par_iter().for_each(|r| {
         let mut row = Vec::with_capacity(w as usize);
         for c in 0..w {
             let x = c as f64 / w as f64 * x_range + x_min;
