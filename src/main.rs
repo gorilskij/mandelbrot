@@ -19,10 +19,10 @@ fn calculate(c: Complex<f64>) -> f64 {
 }
 
 fn main() {
-    let (w, h) = (32_768, 32_768);
+    let (w, h) = (2000, 2000);
 
     let (x_min, x_max) = (-1.5, 0.5);
-    let (y_min, y_max) = (-1.5, 1.5);
+    let (y_min, y_max) = (-1.0, 1.0);
 
     let x_range = x_max - x_min;
     let y_range = y_max - y_min;
@@ -40,8 +40,8 @@ fn main() {
             let (r, row) = rx.recv().unwrap();
             for (c, val) in row.into_iter().enumerate() {
                 let pixel = Rgb([(val * 255.0) as u8, 0, 0]);
-                buffer.put_pixel(r, c as u32, pixel);
-                buffer.put_pixel(h - r - 1, c as u32, pixel);
+                buffer.put_pixel(c as u32, r, pixel);
+                buffer.put_pixel(c as u32, h - r - 1, pixel);
             }
         }
     });
@@ -63,5 +63,5 @@ fn main() {
     pbar.finish();
     println!("ELAPSED {:?}", pbar.elapsed());
 
-    buffer.lock().unwrap().save("../images/aura_32k.png").unwrap();
+    buffer.lock().unwrap().save("test.png").unwrap();
 }
