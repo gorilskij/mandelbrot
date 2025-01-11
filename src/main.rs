@@ -1,5 +1,5 @@
 use std::f64::consts::E;
-use num::complex::{Complex};
+use num::complex::Complex;
 use image::{ImageBuffer, Rgb, imageops::sample_bilinear};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
@@ -9,21 +9,39 @@ use std::thread;
 use hsl::HSL;
 
 const ITERATIONS: usize = 2000;
-const OVERSAMPLE: u32 = 2;
+const OVERSAMPLE: u32 = 1;
 
-fn calculate(c: Complex<f64>) -> f64 {
+fn calculate(c: Complex<f64>) -> (f64, f64) {
+    let mut to_mid = None;
+
     let mut z: Complex<f64> = Complex::ZERO;
     for i in 0..ITERATIONS {
         z = z * z + c;
-        if z.is_infinite() || z.is_nan() { return i as f64 / ITERATIONS as f64; }
-        // if z.norm() > 8.0 { return i as f64 / ITERATIONS as f64; }
+        if to_mid.is_none() && z.norm() > 4.0 {
+            to_mid = Some(i as f64 / ITERATIONS as f64);
+        }
+        if z.is_infinite() || z.is_nan() {
+            let to_inf = i as f64 / ITERATIONS as f64;
+            let to_mid = to_mid.unwrap_or(to_inf);
+            return (to_mid, to_inf);
+        }
     }
-    if z.is_infinite() || z.is_nan() { return 1.0; }
-    0.0
+    (0.0, 0.0)
+}
+
+fn apply_sharpness(val: f64, sharpness: f64) -> f64 {
+    assert!(val >= 0.0 && val <= 1.0);
+    assert!(sharpness >= 2.0);
+    if val < 1.0 / sharpness {
+        sharpness * val
+    } else {
+        // -1.0 / (1.0 - 1.0 / sharpness) * (val - 1.0)
+        1.0
+    }
 }
 
 fn main() {
-    let (w, h) = (6000, 6000);
+    let (w, h) = (12000, 12000);
 
     let (x_min, x_max) = (-2.5, 1.0);
     let (y_min, y_max) = (-1.75, 1.75);
@@ -31,7 +49,7 @@ fn main() {
     let x_range = x_max - x_min;
     let y_range = y_max - y_min;
 
-    let (tx, rx) = channel::<(u32, Vec<f64>)>();
+    let (tx, rx) = channel::<(u32, Vec<(f64, f64)>)>();
 
     let pbar = ProgressBar::new((h / 2 + 1) as u64);
 
@@ -43,21 +61,16 @@ fn main() {
         for _ in 0..h / 2 + 1 {
             let (r, row) = rx.recv().unwrap();
             for (c, val) in row.into_iter().enumerate() {
-                let pixel = if val == 0.0 {
+                let pixel = if val == (0.0, 0.0) {
                     Rgb([0, 0, 0])
                 } else {
-                    const SHARPNESS: f64 = 15.0; // [2,]
-
-                    let val = if val < 1.0 / SHARPNESS {
-                        SHARPNESS * val
-                    } else {
-                        -1.0 / (1.0 - 1.0 / SHARPNESS) * (val - 1.0)
-                    };
+                    let h = apply_sharpness(val.0, 30.0) / 6.0;
+                    let l = apply_sharpness(val.1, 20.0) * 0.6;
 
                     let hsl = HSL {
-                        h: val * 360.0,
+                        h: h * 360.0,
                         s: 1.0,
-                        l: 0.5,
+                        l,
                     };
 
                     let (r, g, b) = hsl.to_rgb();
@@ -88,7 +101,7 @@ fn main() {
     pbar.finish();
     println!("ELAPSED {:?}", pbar.elapsed());
 
-    let mut buffer = buffer.lock().unwrap();
+    let buffer = buffer.lock().unwrap();
 
     let mut new_buffer = ImageBuffer::new(w * OVERSAMPLE, h * OVERSAMPLE);
     for r in 0..h * OVERSAMPLE {
@@ -100,5 +113,5 @@ fn main() {
         }
     }
 
-    new_buffer.save("test.png").unwrap();
+    new_buffer.save("test0.png").unwrap();
 }
