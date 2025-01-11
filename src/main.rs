@@ -1,3 +1,4 @@
+use std::f64::consts::E;
 use num::complex::{Complex};
 use image::{ImageBuffer, Rgb};
 use indicatif::ProgressBar;
@@ -6,20 +7,21 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-const ITERATIONS: usize = 1000;
+const ITERATIONS: usize = 2000;
 
 fn calculate(c: Complex<f64>) -> f64 {
     let mut z: Complex<f64> = Complex::ZERO;
     for i in 0..ITERATIONS {
         z = z * z + c;
-        if z.is_infinite() || z.is_nan() { return i as f64 / ITERATIONS as f64; }
+        // if z.is_infinite() || z.is_nan() { return i as f64 / ITERATIONS as f64; }
+        if z.norm() > 8.0 { return i as f64 / ITERATIONS as f64; }
     }
     if z.is_infinite() || z.is_nan() { return 1.0; }
     0.0
 }
 
 fn main() {
-    let (w, h) = (2000, 2000);
+    let (w, h) = (10000, 10000);
 
     let (x_min, x_max) = (-1.5, 0.5);
     let (y_min, y_max) = (-1.0, 1.0);
@@ -39,7 +41,21 @@ fn main() {
         for _ in 0..h / 2 + 1 {
             let (r, row) = rx.recv().unwrap();
             for (c, val) in row.into_iter().enumerate() {
-                let pixel = Rgb([(val * 255.0) as u8, 0, 0]);
+                let pixel = if val == 0.0 {
+                    Rgb([0, 0, 0])
+                } else {
+                    // [0, 1]
+                    let red = val;
+                    let green = E.powf(-0.5 * ((val - 0.5) / 0.1).powi(2));
+                    let blue = E.powf(-0.5 * ((val - 0.2) / 0.1).powi(2));
+
+                    Rgb([
+                        (red * 255.0) as u8,
+                        (green * 255.0) as u8,
+                        (blue * 255.0) as u8,
+                    ])
+                };
+
                 buffer.put_pixel(c as u32, r, pixel);
                 buffer.put_pixel(c as u32, h - r - 1, pixel);
             }
