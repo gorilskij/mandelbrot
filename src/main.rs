@@ -61,11 +61,11 @@ fn render(
     h: usize,
     // the coordinate of the top-left corner (x, y)
     origin: (f64, f64),
-    scale: f64,
+    view: f64,
 ) {
     let (x_min, y_min) = origin;
-    let x_range = w as f64 * scale;
-    let y_range = h as f64 * scale;
+    let x_range = w as f64 * view;
+    let y_range = h as f64 * view;
 
     let pbar = ProgressBar::new(h as u64);
     (0..h).for_each(|r| {
@@ -97,22 +97,31 @@ fn main() {
 
     window.set_target_fps(60);
 
-    let mut origin = (-1.0, -1.0);
-    let mut scale = 1.0 / 1000.0;
+    let mut origin_x = -1.0;
+    let mut origin_y = -1.0;
+    // displayed range / pixel size (zooming in means reducing view)
+    let mut view = 1.0 / 500.0;
 
     let mut cached = None;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         if let Some((mouse_x, mouse_y)) = window.get_mouse_pos(MouseMode::Discard) {
-            if let Some((scroll_x, scroll_y)) = window.get_scroll_wheel() {
-                scale *= 1.0 - (scroll_y as f64 / 100.0).clamp(-0.1, 0.1);
-                println!("new scale {}", scale);
+            if let Some((_, scroll_y)) = window.get_scroll_wheel() {
+                let multiplier = 1.0 + (scroll_y as f64 / 100.0).clamp(-0.2, 0.2);
+
+                view /= multiplier;
+
+                let pos_x = mouse_x as f64 * view + origin_x;
+                let pos_y = mouse_y as f64 * view + origin_y;
+
+                origin_x = pos_x + (origin_x - pos_x) / multiplier;
+                origin_y = pos_y + (origin_y - pos_y) / multiplier;
             }
         }
 
-        let cache_key = (origin, scale);
+        let cache_key = (origin_x, origin_y, view);
         if cached != Some(cache_key) {
-            render(&mut buffer, w, h, origin, scale);
+            render(&mut buffer, w, h, (origin_x, origin_y), view);
             cached = Some(cache_key);
         }
 
