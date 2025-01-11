@@ -1,13 +1,12 @@
-use std::f64::consts::E;
+mod image_buffer;
+
 use num::complex::Complex;
-use image::{ImageBuffer, Rgb, imageops::sample_bilinear};
+use minifb::{Key, MouseMode, Window, WindowOptions};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
-use std::sync::mpsc::channel;
-use std::sync::{Arc, Mutex};
-use std::thread;
 use hsl::HSL;
 
+const FILE_PATH: &str = "test.png";
 const ITERATIONS: usize = 2000;
 const OVERSAMPLE: u32 = 2;
 
@@ -33,78 +32,92 @@ fn apply_sharpness(val: f64, sharpness: f64) -> f64 {
     }
 }
 
-fn main() {
-    let (w, h) = (6000, 6000);
+fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
 
-    let (x_min, x_max) = (-0.25, 0.0);
-    let (y_min, y_max) = (0.75, 1.0);
+fn render_pixel(val: f64) -> u32 {
+    if val == 0.0 {
+        0
+    } else {
+        let h = apply_sharpness(val, 30.0) / 6.0;
+        let l = apply_sharpness(val, 20.0) * 0.6;
 
-    let x_range = x_max - x_min;
-    let y_range = y_max - y_min;
+        let hsl = HSL {
+            h: h * 360.0,
+            s: 1.0,
+            l,
+        };
 
-    let (tx, rx) = channel::<(u32, Vec<f64>)>();
+        let (r, g, b) = hsl.to_rgb();
+
+        rgb_to_u32(r, g, b)
+    }
+}
+
+fn render(
+    buf: &mut [u32],
+    w: usize,
+    h: usize,
+    // the coordinate of the top-left corner (x, y)
+    origin: (f64, f64),
+    scale: f64,
+) {
+    let (x_min, y_min) = origin;
+    let x_range = w as f64 * scale;
+    let y_range = h as f64 * scale;
 
     let pbar = ProgressBar::new(h as u64);
-
-    let buffer: ImageBuffer<Rgb<u8>, _> = ImageBuffer::new(w, h);
-    let buffer = Arc::new(Mutex::new(buffer));
-    let buffer_clone = Arc::clone(&buffer);
-    let inserter = thread::spawn(move || {
-        let mut buffer = buffer_clone.lock().unwrap();
-        for _ in 0..h {
-            let (r, row) = rx.recv().unwrap();
-            for (c, val) in row.into_iter().enumerate() {
-                let pixel = if val == 0.0 {
-                    Rgb([0, 0, 0])
-                } else {
-                    let h = apply_sharpness(val, 30.0) / 6.0;
-                    let l = apply_sharpness(val, 20.0) * 0.6;
-
-                    let hsl = HSL {
-                        h: h * 360.0,
-                        s: 1.0,
-                        l,
-                    };
-
-                    let (r, g, b) = hsl.to_rgb();
-
-                    Rgb([r, g, b])
-                };
-
-                // buffer.put_pixel(c as u32, r, pixel);
-                buffer.put_pixel(c as u32, h - r - 1, pixel);
-            }
-        }
-    });
-
-    (0..h).into_par_iter().for_each(|r| {
-        let mut row = Vec::with_capacity(w as usize);
+    (0..h).for_each(|r| {
         for c in 0..w {
             let x = c as f64 / w as f64 * x_range + x_min;
             let y = r as f64 / h as f64 * y_range + y_min;
             let val = calculate(Complex::new(x, y));
-            row.push(val);
+            // row_buf[c] = val;
+
+            buf[r * w + c] = render_pixel(val);
         }
-        tx.send((r, row)).unwrap();
         pbar.inc(1);
     });
-
-    inserter.join().unwrap();
-
     pbar.finish();
-    println!("ELAPSED {:?}", pbar.elapsed());
+}
 
-    let buffer = buffer.lock().unwrap();
+fn main() {
+    let w = 1000;
+    let h = 600;
 
-    let mut new_buffer = ImageBuffer::new(w * OVERSAMPLE, h * OVERSAMPLE);
-    for r in 0..h * OVERSAMPLE {
-        for c in 0..w * OVERSAMPLE {
-            let y = r as f32 / (h * OVERSAMPLE) as f32;
-            let x = c as f32 / (w * OVERSAMPLE) as f32;
-            let px = sample_bilinear(&*buffer, x, y).unwrap();
-            new_buffer.put_pixel(c, r, px);
+    let mut buffer: Vec<u32> = vec![0; w * h];
+
+    let mut window = Window::new(
+        "Test - ESC to exit",
+        w, h,
+        WindowOptions::default(),
+    )
+        .unwrap();
+
+    window.set_target_fps(60);
+
+    let mut origin = (-1.0, -1.0);
+    let mut scale = 1.0 / 1000.0;
+
+    let mut cached = None;
+
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        if let Some((mouse_x, mouse_y)) = window.get_mouse_pos(MouseMode::Discard) {
+            if let Some((scroll_x, scroll_y)) = window.get_scroll_wheel() {
+                scale *= 1.0 - (scroll_y as f64 / 100.0).clamp(-0.1, 0.1);
+                println!("new scale {}", scale);
+            }
         }
-    }
 
-    new_buffer.save("test.png").unwrap();
+        let cache_key = (origin, scale);
+        if cached != Some(cache_key) {
+            render(&mut buffer, w, h, origin, scale);
+            cached = Some(cache_key);
+        }
+
+        window
+            .update_with_buffer(&buffer, w, h)
+            .unwrap();
+    }
 }
