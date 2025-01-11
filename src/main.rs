@@ -11,22 +11,15 @@ use hsl::HSL;
 const ITERATIONS: usize = 2000;
 const OVERSAMPLE: u32 = 1;
 
-fn calculate(c: Complex<f64>) -> (f64, f64) {
-    let mut to_mid = None;
-
+fn calculate(c: Complex<f64>) -> f64 {
     let mut z: Complex<f64> = Complex::ZERO;
     for i in 0..ITERATIONS {
         z = z * z + c;
-        if to_mid.is_none() && z.norm() > 4.0 {
-            to_mid = Some(i as f64 / ITERATIONS as f64);
-        }
-        if z.is_infinite() || z.is_nan() {
-            let to_inf = i as f64 / ITERATIONS as f64;
-            let to_mid = to_mid.unwrap_or(to_inf);
-            return (to_mid, to_inf);
+        if z.norm() > 4.0 {
+            return i as f64 / ITERATIONS as f64;
         }
     }
-    (0.0, 0.0)
+    0.0
 }
 
 fn apply_sharpness(val: f64, sharpness: f64) -> f64 {
@@ -49,7 +42,7 @@ fn main() {
     let x_range = x_max - x_min;
     let y_range = y_max - y_min;
 
-    let (tx, rx) = channel::<(u32, Vec<(f64, f64)>)>();
+    let (tx, rx) = channel::<(u32, Vec<f64>)>();
 
     let pbar = ProgressBar::new((h / 2 + 1) as u64);
 
@@ -61,11 +54,11 @@ fn main() {
         for _ in 0..h / 2 + 1 {
             let (r, row) = rx.recv().unwrap();
             for (c, val) in row.into_iter().enumerate() {
-                let pixel = if val == (0.0, 0.0) {
+                let pixel = if val == 0.0 {
                     Rgb([0, 0, 0])
                 } else {
-                    let h = apply_sharpness(val.0, 30.0) / 6.0;
-                    let l = apply_sharpness(val.1, 20.0) * 0.6;
+                    let h = apply_sharpness(val, 30.0) / 6.0;
+                    let l = apply_sharpness(val, 20.0) * 0.6;
 
                     let hsl = HSL {
                         h: h * 360.0,
@@ -113,5 +106,5 @@ fn main() {
         }
     }
 
-    new_buffer.save("test0.png").unwrap();
+    new_buffer.save("test.png").unwrap();
 }
