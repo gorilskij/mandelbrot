@@ -1,10 +1,10 @@
 mod image_buffer;
 
-use num::complex::Complex;
-use minifb::{Key, MouseMode, Window, WindowOptions};
-use indicatif::ProgressBar;
-use rayon::prelude::*;
 use hsl::HSL;
+use indicatif::ProgressBar;
+use minifb::{Key, MouseMode, Window, WindowOptions};
+use num::complex::Complex;
+use rayon::prelude::*;
 
 const FILE_PATH: &str = "test.png";
 const ITERATIONS: usize = 2000;
@@ -27,8 +27,8 @@ fn apply_sharpness(val: f64, sharpness: f64) -> f64 {
     if val < 1.0 / sharpness {
         sharpness * val
     } else {
-        // -1.0 / (1.0 - 1.0 / sharpness) * (val - 1.0)
-        1.0
+        -1.0 / (1.0 - 1.0 / sharpness) * (val - 1.0)
+        // 1.0
     }
 }
 
@@ -55,6 +55,12 @@ fn render_pixel(val: f64) -> u32 {
     }
 }
 
+#[derive(Copy, Clone)]
+struct BufView(*mut u32);
+
+unsafe impl Send for BufView {}
+unsafe impl Sync for BufView {}
+
 fn render(
     buf: &mut [u32],
     w: usize,
@@ -67,15 +73,22 @@ fn render(
     let x_range = w as f64 * view;
     let y_range = h as f64 * view;
 
-    let pbar = ProgressBar::new(h as u64);
-    (0..h).for_each(|r| {
+    let buf_view = BufView(buf.as_mut_ptr());
+
+    let pbar = &ProgressBar::new(h as u64);
+    (0..h).into_par_iter().for_each(move |r| {
+        let buf_view = buf_view;
+
         for c in 0..w {
             let x = c as f64 / w as f64 * x_range + x_min;
             let y = r as f64 / h as f64 * y_range + y_min;
             let val = calculate(Complex::new(x, y));
-            // row_buf[c] = val;
 
-            buf[r * w + c] = render_pixel(val);
+            // SAFETY: all writes are disjoint
+            unsafe {
+                buf_view.0.offset((r * w + c) as isize).write(render_pixel(val));
+            }
+            // buf[r * w + c] = render_pixel(val);
         }
         pbar.inc(1);
     });
@@ -88,12 +101,7 @@ fn main() {
 
     let mut buffer: Vec<u32> = vec![0; w * h];
 
-    let mut window = Window::new(
-        "Test - ESC to exit",
-        w, h,
-        WindowOptions::default(),
-    )
-        .unwrap();
+    let mut window = Window::new("Mandelbrot", w, h, WindowOptions::default()).unwrap();
 
     window.set_target_fps(60);
 
@@ -125,8 +133,6 @@ fn main() {
             cached = Some(cache_key);
         }
 
-        window
-            .update_with_buffer(&buffer, w, h)
-            .unwrap();
+        window.update_with_buffer(&buffer, w, h).unwrap();
     }
 }
