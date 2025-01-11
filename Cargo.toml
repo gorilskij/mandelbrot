@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+hsl = "0.1.1"
 image = "0.25.5"
 indicatif = "0.17.9"
 num = "0.4.3"

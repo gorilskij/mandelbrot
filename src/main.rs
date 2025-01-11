@@ -6,16 +6,17 @@ use rayon::prelude::*;
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use hsl::HSL;
 
-const ITERATIONS: usize = 1000;
+const ITERATIONS: usize = 2000;
 const OVERSAMPLE: u32 = 2;
 
 fn calculate(c: Complex<f64>) -> f64 {
     let mut z: Complex<f64> = Complex::ZERO;
     for i in 0..ITERATIONS {
         z = z * z + c;
-        // if z.is_infinite() || z.is_nan() { return i as f64 / ITERATIONS as f64; }
-        if z.norm() > 8.0 { return i as f64 / ITERATIONS as f64; }
+        if z.is_infinite() || z.is_nan() { return i as f64 / ITERATIONS as f64; }
+        // if z.norm() > 8.0 { return i as f64 / ITERATIONS as f64; }
     }
     if z.is_infinite() || z.is_nan() { return 1.0; }
     0.0
@@ -24,8 +25,8 @@ fn calculate(c: Complex<f64>) -> f64 {
 fn main() {
     let (w, h) = (6000, 6000);
 
-    let (x_min, x_max) = (-2.25, 0.75);
-    let (y_min, y_max) = (-1.5, 1.5);
+    let (x_min, x_max) = (-2.5, 1.0);
+    let (y_min, y_max) = (-1.75, 1.75);
 
     let x_range = x_max - x_min;
     let y_range = y_max - y_min;
@@ -53,15 +54,15 @@ fn main() {
                         -1.0 / (1.0 - 1.0 / SHARPNESS) * (val - 1.0)
                     };
 
-                    let red = 0.0;
-                    let green = val;
-                    let blue = val;
+                    let hsl = HSL {
+                        h: val * 360.0,
+                        s: 1.0,
+                        l: 0.5,
+                    };
 
-                    Rgb([
-                        (red * 255.0) as u8,
-                        (green * 255.0) as u8,
-                        (blue * 255.0) as u8,
-                    ])
+                    let (r, g, b) = hsl.to_rgb();
+
+                    Rgb([r, g, b])
                 };
 
                 buffer.put_pixel(c as u32, r, pixel);
