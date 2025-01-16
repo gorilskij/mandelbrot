@@ -1,6 +1,6 @@
 use hsl::HSL;
 use indicatif::ProgressBar;
-use minifb::{MouseMode, Window, WindowOptions};
+use minifb::{Key, MouseMode, Window, WindowOptions};
 use num::complex::Complex;
 use rayon::prelude::*;
 
@@ -296,14 +296,21 @@ fn main() {
         }
 
         let cache_key = (origin_x, origin_y, view);
-        if cached != Some(cache_key) {
-            if first_time {
-                render(&mut buffer, w, h, (origin_x, origin_y), view);
-                first_time = false;
-            } else if let Some((center_x, center_y, multiplier)) = mouse01 {
-                zoom(&mut buffer, h, w, center_x, center_y, multiplier);
-            }
+        if window.is_key_down(Key::Space) {
+            render(&mut buffer, w, h, (origin_x, origin_y), view);
             cached = Some(cache_key);
+            // window.update_with_buffer(&buffer, w, h).unwrap();
+        } else {
+            if cached != Some(cache_key) {
+                if first_time {
+                    render(&mut buffer, w, h, (origin_x, origin_y), view);
+                    first_time = false;
+                } else if let Some((center_x, center_y, multiplier)) = mouse01 {
+                    zoom(&mut buffer, h, w, center_x, center_y, multiplier);
+                }
+                cached = Some(cache_key);
+                // window.update_with_buffer(&buffer, w, h).unwrap();
+            }
         }
 
         window.update_with_buffer(&buffer, w, h).unwrap();
