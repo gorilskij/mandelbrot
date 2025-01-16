@@ -1,6 +1,6 @@
 use hsl::HSL;
 use indicatif::ProgressBar;
-use minifb::{Key, MouseMode, Window, WindowOptions};
+use minifb::{MouseMode, Window, WindowOptions};
 use num::complex::Complex;
 use rayon::prelude::*;
 
@@ -60,7 +60,12 @@ fn render_pixel(val: f64) -> u32 {
 }
 
 // Returns (&source, &mut destination)
-fn select_rows(buf: &mut [u32], width: usize, source_row: usize, destination_row: usize) -> (&[u32], &mut [u32]) {
+fn select_rows(
+    buf: &mut [u32],
+    width: usize,
+    source_row: usize,
+    destination_row: usize,
+) -> (&[u32], &mut [u32]) {
     let (row1, row2) = if source_row < destination_row {
         (source_row, destination_row)
     } else {
@@ -97,7 +102,12 @@ impl<'a> ColMut<'a> {
     }
 }
 
-fn select_cols(buf: &mut [u32], width: usize, source_col: usize, destination_col: usize) -> (Col, ColMut) {
+fn select_cols(
+    buf: &mut [u32],
+    width: usize,
+    source_col: usize,
+    destination_col: usize,
+) -> (Col, ColMut) {
     assert_ne!(source_col, destination_col);
     assert!(source_col < width);
     assert!(destination_col < width);
@@ -105,57 +115,99 @@ fn select_cols(buf: &mut [u32], width: usize, source_col: usize, destination_col
     // SAFETY: the two columns are nonoverlapping
     let buf_ref = unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) };
 
-    (Col { buf: buf_ref, width, col: source_col }, ColMut { buf, width, col: destination_col })
+    (
+        Col {
+            buf: buf_ref,
+            width,
+            col: source_col,
+        },
+        ColMut {
+            buf,
+            width,
+            col: destination_col,
+        },
+    )
 }
 
 /// center_x and center_y are [0, 1)
-fn zoom(buf: &mut [u32], height: usize, width: usize, center_x: f64, center_y: f64, multiplier: f64) {
-    if multiplier > 1.0 {
-        // zooming in
+fn zoom(
+    buf: &mut [u32],
+    height: usize,
+    width: usize,
+    center_x: f64,
+    center_y: f64,
+    multiplier: f64,
+) {
+    let center_row = (center_y * height as f64) as usize;
 
-        let center_row = (center_y * height as f64) as usize;
+    let row_iter = if multiplier > 1.0 {
+        (center_row + 1..height).rev().chain(0..center_row - 1)
+    } else {
+        (0..center_row - 1).rev().chain(center_row + 1..height)
+    };
 
-        for row in (center_row + 1..height).rev().chain(0..center_row - 1) {
-            let new_location = if row > center_row {
-                ((row - center_row) as f64 * multiplier) as usize + center_row
-            } else if let Some(nl) = center_row.checked_sub(((center_row - row) as f64 * multiplier) as usize) {
-                nl
-            } else {
-                continue;
-            };
+    for row in row_iter {
+        let new_location = if row > center_row {
+            ((row - center_row) as f64 * multiplier) as usize + center_row
+        } else if let Some(nl) =
+            center_row.checked_sub(((center_row - row) as f64 * multiplier) as usize)
+        {
+            nl
+        } else {
+            continue;
+        };
 
-            if new_location >= height {
-                continue; // TODO: fix
-            }
-
-            if new_location != row {
-                let (src, dest) = select_rows(buf, width, row, new_location);
-                dest.copy_from_slice(src);
-            }
+        if new_location >= height {
+            continue; // TODO: fix
         }
 
-        let center_col = (center_x * width as f64) as usize;
-
-        for col in (center_col + 1..width).rev().chain(0..center_col - 1) {
-            let new_location = if col > center_col {
-                ((col - center_col) as f64 * multiplier) as usize + center_col
-            } else if let Some(nl) = center_col.checked_sub(((center_col - col) as f64 * multiplier) as usize) {
-                nl
-            } else {
-                continue;
-            };
-
-            if new_location >= width {
-                continue;
-            }
-
-            if new_location != col {
-                let (src, mut dest) = select_cols(buf, width, col, new_location);
-                dest.copy_from(src);
-            }
+        if row > center_row && new_location <= center_row
+            || row < center_row && new_location >= center_row
+        {
+            continue;
         }
-    } else if multiplier < 1.0 {
-        todo!()
+
+        if new_location != row {
+            let (src, dest) = select_rows(buf, width, row, new_location);
+            dest.copy_from_slice(src);
+        }
+    }
+
+    ////////////////////
+
+    let center_col = (center_x * width as f64) as usize;
+
+    let col_iter = if multiplier > 1.0 {
+        (center_col + 1..width).rev().chain(0..center_col - 1)
+    } else {
+        (0..center_col - 1).rev().chain(center_col + 1..width)
+    };
+
+    for col in col_iter {
+        let new_location = if col > center_col {
+            ((col - center_col) as f64 * multiplier) as usize + center_col
+        } else if let Some(nl) =
+            center_col.checked_sub(((center_col - col) as f64 * multiplier) as usize)
+        {
+            nl
+        } else {
+            continue;
+        };
+
+        if new_location >= width {
+            continue;
+        }
+
+        if col > center_col && new_location <= center_col
+            || col < center_col && new_location >= center_col
+        {
+            continue;
+        }
+
+        if new_location != col {
+            let (src, mut dest) = select_cols(buf, width, col, new_location);
+            dest.copy_from(src);
+        }
     }
 }
 
@@ -190,7 +242,10 @@ fn render(
 
             // SAFETY: all writes are disjoint
             unsafe {
-                buf_view.0.offset((r * w + c) as isize).write(render_pixel(val));
+                buf_view
+                    .0
+                    .offset((r * w + c) as isize)
+                    .write(render_pixel(val));
             }
         }
         pbar.inc(1);
@@ -224,7 +279,11 @@ fn main() {
             if let Some((_, scroll_y)) = window.get_scroll_wheel() {
                 let multiplier = 1.0 + (scroll_y as f64 / 100.0).clamp(-0.2, 0.2);
 
-                mouse01 = Some((mouse_x as f64 / w as f64, mouse_y as f64 / h as f64, multiplier));
+                mouse01 = Some((
+                    mouse_x as f64 / w as f64,
+                    mouse_y as f64 / h as f64,
+                    multiplier,
+                ));
 
                 view /= multiplier;
 
