@@ -1,5 +1,3 @@
-mod image_buffer;
-
 use hsl::HSL;
 use indicatif::ProgressBar;
 use minifb::{Key, MouseMode, Window, WindowOptions};
