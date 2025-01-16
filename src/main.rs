@@ -1,5 +1,3 @@
-mod image_buffer;
-
 use hsl::HSL;
 use indicatif::ProgressBar;
 use minifb::{Key, MouseMode, Window, WindowOptions};
@@ -40,18 +38,176 @@ fn render_pixel(val: f64) -> u32 {
     if val == 0.0 {
         0
     } else {
-        let h = apply_sharpness(val, 30.0) / 6.0;
-        let l = apply_sharpness(val, 20.0) * 0.6;
+        // let h = apply_sharpness(val, 30.0) / 6.0;
+        // let l = apply_sharpness(val, 20.0) * 0.6;
+        //
+        // let hsl = HSL {
+        //     h: h * 360.0,
+        //     s: 1.0,
+        //     l,
+        // };
 
         let hsl = HSL {
-            h: h * 360.0,
+            h: val * 360.0,
             s: 1.0,
-            l,
+            l: 0.5,
         };
 
         let (r, g, b) = hsl.to_rgb();
 
         rgb_to_u32(r, g, b)
+    }
+}
+
+// Returns (&source, &mut destination)
+fn select_rows(
+    buf: &mut [u32],
+    width: usize,
+    source_row: usize,
+    destination_row: usize,
+) -> (&[u32], &mut [u32]) {
+    let (row1, row2) = if source_row < destination_row {
+        (source_row, destination_row)
+    } else {
+        (destination_row, source_row)
+    };
+    let (out1, rest) = buf[row1 * width..].split_at_mut(width);
+    let out2 = &mut rest[(row2 - row1 - 1) * width..(row2 - row1) * width];
+    if source_row < destination_row {
+        (out1, out2)
+    } else {
+        (out2, out1)
+    }
+}
+
+struct Col<'a> {
+    buf: &'a [u32],
+    width: usize,
+    col: usize,
+}
+struct ColMut<'a> {
+    buf: &'a mut [u32],
+    width: usize,
+    col: usize,
+}
+
+impl<'a> ColMut<'a> {
+    fn copy_from(&mut self, src: Col<'_>) {
+        assert_eq!(self.width, src.width);
+        assert_eq!(self.buf.as_ptr(), src.buf.as_ptr());
+        assert_ne!(self.col, src.col);
+        for i in (0..self.buf.len()).step_by(self.width) {
+            self.buf[i + self.col] = src.buf[i + src.col];
+        }
+    }
+}
+
+fn select_cols(
+    buf: &mut [u32],
+    width: usize,
+    source_col: usize,
+    destination_col: usize,
+) -> (Col, ColMut) {
+    assert_ne!(source_col, destination_col);
+    assert!(source_col < width);
+    assert!(destination_col < width);
+
+    // SAFETY: the two columns are nonoverlapping
+    let buf_ref = unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) };
+
+    (
+        Col {
+            buf: buf_ref,
+            width,
+            col: source_col,
+        },
+        ColMut {
+            buf,
+            width,
+            col: destination_col,
+        },
+    )
+}
+
+/// center_x and center_y are [0, 1)
+fn zoom(
+    buf: &mut [u32],
+    height: usize,
+    width: usize,
+    center_x: f64,
+    center_y: f64,
+    multiplier: f64,
+) {
+    let center_row = (center_y * height as f64) as usize;
+
+    let row_iter = if multiplier > 1.0 {
+        (center_row + 1..height).rev().chain(0..center_row - 1)
+    } else {
+        (0..center_row - 1).rev().chain(center_row + 1..height)
+    };
+
+    for row in row_iter {
+        let new_location = if row > center_row {
+            ((row - center_row) as f64 * multiplier) as usize + center_row
+        } else if let Some(nl) =
+            center_row.checked_sub(((center_row - row) as f64 * multiplier) as usize)
+        {
+            nl
+        } else {
+            continue;
+        };
+
+        if new_location >= height {
+            continue; // TODO: fix
+        }
+
+        if row > center_row && new_location <= center_row
+            || row < center_row && new_location >= center_row
+        {
+            continue;
+        }
+
+        if new_location != row {
+            let (src, dest) = select_rows(buf, width, row, new_location);
+            dest.copy_from_slice(src);
+        }
+    }
+
+    ////////////////////
+
+    let center_col = (center_x * width as f64) as usize;
+
+    let col_iter = if multiplier > 1.0 {
+        (center_col + 1..width).rev().chain(0..center_col - 1)
+    } else {
+        (0..center_col - 1).rev().chain(center_col + 1..width)
+    };
+
+    for col in col_iter {
+        let new_location = if col > center_col {
+            ((col - center_col) as f64 * multiplier) as usize + center_col
+        } else if let Some(nl) =
+            center_col.checked_sub(((center_col - col) as f64 * multiplier) as usize)
+        {
+            nl
+        } else {
+            continue;
+        };
+
+        if new_location >= width {
+            continue;
+        }
+
+        if col > center_col && new_location <= center_col
+            || col < center_col && new_location >= center_col
+        {
+            continue;
+        }
+
+        if new_location != col {
+            let (src, mut dest) = select_cols(buf, width, col, new_location);
+            dest.copy_from(src);
+        }
     }
 }
 
@@ -86,9 +242,11 @@ fn render(
 
             // SAFETY: all writes are disjoint
             unsafe {
-                buf_view.0.offset((r * w + c) as isize).write(render_pixel(val));
+                buf_view
+                    .0
+                    .offset((r * w + c) as isize)
+                    .write(render_pixel(val));
             }
-            // buf[r * w + c] = render_pixel(val);
         }
         pbar.inc(1);
     });
@@ -112,10 +270,20 @@ fn main() {
 
     let mut cached = None;
 
-    while window.is_open() && !window.is_key_down(Key::Escape) {
+    let mut first_time = true;
+
+    while window.is_open() {
+        let mut mouse01 = None;
+
         if let Some((mouse_x, mouse_y)) = window.get_mouse_pos(MouseMode::Discard) {
             if let Some((_, scroll_y)) = window.get_scroll_wheel() {
                 let multiplier = 1.0 + (scroll_y as f64 / 100.0).clamp(-0.2, 0.2);
+
+                mouse01 = Some((
+                    mouse_x as f64 / w as f64,
+                    mouse_y as f64 / h as f64,
+                    multiplier,
+                ));
 
                 view /= multiplier;
 
@@ -128,9 +296,21 @@ fn main() {
         }
 
         let cache_key = (origin_x, origin_y, view);
-        if cached != Some(cache_key) {
+        if window.is_key_down(Key::Space) {
             render(&mut buffer, w, h, (origin_x, origin_y), view);
             cached = Some(cache_key);
+            // window.update_with_buffer(&buffer, w, h).unwrap();
+        } else {
+            if cached != Some(cache_key) {
+                if first_time {
+                    render(&mut buffer, w, h, (origin_x, origin_y), view);
+                    first_time = false;
+                } else if let Some((center_x, center_y, multiplier)) = mouse01 {
+                    zoom(&mut buffer, h, w, center_x, center_y, multiplier);
+                }
+                cached = Some(cache_key);
+                // window.update_with_buffer(&buffer, w, h).unwrap();
+            }
         }
 
         window.update_with_buffer(&buffer, w, h).unwrap();
