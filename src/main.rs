@@ -1,22 +1,26 @@
+#![feature(f16)]
+#![feature(f128)]
+
+mod complex;
+
+use std::fmt::{Display, Formatter};
+use complex::{Complex, Float, Zero};
 use hsl::HSL;
 use indicatif::ProgressBar;
-use minifb::{Key, MouseMode, Window, WindowOptions};
-use num::complex::Complex;
+use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
 use rayon::prelude::*;
 
-const FILE_PATH: &str = "test.png";
 const ITERATIONS: usize = 2000;
-const OVERSAMPLE: u32 = 2;
 
-fn calculate(c: Complex<f64>) -> f64 {
-    let mut z: Complex<f64> = Complex::ZERO;
+fn calculate<F: Float>(c: Complex<F>) -> F {
+    let mut z = Complex::<F>::ZERO;
     for i in 0..ITERATIONS {
         z = z * z + c;
-        if z.norm() > 4.0 {
-            return i as f64 / ITERATIONS as f64;
+        if z.norm() > F::from_f64(4.0) {
+            return F::from_usize(i) / F::from_usize(ITERATIONS);
         }
     }
-    0.0
+    F::from_f64(0.0)
 }
 
 fn apply_sharpness(val: f64, sharpness: f64) -> f64 {
@@ -34,8 +38,8 @@ fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-fn render_pixel(val: f64) -> u32 {
-    if val == 0.0 {
+fn render_pixel<F: Float>(val: F) -> u32 {
+    if val == F::from_f64(0.0) {
         0
     } else {
         // let h = apply_sharpness(val, 30.0) / 6.0;
@@ -48,7 +52,7 @@ fn render_pixel(val: f64) -> u32 {
         // };
 
         let hsl = HSL {
-            h: val * 360.0,
+            h: (val * F::from_f64(360.0)).into_f64(),
             s: 1.0,
             l: 0.5,
         };
@@ -217,17 +221,17 @@ struct BufView(*mut u32);
 unsafe impl Send for BufView {}
 unsafe impl Sync for BufView {}
 
-fn render(
+fn render<F: Float>(
     buf: &mut [u32],
     w: usize,
     h: usize,
     // the coordinate of the top-left corner (x, y)
-    origin: (f64, f64),
-    view: f64,
+    origin: (F, F),
+    view: F,
 ) {
     let (x_min, y_min) = origin;
-    let x_range = w as f64 * view;
-    let y_range = h as f64 * view;
+    let x_range = F::from_usize(w) * view;
+    let y_range = F::from_usize(h) * view;
 
     let buf_view = BufView(buf.as_mut_ptr());
 
@@ -236,8 +240,8 @@ fn render(
         let buf_view = buf_view;
 
         for c in 0..w {
-            let x = c as f64 / w as f64 * x_range + x_min;
-            let y = r as f64 / h as f64 * y_range + y_min;
+            let x = F::from_usize(c) / F::from_usize(w) * x_range + x_min;
+            let y = F::from_usize(r) / F::from_usize(h) * y_range + y_min;
             let val = calculate(Complex::new(x, y));
 
             // SAFETY: all writes are disjoint
@@ -251,6 +255,24 @@ fn render(
         pbar.inc(1);
     });
     pbar.finish();
+}
+
+enum RenderPrecision {
+    F16,
+    F32,
+    F64,
+    F128,
+}
+
+impl Display for RenderPrecision {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RenderPrecision::F16 => writeln!(f, "f16"),
+            RenderPrecision::F32 => writeln!(f, "f32"),
+            RenderPrecision::F64 => writeln!(f, "f64"),
+            RenderPrecision::F128 => writeln!(f, "f128"),
+        }
+    }
 }
 
 fn main() {
@@ -271,6 +293,7 @@ fn main() {
     let mut cached = None;
 
     let mut first_time = true;
+    let mut render_precision = RenderPrecision::F64;
 
     while window.is_open() {
         let mut mouse01 = None;
@@ -297,9 +320,21 @@ fn main() {
 
         let cache_key = (origin_x, origin_y, view);
         if window.is_key_down(Key::Space) {
-            render(&mut buffer, w, h, (origin_x, origin_y), view);
+            match render_precision {
+                RenderPrecision::F16 => render::<f16>(&mut buffer, w, h, (origin_x as f16, origin_y as f16), view as f16),
+                RenderPrecision::F32 => render::<f32>(&mut buffer, w, h, (origin_x as f32, origin_y as f32), view as f32),
+                RenderPrecision::F64 => render::<f64>(&mut buffer, w, h, (origin_x, origin_y), view),
+                RenderPrecision::F128 => render::<f128>(&mut buffer, w, h, (origin_x as f128, origin_y as f128), view as f128),
+            }
             cached = Some(cache_key);
-            // window.update_with_buffer(&buffer, w, h).unwrap();
+        } else if window.is_key_pressed(Key::Escape, KeyRepeat::No) {
+            render_precision = match render_precision {
+                RenderPrecision::F16 => RenderPrecision::F32,
+                RenderPrecision::F32 => RenderPrecision::F64,
+                RenderPrecision::F64 => RenderPrecision::F128,
+                RenderPrecision::F128 => RenderPrecision::F16,
+            };
+            println!("render precision: {render_precision}");
         } else {
             if cached != Some(cache_key) {
                 if first_time {
@@ -309,7 +344,6 @@ fn main() {
                     zoom(&mut buffer, h, w, center_x, center_y, multiplier);
                 }
                 cached = Some(cache_key);
-                // window.update_with_buffer(&buffer, w, h).unwrap();
             }
         }
 
