@@ -1,12 +1,13 @@
 use hsl::HSL;
 use indicatif::ProgressBar;
-use minifb::{Key, MouseMode, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
 use num::complex::Complex;
+use palette::rgb::Rgb;
+use palette::{Mix, Srgb, rgb};
 use rayon::prelude::*;
+use std::ops::{Deref, DerefMut};
 
-const FILE_PATH: &str = "test.png";
 const ITERATIONS: usize = 2000;
-const OVERSAMPLE: u32 = 2;
 
 fn calculate(c: Complex<f64>) -> f64 {
     let mut z: Complex<f64> = Complex::ZERO;
@@ -59,154 +60,67 @@ fn render_pixel(val: f64) -> u32 {
     }
 }
 
-// Returns (&source, &mut destination)
-fn select_rows(
-    buf: &mut [u32],
+fn interpolate(
+    color_tl: u32,
+    color_tr: u32,
+    color_bl: u32,
+    color_br: u32,
+    /* (y, x) where tl is (0, 0) */
+    location: (f64, f64),
+) -> u32 {
+    let color_tl = Rgb::<Srgb, _>::from(color_tl).into_format();
+    let color_tr = Rgb::<Srgb, _>::from(color_tr).into_format();
+    let color_bl = Rgb::<Srgb, _>::from(color_bl).into_format();
+    let color_br = Rgb::<Srgb, _>::from(color_br).into_format();
+
+    let top = color_tl.mix(color_tr, location.1);
+    let bottom = color_bl.mix(color_br, location.1);
+
+    let color = top.mix(bottom, location.0).into_format();
+
+    color.into_u32::<rgb::channels::Argb>()
+}
+
+fn sample_zoomed(
+    src: &[u32],
+    dest: &mut [u32],
     width: usize,
-    source_row: usize,
-    destination_row: usize,
-) -> (&[u32], &mut [u32]) {
-    let (row1, row2) = if source_row < destination_row {
-        (source_row, destination_row)
-    } else {
-        (destination_row, source_row)
-    };
-    let (out1, rest) = buf[row1 * width..].split_at_mut(width);
-    let out2 = &mut rest[(row2 - row1 - 1) * width..(row2 - row1) * width];
-    if source_row < destination_row {
-        (out1, out2)
-    } else {
-        (out2, out1)
-    }
-}
-
-struct Col<'a> {
-    buf: &'a [u32],
-    width: usize,
-    col: usize,
-}
-struct ColMut<'a> {
-    buf: &'a mut [u32],
-    width: usize,
-    col: usize,
-}
-
-impl<'a> ColMut<'a> {
-    fn copy_from(&mut self, src: Col<'_>) {
-        assert_eq!(self.width, src.width);
-        assert_eq!(self.buf.as_ptr(), src.buf.as_ptr());
-        assert_ne!(self.col, src.col);
-        for i in (0..self.buf.len()).step_by(self.width) {
-            self.buf[i + self.col] = src.buf[i + src.col];
-        }
-    }
-}
-
-fn select_cols(
-    buf: &mut [u32],
-    width: usize,
-    source_col: usize,
-    destination_col: usize,
-) -> (Col, ColMut) {
-    assert_ne!(source_col, destination_col);
-    assert!(source_col < width);
-    assert!(destination_col < width);
-
-    // SAFETY: the two columns are nonoverlapping
-    let buf_ref = unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) };
-
-    (
-        Col {
-            buf: buf_ref,
-            width,
-            col: source_col,
-        },
-        ColMut {
-            buf,
-            width,
-            col: destination_col,
-        },
-    )
-}
-
-/// center_x and center_y are [0, 1)
-fn zoom(
-    buf: &mut [u32],
     height: usize,
-    width: usize,
+    /* [0,1] relative to the source */
     center_x: f64,
     center_y: f64,
     multiplier: f64,
 ) {
-    let center_row = (center_y * height as f64) as usize;
+    let fwidth = width as f64;
+    let fheight = height as f64;
 
-    let row_iter = if multiplier > 1.0 {
-        (center_row + 1..height).rev().chain(0..center_row - 1)
-    } else {
-        (0..center_row - 1).rev().chain(center_row + 1..height)
-    };
+    for dest_row in 0..height {
+        for dest_col in 0..width {
+            let dest_y = dest_row as f64 / fheight;
+            let dest_x = dest_col as f64 / fwidth;
 
-    for row in row_iter {
-        let new_location = if row > center_row {
-            ((row - center_row) as f64 * multiplier) as usize + center_row
-        } else if let Some(nl) =
-            center_row.checked_sub(((center_row - row) as f64 * multiplier) as usize)
-        {
-            nl
-        } else {
-            continue;
-        };
+            let src_y =
+                ((dest_y - center_y) / multiplier + center_y).clamp(0.0, (fheight - 1.0) / fheight);
+            let src_x =
+                ((dest_x - center_x) / multiplier + center_x).clamp(0.0, (fwidth - 1.0) / fwidth);
 
-        if new_location >= height {
-            continue; // TODO: fix
-        }
+            let tl = ((src_y * fheight) as usize, (src_x * fwidth) as usize);
+            let tr = ((src_y * fheight) as usize, (src_x * fwidth).ceil() as usize);
+            let bl = ((src_y * fheight).ceil() as usize, (src_x * fwidth) as usize);
+            let br = (
+                (src_y * fheight).ceil() as usize,
+                (src_x * fwidth).ceil() as usize,
+            );
 
-        if row > center_row && new_location <= center_row
-            || row < center_row && new_location >= center_row
-        {
-            continue;
-        }
+            let color = interpolate(
+                src[tl.0 * width + tl.1],
+                src[tr.0 * width + tr.1],
+                src[bl.0 * width + bl.1],
+                src[br.0 * width + br.1],
+                (src_y - src_y.floor(), src_x - src_x.floor()),
+            );
 
-        if new_location != row {
-            let (src, dest) = select_rows(buf, width, row, new_location);
-            dest.copy_from_slice(src);
-        }
-    }
-
-    ////////////////////
-
-    let center_col = (center_x * width as f64) as usize;
-
-    let col_iter = if multiplier > 1.0 {
-        (center_col + 1..width).rev().chain(0..center_col - 1)
-    } else {
-        (0..center_col - 1).rev().chain(center_col + 1..width)
-    };
-
-    for col in col_iter {
-        let new_location = if col > center_col {
-            ((col - center_col) as f64 * multiplier) as usize + center_col
-        } else if let Some(nl) =
-            center_col.checked_sub(((center_col - col) as f64 * multiplier) as usize)
-        {
-            nl
-        } else {
-            continue;
-        };
-
-        if new_location >= width {
-            continue;
-        }
-
-        if col > center_col && new_location <= center_col
-            || col < center_col && new_location >= center_col
-        {
-            continue;
-        }
-
-        if new_location != col {
-            let (src, mut dest) = select_cols(buf, width, col, new_location);
-            dest.copy_from(src);
+            dest[dest_row * width + dest_col] = color;
         }
     }
 }
@@ -253,11 +167,65 @@ fn render(
     pbar.finish();
 }
 
+enum BufferSelector {
+    Left,
+    Right,
+}
+
+// The BufferSelector always points to the dest.
+// Dereferencing the struct will return the dest buffer.
+struct Buffer(Box<[u32]>, Box<[u32]>, BufferSelector);
+
+impl Buffer {
+    fn new(width: usize, height: usize) -> Self {
+        Self(
+            vec![0; width * height].into_boxed_slice(),
+            vec![0; width * height].into_boxed_slice(),
+            BufferSelector::Left,
+        )
+    }
+
+    fn get_src_dest(&mut self) -> (&mut [u32], &mut [u32]) {
+        match self.2 {
+            BufferSelector::Left => (&mut self.1, &mut self.0),
+            BufferSelector::Right => (&mut self.0, &mut self.1),
+        }
+    }
+
+    fn switch(&mut self) {
+        match self.2 {
+            BufferSelector::Left => self.2 = BufferSelector::Right,
+            BufferSelector::Right => self.2 = BufferSelector::Left,
+        }
+    }
+}
+
+impl Deref for Buffer {
+    type Target = [u32];
+
+    fn deref(&self) -> &Self::Target {
+        match self.2 {
+            BufferSelector::Left => &self.0,
+            BufferSelector::Right => &self.1,
+        }
+    }
+}
+
+impl DerefMut for Buffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self.2 {
+            BufferSelector::Left => &mut self.0,
+            BufferSelector::Right => &mut self.1,
+        }
+    }
+}
+
 fn main() {
     let w = 1000;
     let h = 600;
 
-    let mut buffer: Vec<u32> = vec![0; w * h];
+    // let mut buffer: Vec<u32> = vec![0; w * h];
+    let mut buffer = Buffer::new(w, h);
 
     let mut window = Window::new("Mandelbrot", w, h, WindowOptions::default()).unwrap();
 
@@ -296,17 +264,28 @@ fn main() {
         }
 
         let cache_key = (origin_x, origin_y, view);
-        if window.is_key_down(Key::Space) {
+        if window.is_key_pressed(Key::Space, KeyRepeat::No) {
             render(&mut buffer, w, h, (origin_x, origin_y), view);
+            // clone dest buffer onto src
+            let (src, dest) = buffer.get_src_dest();
+            src.copy_from_slice(dest);
+
             cached = Some(cache_key);
             // window.update_with_buffer(&buffer, w, h).unwrap();
         } else {
             if cached != Some(cache_key) {
                 if first_time {
                     render(&mut buffer, w, h, (origin_x, origin_y), view);
+                    // clone dest buffer onto src
+                    let (src, dest) = buffer.get_src_dest();
+                    src.copy_from_slice(dest);
+
                     first_time = false;
                 } else if let Some((center_x, center_y, multiplier)) = mouse01 {
-                    zoom(&mut buffer, h, w, center_x, center_y, multiplier);
+                    // zoom(&mut buffer, h, w, center_x, center_y, multiplier);
+                    buffer.switch();
+                    let (src, dest) = buffer.get_src_dest();
+                    sample_zoomed(src, dest, w, h, center_x, center_y, multiplier);
                 }
                 cached = Some(cache_key);
                 // window.update_with_buffer(&buffer, w, h).unwrap();
