@@ -1,4 +1,5 @@
 #![feature(f16)]
+#![feature(f128)]
 
 mod complex;
 
@@ -9,11 +10,12 @@ use indicatif::ProgressBar;
 use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
 use rayon::prelude::*;
 use f256::f256;
+use num_bigfloat::BigFloat;
 
 const ITERATIONS: usize = 2000;
 
 fn calculate<F: Float>(c: Complex<F>) -> F {
-    let mut z = Complex::<F>::ZERO;
+    let mut z = Complex::<F>::zero();
     for i in 0..ITERATIONS {
         z = z * z + c;
         if z.norm() > F::from_f64(4.0) {
@@ -261,8 +263,9 @@ enum RenderPrecision {
     F16,
     F32,
     F64,
-    // F128,
+    F128,
     F256,
+    BF,
 }
 
 impl Display for RenderPrecision {
@@ -271,8 +274,9 @@ impl Display for RenderPrecision {
             RenderPrecision::F16 => writeln!(f, "f16"),
             RenderPrecision::F32 => writeln!(f, "f32"),
             RenderPrecision::F64 => writeln!(f, "f64"),
-            // RenderPrecision::F128 => writeln!(f, "f128"),
+            RenderPrecision::F128 => writeln!(f, "f128"),
             RenderPrecision::F256 => writeln!(f, "f256"),
+            RenderPrecision::BF => writeln!(f, "bf"),
         }
     }
 }
@@ -321,23 +325,24 @@ fn main() {
         }
 
         let cache_key = (origin_x, origin_y, view);
-        if window.is_key_down(Key::Space) {
+        if window.is_key_pressed(Key::Space, KeyRepeat::No) {
             match render_precision {
                 RenderPrecision::F16 => render::<f16>(&mut buffer, w, h, (origin_x as f16, origin_y as f16), view as f16),
                 RenderPrecision::F32 => render::<f32>(&mut buffer, w, h, (origin_x as f32, origin_y as f32), view as f32),
                 RenderPrecision::F64 => render::<f64>(&mut buffer, w, h, (origin_x, origin_y), view),
-                // RenderPrecision::F128 => render::<f128>(&mut buffer, w, h, (origin_x as f128, origin_y as f128), view as f128),
+                RenderPrecision::F128 => render::<f128>(&mut buffer, w, h, (origin_x as f128, origin_y as f128), view as f128),
                 RenderPrecision::F256 => render::<f256>(&mut buffer, w, h, (origin_x.into(), origin_y.into()), view.into()),
+                RenderPrecision::BF => render::<BigFloat>(&mut buffer, w, h, (origin_x.into(), origin_y.into()), view.into()),
             }
             cached = Some(cache_key);
         } else if window.is_key_pressed(Key::Escape, KeyRepeat::No) {
             render_precision = match render_precision {
                 RenderPrecision::F16 => RenderPrecision::F32,
                 RenderPrecision::F32 => RenderPrecision::F64,
-                RenderPrecision::F64 => RenderPrecision::F256,
-                // RenderPrecision::F64 => RenderPrecision::F128,
-                // RenderPrecision::F128 => RenderPrecision::F16,
-                RenderPrecision::F256 => RenderPrecision::F16,
+                RenderPrecision::F64 => RenderPrecision::F128,
+                RenderPrecision::F128 => RenderPrecision::F256,
+                RenderPrecision::F256 => RenderPrecision::BF,
+                RenderPrecision::BF => RenderPrecision::F16,
             };
             println!("render precision: {render_precision}");
         } else {

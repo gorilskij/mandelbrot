@@ -1,28 +1,33 @@
 use std::ops::{Add, Div, Mul, Sub};
 use f256::f256;
+use num_bigfloat::BigFloat;
 
 pub trait Zero {
-    const ZERO: Self;
+    fn zero() -> Self;
 }
 
 impl Zero for f16 {
-    const ZERO: Self = 0.0;
+    fn zero() -> Self { 0.0 }
 }
 
 impl Zero for f32 {
-    const ZERO: Self = 0.0;
+    fn zero() -> Self { 0.0 }
 }
 
 impl Zero for f64 {
-    const ZERO: Self = 0.0;
+    fn zero() -> Self { 0.0 }
 }
 
-// impl Zero for f128 {
-//     const ZERO: Self = 0.0;
-// }
+impl Zero for f128 {
+    fn zero() -> Self { 0.0 }
+}
 
 impl Zero for f256 {
-    const ZERO: Self = f256::ZERO;
+    fn zero() -> Self { f256::ZERO }
+}
+
+impl Zero for BigFloat {
+    fn zero() -> Self { BigFloat::from_f64(0.0) }
 }
 
 pub trait Sqrt {
@@ -47,15 +52,21 @@ impl Sqrt for f64 {
     }
 }
 
-// impl Sqrt for f128 {
-//     fn sqrt(self) -> Self {
-//         f128::sqrt(self)
-//     }
-// }
+impl Sqrt for f128 {
+    fn sqrt(self) -> Self {
+        f128::sqrt(self)
+    }
+}
 
 impl Sqrt for f256 {
     fn sqrt(self) -> Self {
         f256::sqrt(self)
+    }
+}
+
+impl Sqrt for BigFloat {
+    fn sqrt(self) -> Self {
+        BigFloat::sqrt(&self)
     }
 }
 
@@ -81,15 +92,21 @@ impl FromF64 for f64 {
     }
 }
 
-// impl FromF64 for f128 {
-//     fn from_f64(n: f64) -> Self {
-//         n as f128
-//     }
-// }
+impl FromF64 for f128 {
+    fn from_f64(n: f64) -> Self {
+        n as f128
+    }
+}
 
 impl FromF64 for f256 {
     fn from_f64(n: f64) -> Self {
         f256::from(n)
+    }
+}
+
+impl FromF64 for BigFloat {
+    fn from_f64(n: f64) -> Self {
+        Self::from(n)
     }
 }
 
@@ -115,15 +132,21 @@ impl FromUsize for f64 {
     }
 }
 
-// impl FromUsize for f128 {
-//     fn from_usize(n: usize) -> Self {
-//         n as f128
-//     }
-// }
+impl FromUsize for f128 {
+    fn from_usize(n: usize) -> Self {
+        n as f128
+    }
+}
 
 impl FromUsize for f256 {
     fn from_usize(n: usize) -> Self {
         f256::from(n as f64)
+    }
+}
+
+impl FromUsize for BigFloat {
+    fn from_usize(n: usize) -> Self {
+        Self::from(n as f64)
     }
 }
 
@@ -149,11 +172,11 @@ impl IntoF64 for f64 {
     }
 }
 
-// impl IntoF64 for f128 {
-//     fn into_f64(self) -> f64 {
-//         self as f64
-//     }
-// }
+impl IntoF64 for f128 {
+    fn into_f64(self) -> f64 {
+        self as f64
+    }
+}
 
 impl IntoF64 for f256 {
     fn into_f64(self) -> f64 {
@@ -182,6 +205,12 @@ impl IntoF64 for f256 {
     }
 }
 
+impl IntoF64 for BigFloat {
+    fn into_f64(self) -> f64 {
+        self.to_f64()
+    }
+}
+
 pub trait Float:
     Copy
     + Zero
@@ -205,9 +234,11 @@ impl Float for f32 {}
 
 impl Float for f64 {}
 
-// impl Float for f128 {}
+impl Float for f128 {}
 
 impl Float for f256 {}
+
+impl Float for BigFloat {}
 
 #[derive(Copy, Clone, Debug)]
 pub struct Complex<F: Float> {
@@ -216,10 +247,12 @@ pub struct Complex<F: Float> {
 }
 
 impl<F: Float> Zero for Complex<F> {
-    const ZERO: Self = Self {
-        re: F::ZERO,
-        im: F::ZERO,
-    };
+    fn zero() -> Self {
+        Self {
+            re: F::zero(),
+            im: F::zero(),
+        }
+    }
 }
 
 impl<F: Float> Add for Complex<F> {
