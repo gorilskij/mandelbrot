@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+f256 = "0.6.0"
 hsl = "0.1.1"
 indicatif = "0.17.9"
 minifb = "0.27.0"
-num = "0.4.3"
 rayon = "1.10.0"

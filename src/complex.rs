@@ -1,4 +1,5 @@
 use std::ops::{Add, Div, Mul, Sub};
+use f256::f256;
 
 pub trait Zero {
     const ZERO: Self;
@@ -16,8 +17,12 @@ impl Zero for f64 {
     const ZERO: Self = 0.0;
 }
 
-impl Zero for f128 {
-    const ZERO: Self = 0.0;
+// impl Zero for f128 {
+//     const ZERO: Self = 0.0;
+// }
+
+impl Zero for f256 {
+    const ZERO: Self = f256::ZERO;
 }
 
 pub trait Sqrt {
@@ -42,9 +47,15 @@ impl Sqrt for f64 {
     }
 }
 
-impl Sqrt for f128 {
+// impl Sqrt for f128 {
+//     fn sqrt(self) -> Self {
+//         f128::sqrt(self)
+//     }
+// }
+
+impl Sqrt for f256 {
     fn sqrt(self) -> Self {
-        f128::sqrt(self)
+        f256::sqrt(self)
     }
 }
 
@@ -66,13 +77,19 @@ impl FromF64 for f32 {
 
 impl FromF64 for f64 {
     fn from_f64(n: f64) -> Self {
-        n as f64
+        n
     }
 }
 
-impl FromF64 for f128 {
+// impl FromF64 for f128 {
+//     fn from_f64(n: f64) -> Self {
+//         n as f128
+//     }
+// }
+
+impl FromF64 for f256 {
     fn from_f64(n: f64) -> Self {
-        n as f128
+        f256::from(n)
     }
 }
 
@@ -98,9 +115,15 @@ impl FromUsize for f64 {
     }
 }
 
-impl FromUsize for f128 {
+// impl FromUsize for f128 {
+//     fn from_usize(n: usize) -> Self {
+//         n as f128
+//     }
+// }
+
+impl FromUsize for f256 {
     fn from_usize(n: usize) -> Self {
-        n as f128
+        f256::from(n as f64)
     }
 }
 
@@ -126,9 +149,36 @@ impl IntoF64 for f64 {
     }
 }
 
-impl IntoF64 for f128 {
+// impl IntoF64 for f128 {
+//     fn into_f64(self) -> f64 {
+//         self as f64
+//     }
+// }
+
+impl IntoF64 for f256 {
     fn into_f64(self) -> f64 {
-        self as f64
+        if self.is_nan() {
+            return f64::NAN;
+        }
+        if self.is_infinite() {
+            return if self.is_sign_positive() {
+                f64::INFINITY
+            } else {
+                -f64::INFINITY
+            };
+        }
+
+        let (hi, lo) = self.to_bits();
+        let sign = hi >> 127;
+        let exp = (hi >> 108) & (!(1 << 20));
+        if exp > 0b0111_1111_1111 /* 11 bits */ {
+            return if sign == 0 { f64::INFINITY } else { -f64::INFINITY };
+        }
+        let mant = (0x0fff_ffff_ffff_ff00_0000_0000_0000 /* first 52 bits */ & hi) >> 56;
+
+        let float = ((sign as u64) << 63) | ((exp as u64) << 52) | mant as u64;
+
+        f64::from_bits(float)
     }
 }
 
@@ -155,7 +205,9 @@ impl Float for f32 {}
 
 impl Float for f64 {}
 
-impl Float for f128 {}
+// impl Float for f128 {}
+
+impl Float for f256 {}
 
 #[derive(Copy, Clone, Debug)]
 pub struct Complex<F: Float> {
