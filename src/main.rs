@@ -5,7 +5,6 @@ use num::complex::Complex;
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
 use rayon::prelude::*;
-use std::ops::{Deref, DerefMut};
 
 const ITERATIONS: usize = 2000;
 
@@ -167,55 +166,18 @@ fn render(
     pbar.finish();
 }
 
-enum BufferSelector {
-    Left,
-    Right,
+struct Buffer {
+    base: Box<[u32]>,
+    zoomed: Box<[u32]>,
+    multiplier: f64,
 }
-
-// The BufferSelector always points to the dest.
-// Dereferencing the struct will return the dest buffer.
-struct Buffer(Box<[u32]>, Box<[u32]>, BufferSelector);
 
 impl Buffer {
     fn new(width: usize, height: usize) -> Self {
-        Self(
-            vec![0; width * height].into_boxed_slice(),
-            vec![0; width * height].into_boxed_slice(),
-            BufferSelector::Left,
-        )
-    }
-
-    fn get_src_dest(&mut self) -> (&mut [u32], &mut [u32]) {
-        match self.2 {
-            BufferSelector::Left => (&mut self.1, &mut self.0),
-            BufferSelector::Right => (&mut self.0, &mut self.1),
-        }
-    }
-
-    fn switch(&mut self) {
-        match self.2 {
-            BufferSelector::Left => self.2 = BufferSelector::Right,
-            BufferSelector::Right => self.2 = BufferSelector::Left,
-        }
-    }
-}
-
-impl Deref for Buffer {
-    type Target = [u32];
-
-    fn deref(&self) -> &Self::Target {
-        match self.2 {
-            BufferSelector::Left => &self.0,
-            BufferSelector::Right => &self.1,
-        }
-    }
-}
-
-impl DerefMut for Buffer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match self.2 {
-            BufferSelector::Left => &mut self.0,
-            BufferSelector::Right => &mut self.1,
+        Self {
+            base: vec![0; width * height].into_boxed_slice(),
+            zoomed: vec![0; width * height].into_boxed_slice(),
+            multiplier: 1.0,
         }
     }
 }
@@ -224,7 +186,6 @@ fn main() {
     let w = 1000;
     let h = 600;
 
-    // let mut buffer: Vec<u32> = vec![0; w * h];
     let mut buffer = Buffer::new(w, h);
 
     let mut window = Window::new("Mandelbrot", w, h, WindowOptions::default()).unwrap();
@@ -265,33 +226,28 @@ fn main() {
 
         let cache_key = (origin_x, origin_y, view);
         if window.is_key_pressed(Key::Space, KeyRepeat::No) {
-            render(&mut buffer, w, h, (origin_x, origin_y), view);
-            // clone dest buffer onto src
-            let (src, dest) = buffer.get_src_dest();
-            src.copy_from_slice(dest);
+            render(&mut buffer.base, w, h, (origin_x, origin_y), view);
+            buffer.zoomed.copy_from_slice(&buffer.base);
+            buffer.multiplier = 1.0;
 
             cached = Some(cache_key);
             // window.update_with_buffer(&buffer, w, h).unwrap();
         } else {
             if cached != Some(cache_key) {
                 if first_time {
-                    render(&mut buffer, w, h, (origin_x, origin_y), view);
-                    // clone dest buffer onto src
-                    let (src, dest) = buffer.get_src_dest();
-                    src.copy_from_slice(dest);
+                    render(&mut buffer.base, w, h, (origin_x, origin_y), view);
+                    buffer.zoomed.copy_from_slice(&buffer.base);
+                    buffer.multiplier = 1.0;
 
                     first_time = false;
                 } else if let Some((center_x, center_y, multiplier)) = mouse01 {
-                    // zoom(&mut buffer, h, w, center_x, center_y, multiplier);
-                    buffer.switch();
-                    let (src, dest) = buffer.get_src_dest();
-                    sample_zoomed(src, dest, w, h, center_x, center_y, multiplier);
+                    buffer.multiplier *= multiplier;
+                    sample_zoomed(&buffer.base, &mut buffer.zoomed, w, h, center_x, center_y, buffer.multiplier);
                 }
                 cached = Some(cache_key);
-                // window.update_with_buffer(&buffer, w, h).unwrap();
             }
         }
 
-        window.update_with_buffer(&buffer, w, h).unwrap();
+        window.update_with_buffer(&buffer.zoomed, w, h).unwrap();
     }
 }
