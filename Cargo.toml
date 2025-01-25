@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+euclid = "0.22.11"
 hsl = "0.1.1"
 indicatif = "0.17.9"
 minifb = "0.27.0"
