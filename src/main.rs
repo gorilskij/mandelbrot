@@ -1,4 +1,4 @@
-use euclid::{Point2D, UnknownUnit};
+use euclid::{Length, Point2D, Scale};
 use hsl::HSL;
 use indicatif::ProgressBar;
 use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
@@ -9,7 +9,29 @@ use rayon::prelude::*;
 
 const ITERATIONS: usize = 2000;
 
-type Point = Point2D<f64, UnknownUnit>;
+struct Units;
+struct Pixels;
+struct Relative;
+type Point<U> = Point2D<f64, U>;
+type View = Scale<f64, Pixels, Units>;
+
+trait TypedXY<T, U> {
+    fn x(&self) -> Length<T, U>;
+    fn y(&self) -> Length<T, U>;
+}
+
+impl<T, U> TypedXY<T, U> for Point2D<T, U>
+where
+    T: Copy,
+{
+    fn x(&self) -> Length<T, U> {
+        Length::new(self.x)
+    }
+
+    fn y(&self) -> Length<T, U> {
+        Length::new(self.y)
+    }
+}
 
 fn calculate(c: Complex<f64>) -> f64 {
     let mut z: Complex<f64> = Complex::ZERO;
@@ -90,27 +112,32 @@ fn sample_zoomed(
     width: usize,
     height: usize,
     //
-    src_origin: Point,
-    src_view: f64,
+    src_origin: Point<Units>,
+    src_view: View,
     //
-    dest_origin: Point,
-    dest_view: f64,
+    dest_origin: Point<Units>,
+    dest_view: View,
 ) {
     let fwidth = width as f64;
     let fheight = height as f64;
 
     // src_origin and dest_origin are both absolute
     // calculate dest_origin in the [0, 1] reference frame given by src
-    let dest_origin_rel_src = ((dest_origin - src_origin) / src_view).to_point();
+    let dest_origin_rel_src = {
+        let p = ((dest_origin - src_origin) / src_view).to_point();
+        Point::<Relative>::new(p.x / fwidth, p.y / fheight)
+    };
 
     for dest_row in 0..height {
         for dest_col in 0..width {
             // [0, 1] coordinates relative to the reference frame given by dest
-            let point_rel_dest = Point::new(dest_col as f64 / fwidth, dest_row as f64 / fheight);
+            let point_rel_dest =
+                Point::<Relative>::new(dest_col as f64 / fwidth, dest_row as f64 / fheight);
 
             // calculate [0, 1] coordinates in the reference frame given by src
-            let point_rel_src =
-                (dest_origin_rel_src + point_rel_dest.to_vector() * (dest_view / src_view)).clamp(
+            let point_rel_src = (dest_origin_rel_src
+                + point_rel_dest.to_vector() * (dest_view.0 / src_view.0))
+                .clamp(
                     Point::zero(),
                     Point::new((fwidth - 1.0) / fwidth, (fheight - 1.0) / fheight),
                 );
@@ -154,7 +181,7 @@ struct BufView(*mut u32);
 unsafe impl Send for BufView {}
 unsafe impl Sync for BufView {}
 
-fn render(buf: &mut [u32], width: usize, height: usize, origin: Point, view: f64) {
+fn render(buf: &mut [u32], width: usize, height: usize, origin: Point<Units>, view: View) {
     let buf_view = BufView(buf.as_mut_ptr());
 
     let pbar = &ProgressBar::new(height as u64);
@@ -162,9 +189,12 @@ fn render(buf: &mut [u32], width: usize, height: usize, origin: Point, view: f64
         let buf_view = buf_view;
 
         for c in 0..width {
+            let c_typed = Length::<_, Pixels>::new(c as f64);
+            let r_typed = Length::<_, Pixels>::new(r as f64);
+
             let val = calculate(Complex::new(
-                c as f64 * view + origin.x,
-                r as f64 * view + origin.y,
+                (c_typed * view + origin.x()).0,
+                (r_typed * view + origin.y()).0,
             ));
 
             // SAFETY: all writes are disjoint
@@ -184,12 +214,12 @@ struct Buffer {
     base: Box<[u32]>,
     zoomed: Box<[u32]>,
     //
-    base_origin: Point,
-    base_view: f64,
+    base_origin: Point2D<f64, Units>,
+    base_view: View,
 }
 
 impl Buffer {
-    fn new(width: usize, height: usize, origin: Point, view: f64) -> Self {
+    fn new(width: usize, height: usize, origin: Point2D<f64, Units>, view: View) -> Self {
         Self {
             base: vec![0; width * height].into_boxed_slice(),
             zoomed: vec![0; width * height].into_boxed_slice(),
@@ -207,11 +237,10 @@ fn main() {
 
     window.set_target_fps(60);
 
-    let mut origin = Point::new(-2.5, -1.0);
+    let mut origin = Point2D::<_, Units>::new(-2.5, -1.0);
 
-    // Displayed range / pixel size (zooming in means reducing view)
-    // (real world units / pixel)
-    let mut view = 1.0 / 300.0;
+    // range (1) / pixel
+    let mut view = View::new(1.0 / 300.0);
 
     let mut buffer = Buffer::new(width, height, origin, view);
 
@@ -226,32 +255,15 @@ fn main() {
             if let Some((_, scroll_y)) = window.get_scroll_wheel() {
                 zoomed = true;
 
-                // let cursor_rel = Point::new(mouse_x as f64, mouse_y as f64);
-                // let cursor_abs = origin + (cursor_rel * view).to_vector();
-
-                // let pos_x = mouse_x as f64 * view + origin.x;
-                // let pos_y = mouse_y as f64 * view + origin.y;
-
-                // origin.x = pos.x + (origin.x - pos.x) / multiplier;
-                // origin.y = pos.y + (origin.y - pos.y) / multiplier;
-
-                // origin = cursor_abs + (origin - cursor_abs) / multiplier;
-
-
                 // [0, 1] in the reference frame given by the window
-                let cursor_rel = Point::new(
-                    mouse_x as f64 / width as f64,
-                    mouse_y as f64 / height as f64,
-                );
+                let cursor_rel = Point2D::<_, Pixels>::new(mouse_x as f64, mouse_y as f64);
 
                 let cursor_abs = origin + (cursor_rel * view).to_vector();
 
                 let multiplier = 1.0 + (scroll_y as f64 / 100.0).clamp(-0.2, 0.2);
-                view /= multiplier;
 
                 origin = cursor_abs + (origin - cursor_abs) / multiplier;
-
-                println!("{:?} {}", origin, view);
+                view = View::new(view.0 / multiplier);
             }
         }
 
@@ -263,7 +275,6 @@ fn main() {
             buffer.base_view = view;
 
             cached = Some(cache_key);
-            // window.update_with_buffer(&buffer, w, h).unwrap();
         } else {
             if cached != Some(cache_key) {
                 if first_time {
