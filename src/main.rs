@@ -1,10 +1,11 @@
 mod rendering;
 
 use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
+use parking_lot::Mutex;
 use rayon::prelude::*;
 use rendering::*;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -72,20 +73,20 @@ fn main() {
                 println!("redrawing");
 
                 let (origin, view) = {
-                    let zoomed = buffer.zoomed.lock().unwrap();
+                    let zoomed = buffer.zoomed.lock();
                     (zoomed.origin, zoomed.view)
                 };
 
                 render(&mut tmp_buffer, width, height, origin, view);
 
                 {
-                    let base = &mut buffer.base.lock().unwrap();
+                    let base = &mut buffer.base.lock();
 
                     base.buffer.copy_from_slice(&tmp_buffer);
                     base.origin = origin;
                     base.view = view;
 
-                    let zoomed = &mut buffer.zoomed.lock().unwrap();
+                    let zoomed = &mut buffer.zoomed.lock();
 
                     let zoomed_origin = zoomed.origin;
                     let zoomed_view = zoomed.view;
@@ -126,7 +127,7 @@ fn main() {
                 view = View::new(view.0 / multiplier);
 
                 {
-                    let zoomed = &mut buffer.zoomed.lock().unwrap();
+                    let zoomed = &mut buffer.zoomed.lock();
                     zoomed.origin = origin;
                     zoomed.view = view;
                 }
@@ -136,8 +137,8 @@ fn main() {
         let cache_key = (origin, view);
         if window.is_key_pressed(Key::Space, KeyRepeat::No) {
             {
-                let base = &mut buffer.base.lock().unwrap();
-                let zoomed = &mut buffer.zoomed.lock().unwrap();
+                let base = &mut buffer.base.lock();
+                let zoomed = &mut buffer.zoomed.lock();
 
                 render(&mut base.buffer, width, height, origin, view);
                 zoomed.buffer.copy_from_slice(&base.buffer);
@@ -150,8 +151,8 @@ fn main() {
             if cached != Some(cache_key) {
                 if first_time {
                     {
-                        let base = &mut buffer.base.lock().unwrap();
-                        let zoomed = &mut buffer.zoomed.lock().unwrap();
+                        let base = &mut buffer.base.lock();
+                        let zoomed = &mut buffer.zoomed.lock();
 
                         render(&mut base.buffer, width, height, origin, view);
                         zoomed.buffer.copy_from_slice(&base.buffer);
@@ -161,8 +162,8 @@ fn main() {
 
                     first_time = false;
                 } else if zoomed {
-                    let base = &mut buffer.base.lock().unwrap();
-                    let zoomed = &mut buffer.zoomed.lock().unwrap();
+                    let base = &mut buffer.base.lock();
+                    let zoomed = &mut buffer.zoomed.lock();
 
                     sample_zoomed(
                         &base.buffer,
@@ -183,7 +184,7 @@ fn main() {
         }
 
         {
-            let zoomed = &buffer.zoomed.lock().unwrap();
+            let zoomed = &buffer.zoomed.lock();
             window
                 .update_with_buffer(&zoomed.buffer, width, height)
                 .unwrap();
