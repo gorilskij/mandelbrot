@@ -3,22 +3,38 @@ mod rendering;
 use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
 use rayon::prelude::*;
 use rendering::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
+struct SubBuffer {
+    buffer: Box<[u32]>,
+    origin: Point<Units>,
+    view: View,
+}
+
+impl SubBuffer {
+    fn new(width: usize, height: usize, origin: Point<Units>, view: View) -> Self {
+        Self {
+            buffer: vec![0; width * height].into_boxed_slice(),
+            origin,
+            view,
+        }
+    }
+}
+
+#[derive(Clone)]
 struct Buffer {
-    base: Box<[u32]>,
-    zoomed: Box<[u32]>,
-    //
-    base_origin: Point<Units>,
-    base_view: View,
+    base: Arc<Mutex<SubBuffer>>,
+    zoomed: Arc<Mutex<SubBuffer>>,
 }
 
 impl Buffer {
     fn new(width: usize, height: usize, origin: Point<Units>, view: View) -> Self {
         Self {
-            base: vec![0; width * height].into_boxed_slice(),
-            zoomed: vec![0; width * height].into_boxed_slice(),
-            base_origin: origin,
-            base_view: view,
+            base: Arc::new(Mutex::new(SubBuffer::new(width, height, origin, view))),
+            zoomed: Arc::new(Mutex::new(SubBuffer::new(width, height, origin, view))),
         }
     }
 }
@@ -36,11 +52,61 @@ fn main() {
     // range (1) / pixel
     let mut view = View::new(1.0 / 300.0);
 
-    let mut buffer = Buffer::new(width, height, origin, view);
+    let buffer = Buffer::new(width, height, origin, view);
 
     let mut cached = None;
 
     let mut first_time = true;
+
+    let redraw_thread_running = Arc::new(AtomicBool::new(true));
+
+    let redraw_thread = {
+        let buffer = buffer.clone();
+        let redraw_thread_running_cloned = redraw_thread_running.clone();
+        thread::spawn(move || {
+            let mut tmp_buffer = vec![0; width * height].into_boxed_slice();
+
+            while redraw_thread_running_cloned.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_secs(2));
+
+                println!("redrawing");
+
+                let (origin, view) = {
+                    let zoomed = buffer.zoomed.lock().unwrap();
+                    (zoomed.origin, zoomed.view)
+                };
+
+                render(&mut tmp_buffer, width, height, origin, view);
+
+                {
+                    let base = &mut buffer.base.lock().unwrap();
+
+                    base.buffer.copy_from_slice(&tmp_buffer);
+                    base.origin = origin;
+                    base.view = view;
+
+                    let zoomed = &mut buffer.zoomed.lock().unwrap();
+
+                    let zoomed_origin = zoomed.origin;
+                    let zoomed_view = zoomed.view;
+
+                    sample_zoomed(
+                        &base.buffer,
+                        &mut zoomed.buffer,
+                        //
+                        width,
+                        height,
+                        //
+                        base.origin,
+                        base.view,
+                        //
+                        zoomed_origin,
+                        zoomed_view,
+                    );
+                }
+            }
+        })
+    };
 
     while window.is_open() {
         let mut zoomed = false;
@@ -58,36 +124,55 @@ fn main() {
 
                 origin = cursor_abs + (origin - cursor_abs) / multiplier;
                 view = View::new(view.0 / multiplier);
+
+                {
+                    let zoomed = &mut buffer.zoomed.lock().unwrap();
+                    zoomed.origin = origin;
+                    zoomed.view = view;
+                }
             }
         }
 
         let cache_key = (origin, view);
         if window.is_key_pressed(Key::Space, KeyRepeat::No) {
-            render(&mut buffer.base, width, height, origin, view);
-            buffer.zoomed.copy_from_slice(&buffer.base);
-            buffer.base_origin = origin;
-            buffer.base_view = view;
+            {
+                let base = &mut buffer.base.lock().unwrap();
+                let zoomed = &mut buffer.zoomed.lock().unwrap();
+
+                render(&mut base.buffer, width, height, origin, view);
+                zoomed.buffer.copy_from_slice(&base.buffer);
+                base.origin = origin;
+                base.view = view;
+            }
 
             cached = Some(cache_key);
         } else {
             if cached != Some(cache_key) {
                 if first_time {
-                    render(&mut buffer.base, width, height, origin, view);
-                    buffer.zoomed.copy_from_slice(&buffer.base);
-                    buffer.base_origin = origin;
-                    buffer.base_view = view;
+                    {
+                        let base = &mut buffer.base.lock().unwrap();
+                        let zoomed = &mut buffer.zoomed.lock().unwrap();
+
+                        render(&mut base.buffer, width, height, origin, view);
+                        zoomed.buffer.copy_from_slice(&base.buffer);
+                        base.origin = origin;
+                        base.view = view;
+                    }
 
                     first_time = false;
                 } else if zoomed {
+                    let base = &mut buffer.base.lock().unwrap();
+                    let zoomed = &mut buffer.zoomed.lock().unwrap();
+
                     sample_zoomed(
-                        &buffer.base,
-                        &mut buffer.zoomed,
+                        &base.buffer,
+                        &mut zoomed.buffer,
                         //
                         width,
                         height,
                         //
-                        buffer.base_origin,
-                        buffer.base_view,
+                        base.origin,
+                        base.view,
                         //
                         origin,
                         view,
@@ -97,8 +182,14 @@ fn main() {
             }
         }
 
-        window
-            .update_with_buffer(&buffer.zoomed, width, height)
-            .unwrap();
+        {
+            let zoomed = &buffer.zoomed.lock().unwrap();
+            window
+                .update_with_buffer(&zoomed.buffer, width, height)
+                .unwrap();
+        }
     }
+
+    redraw_thread_running.store(false, Ordering::Relaxed);
+    redraw_thread.join().unwrap();
 }
