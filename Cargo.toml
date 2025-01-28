@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+env_logger = "0.11.6"
 euclid = "0.22.11"
 hsl = "0.1.1"
 indicatif = "0.17.9"
+log = "0.4.25"
 minifb = "0.27.0"
 num = "0.4.3"
 palette = "0.7.6"

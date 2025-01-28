@@ -1,13 +1,12 @@
 mod rendering;
 
+use log::trace;
 use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
-use parking_lot::Mutex;
-use rayon::prelude::*;
+use parking_lot::{Condvar, Mutex};
 use rendering::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::{mem, thread};
 
 struct SubBuffer {
     buffer: Box<[u32]>,
@@ -40,7 +39,16 @@ impl Buffer {
     }
 }
 
+#[derive(Debug)]
+enum RedrawThreadState {
+    Run { view_ratio: f64 },
+    Wait,
+    Terminate,
+}
+
 fn main() {
+    env_logger::init();
+
     let width = 1000;
     let height = 600;
 
@@ -48,8 +56,8 @@ fn main() {
 
     window.set_target_fps(60);
 
+    // these (origin, view) are always in sync with (zoomed.origin, zoomed.view)
     let mut origin = Point::<Units>::new(-2.5, -1.0);
-
     // range (1) / pixel
     let mut view = View::new(1.0 / 300.0);
 
@@ -59,28 +67,49 @@ fn main() {
 
     let mut first_time = true;
 
-    let redraw_thread_running = Arc::new(AtomicBool::new(true));
+    let wake_redraw_thread = Arc::new((Mutex::new(RedrawThreadState::Wait), Condvar::new()));
 
     let redraw_thread = {
         let buffer = buffer.clone();
-        let redraw_thread_running_cloned = redraw_thread_running.clone();
+        let wake_redraw_thread = wake_redraw_thread.clone();
+
         thread::spawn(move || {
             let mut tmp_buffer = vec![0; width * height].into_boxed_slice();
+            let (lock, cvar) = &*wake_redraw_thread;
 
-            while redraw_thread_running_cloned.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_secs(2));
+            let mut lock = lock.lock();
+            let mut last_update = Instant::now();
+            loop {
+                trace!("re: wait");
 
-                println!("redrawing");
+                cvar.wait_for(&mut lock, Duration::from_millis(200));
+
+                trace!("re: woken {:?}", *lock);
+
+                let view_ratio = match mem::replace(&mut *lock, RedrawThreadState::Wait) {
+                    RedrawThreadState::Run { view_ratio } => view_ratio,
+                    RedrawThreadState::Wait => continue,
+                    RedrawThreadState::Terminate => break,
+                };
+
+                if view_ratio.ln().abs() < 1.1_f64.ln() && last_update.elapsed().as_millis() < 500 {
+                    continue;
+                }
+
+                trace!("re: redrawing");
 
                 let (origin, view) = {
                     let zoomed = buffer.zoomed.lock();
                     (zoomed.origin, zoomed.view)
                 };
 
+                trace!("re: rendering");
                 render(&mut tmp_buffer, width, height, origin, view);
+                trace!("re: done rendering");
 
                 {
                     let base = &mut buffer.base.lock();
+                    trace!("re: base acquired");
 
                     base.buffer.copy_from_slice(&tmp_buffer);
                     base.origin = origin;
@@ -91,6 +120,7 @@ fn main() {
                     let zoomed_origin = zoomed.origin;
                     let zoomed_view = zoomed.view;
 
+                    trace!("re: sample zooming");
                     sample_zoomed(
                         &base.buffer,
                         &mut zoomed.buffer,
@@ -104,7 +134,10 @@ fn main() {
                         zoomed_origin,
                         zoomed_view,
                     );
+                    trace!("re: done sample zooming");
                 }
+
+                last_update = Instant::now();
             }
         })
     };
@@ -162,22 +195,32 @@ fn main() {
 
                     first_time = false;
                 } else if zoomed {
-                    let base = &mut buffer.base.lock();
-                    let zoomed = &mut buffer.zoomed.lock();
+                    let view_ratio = {
+                        let base = &mut buffer.base.lock();
 
-                    sample_zoomed(
-                        &base.buffer,
-                        &mut zoomed.buffer,
-                        //
-                        width,
-                        height,
-                        //
-                        base.origin,
-                        base.view,
-                        //
-                        origin,
-                        view,
-                    );
+                        let zoomed = &mut buffer.zoomed.lock();
+
+                        sample_zoomed(
+                            &base.buffer,
+                            &mut zoomed.buffer,
+                            //
+                            width,
+                            height,
+                            //
+                            base.origin,
+                            base.view,
+                            //
+                            origin,
+                            view,
+                        );
+
+                        base.view.0 / zoomed.view.0
+                    };
+
+                    if let Some(mut lock) = wake_redraw_thread.0.try_lock() {
+                        *lock = RedrawThreadState::Run { view_ratio };
+                        wake_redraw_thread.1.notify_all();
+                    }
                 }
                 cached = Some(cache_key);
             }
@@ -191,6 +234,7 @@ fn main() {
         }
     }
 
-    redraw_thread_running.store(false, Ordering::Relaxed);
+    *wake_redraw_thread.0.lock() = RedrawThreadState::Terminate;
+    wake_redraw_thread.1.notify_all();
     redraw_thread.join().unwrap();
 }
