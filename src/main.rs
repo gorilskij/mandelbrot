@@ -68,10 +68,12 @@ fn main() {
     let mut first_time = true;
 
     let wake_redraw_thread = Arc::new((Mutex::new(RedrawThreadState::Wait), Condvar::new()));
+    let redraw_thread_missed_update = Arc::new(Mutex::new(false));
 
     let redraw_thread = {
         let buffer = buffer.clone();
         let wake_redraw_thread = wake_redraw_thread.clone();
+        let redraw_thread_missed_update = redraw_thread_missed_update.clone();
 
         thread::spawn(move || {
             let mut tmp_buffer = vec![0; width * height].into_boxed_slice();
@@ -86,15 +88,24 @@ fn main() {
 
                 trace!("re: woken {:?}", *lock);
 
-                let view_ratio = match mem::replace(&mut *lock, RedrawThreadState::Wait) {
-                    RedrawThreadState::Run { view_ratio } => view_ratio,
-                    RedrawThreadState::Wait => continue,
+                match mem::replace(&mut *lock, RedrawThreadState::Wait) {
+                    RedrawThreadState::Run { view_ratio } => {
+                        if view_ratio.ln().abs() < 1.1_f64.ln()
+                            && last_update.elapsed().as_millis() < 500
+                        {
+                            continue;
+                        }
+                    }
+                    RedrawThreadState::Wait => {
+                        let missed_update = &mut *redraw_thread_missed_update.lock();
+                        if *missed_update {
+                            *missed_update = false
+                        } else {
+                            continue;
+                        }
+                    }
                     RedrawThreadState::Terminate => break,
                 };
-
-                if view_ratio.ln().abs() < 1.1_f64.ln() && last_update.elapsed().as_millis() < 500 {
-                    continue;
-                }
 
                 trace!("re: redrawing");
 
@@ -220,6 +231,8 @@ fn main() {
                     if let Some(mut lock) = wake_redraw_thread.0.try_lock() {
                         *lock = RedrawThreadState::Run { view_ratio };
                         wake_redraw_thread.1.notify_all();
+                    } else {
+                        *redraw_thread_missed_update.lock() = true;
                     }
                 }
                 cached = Some(cache_key);
