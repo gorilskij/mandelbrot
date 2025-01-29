@@ -44,7 +44,7 @@ fn calculate(c: Complex<f64>) -> f64 {
 }
 
 fn apply_sharpness(val: f64, sharpness: f64) -> f64 {
-    assert!(val >= 0.0 && val <= 1.0);
+    assert!((0.0..=1.0).contains(&val));
     assert!(sharpness >= 2.0);
     if val < 1.0 / sharpness {
         sharpness * val
@@ -200,7 +200,7 @@ pub fn render(buf: &mut [u32], width: usize, height: usize, origin: Point<Units>
             unsafe {
                 buf_view
                     .0
-                    .offset((r * width + c) as isize)
+                    .add(r * width + c)
                     .write(render_pixel(val));
             }
         }
