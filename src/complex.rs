@@ -226,19 +226,44 @@ pub trait Float:
     + Send
     + Sync
 {
+    fn abs(self) -> Self;
 }
 
-impl Float for f16 {}
+impl Float for f16 {
+    fn abs(self) -> Self {
+        f16::abs(self)
+    }
+}
 
-impl Float for f32 {}
+impl Float for f32 {
+    fn abs(self) -> Self {
+        f32::abs(self)
+    }
+}
 
-impl Float for f64 {}
+impl Float for f64 {
+    fn abs(self) -> Self {
+        f64::abs(self)
+    }
+}
 
-impl Float for f128 {}
+impl Float for f128 {
+    fn abs(self) -> Self {
+        f128::abs(self)
+    }
+}
 
-impl Float for f256 {}
+impl Float for f256 {
+    fn abs(self) -> Self {
+        f256::abs(&self)
+    }
+}
 
-impl Float for BigFloat {}
+impl Float for BigFloat {
+    fn abs(self) -> Self {
+        BigFloat::abs(&self)
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 pub struct Complex<F: Float> {
@@ -281,6 +306,10 @@ impl<F: Float> Complex<F> {
     pub fn new(re: F, im: F) -> Self {
         Self { re, im }
     }
+
+    pub fn re(&self) -> F { self.re }
+
+    pub fn im(&self) -> F { self.im }
 
     pub fn norm(&self) -> F {
         (self.re * self.re + self.im * self.im).sqrt()

@@ -12,14 +12,16 @@ use rayon::prelude::*;
 use f256::f256;
 use num_bigfloat::BigFloat;
 
-const ITERATIONS: usize = 2000;
+const ITERATIONS: usize = 10;
 
 fn calculate<F: Float>(c: Complex<F>) -> F {
     let mut z = Complex::<F>::zero();
     for i in 0..ITERATIONS {
         z = z * z + c;
-        if z.norm() > F::from_f64(4.0) {
-            return F::from_usize(i) / F::from_usize(ITERATIONS);
+        if z.re().abs() + z.im().abs() > F::from_f64(2.0) {
+            if z.norm() > F::from_f64(4.0) {
+                return F::from_usize(i) / F::from_usize(ITERATIONS);
+            }
         }
     }
     F::from_f64(0.0)
