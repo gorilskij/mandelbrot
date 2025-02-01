@@ -198,10 +198,7 @@ pub fn render(buf: &mut [u32], width: usize, height: usize, origin: Point<Units>
 
             // SAFETY: all writes are disjoint
             unsafe {
-                buf_view
-                    .0
-                    .add(r * width + c)
-                    .write(render_pixel(val));
+                buf_view.0.add(r * width + c).write(render_pixel(val));
             }
         }
         pbar.inc(1);
