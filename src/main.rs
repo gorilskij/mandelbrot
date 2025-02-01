@@ -3,9 +3,7 @@ mod rendering;
 
 use log::trace;
 use minifb::{MouseButton, MouseMode, Window, WindowOptions};
-use parking_lot::Mutex;
 use rendering::*;
-use std::sync::Arc;
 
 fn main() {
     env_logger::init();
@@ -17,12 +15,14 @@ fn main() {
 
     window.set_target_fps(60);
 
-    // these (origin, view) are always in sync with (zoomed.origin, zoomed.view)
-    let mut origin = Point::<Units>::new(-2.5, -1.0);
-    // range (1) / pixel
-    let mut view = View::new(1.0 / 300.0);
+    let mut coords = CoordinatesBox {
+        // these (origin, view) are always in sync with (zoomed.origin, zoomed.view)
+        origin: Point::new(-2.5, -1.0),
+        // range (1) / pixel
+        view: View::new(1.0 / 300.0),
+    };
 
-    let draw_thread = draw_thread::spawn(width, height, origin, view);
+    let draw_thread = draw_thread::spawn(width, height, coords);
 
     let mut first_time = true;
     let mut cached = None;
@@ -45,10 +45,10 @@ fn main() {
 
                     let drag =
                         Point::<Pixels>::new((mouse_x - last_x) as f64, (mouse_y - last_y) as f64);
-                    origin -= (drag * view).to_vector();
+                    coords.origin -= (drag * coords.view).to_vector();
                     {
                         let zoomed = &mut draw_thread.buffer.zoomed.lock();
-                        zoomed.origin = origin;
+                        zoomed.coords.origin = coords.origin;
                     }
                 }
                 dragging = Some((mouse_x, mouse_y));
@@ -66,22 +66,21 @@ fn main() {
                     zoomed = true;
 
                     let cursor_rel = Point::<Pixels>::new(mouse_x as f64, mouse_y as f64);
-                    let cursor_abs = origin + (cursor_rel * view).to_vector();
+                    let cursor_abs = coords.origin + (cursor_rel * coords.view).to_vector();
                     let multiplier = 1.0 + (scroll_y as f64 / 100.0).clamp(-0.2, 0.2);
 
-                    origin = cursor_abs + (origin - cursor_abs) / multiplier;
-                    view = View::new(view.0 / multiplier);
+                    coords.origin = cursor_abs + (coords.origin - cursor_abs) / multiplier;
+                    coords.view = View::new(coords.view.0 / multiplier);
 
                     {
                         let zoomed = &mut draw_thread.buffer.zoomed.lock();
-                        zoomed.origin = origin;
-                        zoomed.view = view;
+                        zoomed.coords = coords;
                     }
                 }
             }
         }
 
-        let cache_key = (origin, view);
+        let cache_key = coords;
 
         if cached != Some(cache_key) {
             if first_time {
@@ -89,10 +88,9 @@ fn main() {
                     let base = &mut draw_thread.buffer.base.lock();
                     let zoomed = &mut draw_thread.buffer.zoomed.lock();
 
-                    render(&mut base.buffer, width, height, origin, view);
+                    render(&mut base.buffer, width, height, coords);
                     zoomed.buffer.copy_from_slice(&base.buffer);
-                    base.origin = origin;
-                    base.view = view;
+                    base.coords = coords;
                 }
 
                 first_time = false;
@@ -108,11 +106,9 @@ fn main() {
                         width,
                         height,
                         //
-                        base.origin,
-                        base.view,
+                        base.coords,
                         //
-                        origin,
-                        view,
+                        coords,
                     );
                 }
 

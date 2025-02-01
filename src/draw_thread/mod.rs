@@ -1,6 +1,6 @@
 mod buffer;
 
-use crate::rendering::{Point, Units, View, render, sample_zoomed};
+use crate::rendering::{CoordinatesBox, render, sample_zoomed};
 use buffer::Buffer;
 use log::trace;
 use parking_lot::{Condvar, Mutex};
@@ -42,8 +42,8 @@ impl Handle {
     }
 }
 
-pub fn spawn(width: usize, height: usize, origin: Point<Units>, view: View) -> Handle {
-    let buffer = Buffer::new(width, height, origin, view);
+pub fn spawn(width: usize, height: usize, coords: CoordinatesBox) -> Handle {
+    let buffer = Buffer::new(width, height, coords);
 
     let wake = Arc::new((Mutex::new(State::Wait), Condvar::new()));
     let missed_update = Arc::new(Mutex::new(false));
@@ -78,13 +78,13 @@ pub fn spawn(width: usize, height: usize, origin: Point<Units>, view: View) -> H
 
                 trace!("re: redrawing");
 
-                let (origin, view) = {
+                let zoomed_coords = {
                     let zoomed = buffer.zoomed.lock();
-                    (zoomed.origin, zoomed.view)
+                    zoomed.coords
                 };
 
                 trace!("re: rendering");
-                render(&mut tmp_buffer, width, height, origin, view);
+                render(&mut tmp_buffer, width, height, zoomed_coords);
                 trace!("re: done rendering");
 
                 {
@@ -92,13 +92,10 @@ pub fn spawn(width: usize, height: usize, origin: Point<Units>, view: View) -> H
                     trace!("re: base acquired");
 
                     base.buffer.copy_from_slice(&tmp_buffer);
-                    base.origin = origin;
-                    base.view = view;
+                    base.coords = zoomed_coords;
 
                     let zoomed = &mut buffer.zoomed.lock();
-
-                    let zoomed_origin = zoomed.origin;
-                    let zoomed_view = zoomed.view;
+                    let zoomed_coords = zoomed.coords;
 
                     trace!("re: sample zooming");
                     sample_zoomed(
@@ -108,11 +105,9 @@ pub fn spawn(width: usize, height: usize, origin: Point<Units>, view: View) -> H
                         width,
                         height,
                         //
-                        base.origin,
-                        base.view,
+                        base.coords,
                         //
-                        zoomed_origin,
-                        zoomed_view,
+                        zoomed_coords,
                     );
                     trace!("re: done sample zooming");
                 }

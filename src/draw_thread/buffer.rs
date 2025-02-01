@@ -1,19 +1,17 @@
-use crate::rendering::{Point, Units, View};
+use crate::rendering::CoordinatesBox;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
 pub struct SubBuffer {
     pub buffer: Box<[u32]>,
-    pub origin: Point<Units>,
-    pub view: View,
+    pub coords: CoordinatesBox,
 }
 
 impl SubBuffer {
-    fn new(width: usize, height: usize, origin: Point<Units>, view: View) -> Self {
+    fn new(width: usize, height: usize, coords: CoordinatesBox) -> Self {
         Self {
             buffer: vec![0; width * height].into_boxed_slice(),
-            origin,
-            view,
+            coords,
         }
     }
 }
@@ -25,10 +23,10 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    pub fn new(width: usize, height: usize, origin: Point<Units>, view: View) -> Self {
+    pub fn new(width: usize, height: usize, coords: CoordinatesBox) -> Self {
         Self {
-            base: Arc::new(Mutex::new(SubBuffer::new(width, height, origin, view))),
-            zoomed: Arc::new(Mutex::new(SubBuffer::new(width, height, origin, view))),
+            base: Arc::new(Mutex::new(SubBuffer::new(width, height, coords))),
+            zoomed: Arc::new(Mutex::new(SubBuffer::new(width, height, coords))),
         }
     }
 }

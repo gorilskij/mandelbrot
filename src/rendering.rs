@@ -12,7 +12,14 @@ pub enum Units {}
 pub enum Pixels {}
 pub enum Relative {}
 pub type Point<U> = Point2D<f64, U>;
+pub type Origin = Point<Units>;
 pub type View = Scale<f64, Pixels, Units>;
+
+#[derive(Copy, Clone, PartialEq)]
+pub struct CoordinatesBox {
+    pub origin: Origin,
+    pub view: View,
+}
 
 trait TypedXY<T, U> {
     fn x(&self) -> Length<T, U>;
@@ -111,14 +118,21 @@ pub fn sample_zoomed(
     width: usize,
     height: usize,
     //
-    src_origin: Point<Units>,
-    src_view: View,
+    src_coords: CoordinatesBox,
     //
-    dest_origin: Point<Units>,
-    dest_view: View,
+    dest_coords: CoordinatesBox,
 ) {
     let fwidth = width as f64;
     let fheight = height as f64;
+
+    let CoordinatesBox {
+        origin: src_origin,
+        view: src_view,
+    } = src_coords;
+    let CoordinatesBox {
+        origin: dest_origin,
+        view: dest_view,
+    } = dest_coords;
 
     // src_origin and dest_origin are both absolute
     // calculate dest_origin in the [0, 1] reference frame given by src
@@ -180,7 +194,9 @@ struct BufView(*mut u32);
 unsafe impl Send for BufView {}
 unsafe impl Sync for BufView {}
 
-pub fn render(buf: &mut [u32], width: usize, height: usize, origin: Point<Units>, view: View) {
+pub fn render(buf: &mut [u32], width: usize, height: usize, coords: CoordinatesBox) {
+    let CoordinatesBox { origin, view } = coords;
+
     let buf_view = BufView(buf.as_mut_ptr());
 
     let pbar = &ProgressBar::new(height as u64);
