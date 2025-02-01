@@ -1,110 +1,267 @@
-use std::f64::consts::E;
-use num::complex::Complex;
-use image::{ImageBuffer, Rgb, imageops::sample_bilinear};
-use indicatif::ProgressBar;
-use rayon::prelude::*;
-use std::sync::mpsc::channel;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use hsl::HSL;
+mod rendering;
 
-const ITERATIONS: usize = 2000;
-const OVERSAMPLE: u32 = 1;
+use log::trace;
+use minifb::{MouseButton, MouseMode, Window, WindowOptions};
+use parking_lot::{Condvar, Mutex};
+use rendering::*;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use std::{mem, thread};
 
-fn calculate(c: Complex<f64>) -> f64 {
-    let mut z: Complex<f64> = Complex::ZERO;
-    for i in 0..ITERATIONS {
-        z = z * z + c;
-        if z.norm() > 4.0 {
-            return i as f64 / ITERATIONS as f64;
-        }
-    }
-    0.0
+struct SubBuffer {
+    buffer: Box<[u32]>,
+    origin: Point<Units>,
+    view: View,
 }
 
-fn apply_sharpness(val: f64, sharpness: f64) -> f64 {
-    assert!(val >= 0.0 && val <= 1.0);
-    assert!(sharpness >= 2.0);
-    if val < 1.0 / sharpness {
-        sharpness * val
-    } else {
-        // -1.0 / (1.0 - 1.0 / sharpness) * (val - 1.0)
-        1.0
+impl SubBuffer {
+    fn new(width: usize, height: usize, origin: Point<Units>, view: View) -> Self {
+        Self {
+            buffer: vec![0; width * height].into_boxed_slice(),
+            origin,
+            view,
+        }
     }
+}
+
+#[derive(Clone)]
+struct Buffer {
+    base: Arc<Mutex<SubBuffer>>,
+    zoomed: Arc<Mutex<SubBuffer>>,
+}
+
+impl Buffer {
+    fn new(width: usize, height: usize, origin: Point<Units>, view: View) -> Self {
+        Self {
+            base: Arc::new(Mutex::new(SubBuffer::new(width, height, origin, view))),
+            zoomed: Arc::new(Mutex::new(SubBuffer::new(width, height, origin, view))),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RedrawThreadState {
+    Run { view_ratio: f64 },
+    Wait,
+    Terminate,
 }
 
 fn main() {
-    let (w, h) = (12000, 12000);
+    env_logger::init();
 
-    let (x_min, x_max) = (-2.5, 1.0);
-    let (y_min, y_max) = (-1.75, 1.75);
+    let width = 1000;
+    let height = 600;
 
-    let x_range = x_max - x_min;
-    let y_range = y_max - y_min;
+    let mut window = Window::new("Mandelbrot", width, height, WindowOptions::default()).unwrap();
 
-    let (tx, rx) = channel::<(u32, Vec<f64>)>();
+    window.set_target_fps(60);
 
-    let pbar = ProgressBar::new((h / 2 + 1) as u64);
+    // these (origin, view) are always in sync with (zoomed.origin, zoomed.view)
+    let mut origin = Point::<Units>::new(-2.5, -1.0);
+    // range (1) / pixel
+    let mut view = View::new(1.0 / 300.0);
 
-    let buffer: ImageBuffer<Rgb<u8>, _> = ImageBuffer::new(w, h);
-    let buffer = Arc::new(Mutex::new(buffer));
-    let buffer_clone = Arc::clone(&buffer);
-    let inserter = thread::spawn(move || {
-        let mut buffer = buffer_clone.lock().unwrap();
-        for _ in 0..h / 2 + 1 {
-            let (r, row) = rx.recv().unwrap();
-            for (c, val) in row.into_iter().enumerate() {
-                let pixel = if val == 0.0 {
-                    Rgb([0, 0, 0])
-                } else {
-                    let h = apply_sharpness(val, 30.0) / 6.0;
-                    let l = apply_sharpness(val, 20.0) * 0.6;
+    let buffer = Buffer::new(width, height, origin, view);
 
-                    let hsl = HSL {
-                        h: h * 360.0,
-                        s: 1.0,
-                        l,
-                    };
+    let wake_redraw_thread = Arc::new((Mutex::new(RedrawThreadState::Wait), Condvar::new()));
+    let redraw_thread_missed_update = Arc::new(Mutex::new(false));
 
-                    let (r, g, b) = hsl.to_rgb();
+    let redraw_thread = {
+        let buffer = buffer.clone();
+        let wake_redraw_thread = wake_redraw_thread.clone();
+        let redraw_thread_missed_update = redraw_thread_missed_update.clone();
 
-                    Rgb([r, g, b])
+        thread::spawn(move || {
+            let mut tmp_buffer = vec![0; width * height].into_boxed_slice();
+            let (lock, cvar) = &*wake_redraw_thread;
+
+            let mut lock = lock.lock();
+            let mut last_update = Instant::now();
+            loop {
+                trace!("re: wait");
+
+                cvar.wait_for(&mut lock, Duration::from_millis(200));
+
+                trace!("re: woken {:?}", *lock);
+
+                match mem::replace(&mut *lock, RedrawThreadState::Wait) {
+                    RedrawThreadState::Run { view_ratio } => {
+                        if view_ratio.ln().abs() < 1.1_f64.ln()
+                            && last_update.elapsed().as_millis() < 500
+                        {
+                            continue;
+                        }
+                    }
+                    RedrawThreadState::Wait => {
+                        let missed_update = &mut *redraw_thread_missed_update.lock();
+                        if *missed_update {
+                            *missed_update = false
+                        } else {
+                            continue;
+                        }
+                    }
+                    RedrawThreadState::Terminate => break,
                 };
 
-                buffer.put_pixel(c as u32, r, pixel);
-                buffer.put_pixel(c as u32, h - r - 1, pixel);
+                trace!("re: redrawing");
+
+                let (origin, view) = {
+                    let zoomed = buffer.zoomed.lock();
+                    (zoomed.origin, zoomed.view)
+                };
+
+                trace!("re: rendering");
+                render(&mut tmp_buffer, width, height, origin, view);
+                trace!("re: done rendering");
+
+                {
+                    let base = &mut buffer.base.lock();
+                    trace!("re: base acquired");
+
+                    base.buffer.copy_from_slice(&tmp_buffer);
+                    base.origin = origin;
+                    base.view = view;
+
+                    let zoomed = &mut buffer.zoomed.lock();
+
+                    let zoomed_origin = zoomed.origin;
+                    let zoomed_view = zoomed.view;
+
+                    trace!("re: sample zooming");
+                    sample_zoomed(
+                        &base.buffer,
+                        &mut zoomed.buffer,
+                        //
+                        width,
+                        height,
+                        //
+                        base.origin,
+                        base.view,
+                        //
+                        zoomed_origin,
+                        zoomed_view,
+                    );
+                    trace!("re: done sample zooming");
+                }
+
+                last_update = Instant::now();
+            }
+        })
+    };
+
+    let mut first_time = true;
+    let mut cached = None;
+    let mut dragging = None;
+
+    while window.is_open() {
+        let mut zoomed = false;
+        let mut dragged = false;
+
+        if let Some((mouse_x, mouse_y)) = window.get_mouse_pos(MouseMode::Discard) {
+            let left_mouse_down = window.get_mouse_down(MouseButton::Left);
+
+            if left_mouse_down {
+                if dragging.is_none() {
+                    trace!("start dragging");
+                }
+
+                if let Some((last_x, last_y)) = dragging {
+                    dragged = true;
+
+                    let drag =
+                        Point::<Pixels>::new((mouse_x - last_x) as f64, (mouse_y - last_y) as f64);
+                    origin -= (drag * view).to_vector();
+                    {
+                        let zoomed = &mut buffer.zoomed.lock();
+                        zoomed.origin = origin;
+                    }
+                }
+                dragging = Some((mouse_x, mouse_y));
+            } else {
+                if dragging.is_some() {
+                    trace!("stop dragging");
+                    // perform an update on release
+                    dragged = true;
+                }
+
+                dragging = None;
+
+                // scroll wheel is ignored while dragging
+                if let Some((_, scroll_y)) = window.get_scroll_wheel() {
+                    zoomed = true;
+
+                    let cursor_rel = Point::<Pixels>::new(mouse_x as f64, mouse_y as f64);
+                    let cursor_abs = origin + (cursor_rel * view).to_vector();
+                    let multiplier = 1.0 + (scroll_y as f64 / 100.0).clamp(-0.2, 0.2);
+
+                    origin = cursor_abs + (origin - cursor_abs) / multiplier;
+                    view = View::new(view.0 / multiplier);
+
+                    {
+                        let zoomed = &mut buffer.zoomed.lock();
+                        zoomed.origin = origin;
+                        zoomed.view = view;
+                    }
+                }
             }
         }
-    });
 
-    (0..h / 2 + 1).into_par_iter().for_each(|r| {
-        let mut row = Vec::with_capacity(w as usize);
-        for c in 0..w {
-            let x = c as f64 / w as f64 * x_range + x_min;
-            let y = r as f64 / h as f64 * y_range + y_min;
-            let val = calculate(Complex::new(x, y));
-            row.push(val);
+        let cache_key = (origin, view);
+
+        if cached != Some(cache_key) {
+            if first_time {
+                {
+                    let base = &mut buffer.base.lock();
+                    let zoomed = &mut buffer.zoomed.lock();
+
+                    render(&mut base.buffer, width, height, origin, view);
+                    zoomed.buffer.copy_from_slice(&base.buffer);
+                    base.origin = origin;
+                    base.view = view;
+                }
+
+                first_time = false;
+            } else if dragged || zoomed {
+                let view_ratio = {
+                    let base = &mut buffer.base.lock();
+                    let zoomed = &mut buffer.zoomed.lock();
+
+                    sample_zoomed(
+                        &base.buffer,
+                        &mut zoomed.buffer,
+                        //
+                        width,
+                        height,
+                        //
+                        base.origin,
+                        base.view,
+                        //
+                        origin,
+                        view,
+                    );
+
+                    base.view.0 / zoomed.view.0
+                };
+
+                if let Some(mut lock) = wake_redraw_thread.0.try_lock() {
+                    *lock = RedrawThreadState::Run { view_ratio };
+                    wake_redraw_thread.1.notify_all();
+                } else {
+                    *redraw_thread_missed_update.lock() = true;
+                }
+            }
+            cached = Some(cache_key);
         }
-        tx.send((r, row)).unwrap();
-        pbar.inc(1);
-    });
 
-    inserter.join().unwrap();
-
-    pbar.finish();
-    println!("ELAPSED {:?}", pbar.elapsed());
-
-    let buffer = buffer.lock().unwrap();
-
-    let mut new_buffer = ImageBuffer::new(w * OVERSAMPLE, h * OVERSAMPLE);
-    for r in 0..h * OVERSAMPLE {
-        for c in 0..w * OVERSAMPLE {
-            let y = r as f32 / (h * OVERSAMPLE) as f32;
-            let x = c as f32 / (w * OVERSAMPLE) as f32;
-            let px = sample_bilinear(&*buffer, x, y).unwrap();
-            new_buffer.put_pixel(c, r, px);
+        {
+            let zoomed = &buffer.zoomed.lock();
+            window
+                .update_with_buffer(&zoomed.buffer, width, height)
+                .unwrap();
         }
     }
 
-    new_buffer.save("test.png").unwrap();
+    *wake_redraw_thread.0.lock() = RedrawThreadState::Terminate;
+    wake_redraw_thread.1.notify_all();
+    redraw_thread.join().unwrap();
 }
