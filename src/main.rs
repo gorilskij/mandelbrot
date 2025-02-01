@@ -1,50 +1,11 @@
+mod draw_thread;
 mod rendering;
 
 use log::trace;
 use minifb::{MouseButton, MouseMode, Window, WindowOptions};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use rendering::*;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use std::{mem, thread};
-
-struct SubBuffer {
-    buffer: Box<[u32]>,
-    origin: Point<Units>,
-    view: View,
-}
-
-impl SubBuffer {
-    fn new(width: usize, height: usize, origin: Point<Units>, view: View) -> Self {
-        Self {
-            buffer: vec![0; width * height].into_boxed_slice(),
-            origin,
-            view,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct Buffer {
-    base: Arc<Mutex<SubBuffer>>,
-    zoomed: Arc<Mutex<SubBuffer>>,
-}
-
-impl Buffer {
-    fn new(width: usize, height: usize, origin: Point<Units>, view: View) -> Self {
-        Self {
-            base: Arc::new(Mutex::new(SubBuffer::new(width, height, origin, view))),
-            zoomed: Arc::new(Mutex::new(SubBuffer::new(width, height, origin, view))),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum RedrawThreadState {
-    Run { view_ratio: f64 },
-    Wait,
-    Terminate,
-}
 
 fn main() {
     env_logger::init();
@@ -61,93 +22,7 @@ fn main() {
     // range (1) / pixel
     let mut view = View::new(1.0 / 300.0);
 
-    let buffer = Buffer::new(width, height, origin, view);
-
-    let wake_redraw_thread = Arc::new((Mutex::new(RedrawThreadState::Wait), Condvar::new()));
-    let redraw_thread_missed_update = Arc::new(Mutex::new(false));
-
-    let redraw_thread = {
-        let buffer = buffer.clone();
-        let wake_redraw_thread = wake_redraw_thread.clone();
-        let redraw_thread_missed_update = redraw_thread_missed_update.clone();
-
-        thread::spawn(move || {
-            let mut tmp_buffer = vec![0; width * height].into_boxed_slice();
-            let (lock, cvar) = &*wake_redraw_thread;
-
-            let mut lock = lock.lock();
-            let mut last_update = Instant::now();
-            loop {
-                trace!("re: wait");
-
-                cvar.wait_for(&mut lock, Duration::from_millis(200));
-
-                trace!("re: woken {:?}", *lock);
-
-                match mem::replace(&mut *lock, RedrawThreadState::Wait) {
-                    RedrawThreadState::Run { view_ratio } => {
-                        if view_ratio.ln().abs() < 1.1_f64.ln()
-                            && last_update.elapsed().as_millis() < 500
-                        {
-                            continue;
-                        }
-                    }
-                    RedrawThreadState::Wait => {
-                        let missed_update = &mut *redraw_thread_missed_update.lock();
-                        if *missed_update {
-                            *missed_update = false
-                        } else {
-                            continue;
-                        }
-                    }
-                    RedrawThreadState::Terminate => break,
-                };
-
-                trace!("re: redrawing");
-
-                let (origin, view) = {
-                    let zoomed = buffer.zoomed.lock();
-                    (zoomed.origin, zoomed.view)
-                };
-
-                trace!("re: rendering");
-                render(&mut tmp_buffer, width, height, origin, view);
-                trace!("re: done rendering");
-
-                {
-                    let base = &mut buffer.base.lock();
-                    trace!("re: base acquired");
-
-                    base.buffer.copy_from_slice(&tmp_buffer);
-                    base.origin = origin;
-                    base.view = view;
-
-                    let zoomed = &mut buffer.zoomed.lock();
-
-                    let zoomed_origin = zoomed.origin;
-                    let zoomed_view = zoomed.view;
-
-                    trace!("re: sample zooming");
-                    sample_zoomed(
-                        &base.buffer,
-                        &mut zoomed.buffer,
-                        //
-                        width,
-                        height,
-                        //
-                        base.origin,
-                        base.view,
-                        //
-                        zoomed_origin,
-                        zoomed_view,
-                    );
-                    trace!("re: done sample zooming");
-                }
-
-                last_update = Instant::now();
-            }
-        })
-    };
+    let draw_thread = draw_thread::spawn(width, height, origin, view);
 
     let mut first_time = true;
     let mut cached = None;
@@ -172,7 +47,7 @@ fn main() {
                         Point::<Pixels>::new((mouse_x - last_x) as f64, (mouse_y - last_y) as f64);
                     origin -= (drag * view).to_vector();
                     {
-                        let zoomed = &mut buffer.zoomed.lock();
+                        let zoomed = &mut draw_thread.buffer.zoomed.lock();
                         zoomed.origin = origin;
                     }
                 }
@@ -198,7 +73,7 @@ fn main() {
                     view = View::new(view.0 / multiplier);
 
                     {
-                        let zoomed = &mut buffer.zoomed.lock();
+                        let zoomed = &mut draw_thread.buffer.zoomed.lock();
                         zoomed.origin = origin;
                         zoomed.view = view;
                     }
@@ -211,8 +86,8 @@ fn main() {
         if cached != Some(cache_key) {
             if first_time {
                 {
-                    let base = &mut buffer.base.lock();
-                    let zoomed = &mut buffer.zoomed.lock();
+                    let base = &mut draw_thread.buffer.base.lock();
+                    let zoomed = &mut draw_thread.buffer.zoomed.lock();
 
                     render(&mut base.buffer, width, height, origin, view);
                     zoomed.buffer.copy_from_slice(&base.buffer);
@@ -222,9 +97,9 @@ fn main() {
 
                 first_time = false;
             } else if dragged || zoomed {
-                let view_ratio = {
-                    let base = &mut buffer.base.lock();
-                    let zoomed = &mut buffer.zoomed.lock();
+                {
+                    let base = &mut draw_thread.buffer.base.lock();
+                    let zoomed = &mut draw_thread.buffer.zoomed.lock();
 
                     sample_zoomed(
                         &base.buffer,
@@ -239,29 +114,21 @@ fn main() {
                         origin,
                         view,
                     );
-
-                    base.view.0 / zoomed.view.0
-                };
-
-                if let Some(mut lock) = wake_redraw_thread.0.try_lock() {
-                    *lock = RedrawThreadState::Run { view_ratio };
-                    wake_redraw_thread.1.notify_all();
-                } else {
-                    *redraw_thread_missed_update.lock() = true;
                 }
+
+                draw_thread.notify_run();
             }
             cached = Some(cache_key);
         }
 
         {
-            let zoomed = &buffer.zoomed.lock();
+            let zoomed = &draw_thread.buffer.zoomed.lock();
             window
                 .update_with_buffer(&zoomed.buffer, width, height)
                 .unwrap();
         }
     }
 
-    *wake_redraw_thread.0.lock() = RedrawThreadState::Terminate;
-    wake_redraw_thread.1.notify_all();
-    redraw_thread.join().unwrap();
+    draw_thread.notify_terminate();
+    draw_thread.join().unwrap();
 }
