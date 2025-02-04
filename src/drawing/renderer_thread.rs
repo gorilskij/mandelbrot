@@ -86,7 +86,7 @@ pub fn spawn(width: usize, height: usize) -> Handle {
     let (buffer, done_clone, buf_clone) = RenderBuffer::new(width, height);
 
     let handle = thread::spawn(move || {
-        receiver.run(Duration::from_millis(200), |new_zoomed_coords, int| {
+        receiver.run_multithreaded(Duration::from_millis(200), |new_zoomed_coords, int| {
             *done_clone.lock() = false;
 
             let mut buf_lock = buf_clone.lock();

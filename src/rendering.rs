@@ -5,7 +5,8 @@ use indicatif::ProgressBar;
 use num::Complex;
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
-use waker_interrupter::Interrupter;
+use rayon::prelude::*;
+use waker_interrupter::MultiInterrupter;
 
 const ITERATIONS: usize = 2000;
 
@@ -199,15 +200,16 @@ pub fn render(
     width: usize,
     height: usize,
     coords: CoordinatesBox,
-    mut int: Interrupter,
+    int: MultiInterrupter,
 ) {
     let CoordinatesBox { origin, view } = coords;
 
     let buf_view = BufView(buf.as_mut_ptr());
 
     let pbar = &ProgressBar::new(height as u64);
-    // (0..height).into_par_iter().for_each(move |r| {
-    for r in 0..height {
+
+    (0..height).into_par_iter().for_each(move |r| {
+        // for r in 0..height {
         if int.interrupted() {
             pbar.abandon();
             return;
@@ -233,7 +235,7 @@ pub fn render(
             }
         }
         pbar.inc(1);
-    }
+    });
 
     pbar.finish();
 }
