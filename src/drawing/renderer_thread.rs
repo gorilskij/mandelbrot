@@ -3,6 +3,7 @@ use crate::drawing::renderer_thread::render_buffer::RenderBuffer;
 use crate::rendering::{CoordinatesBox, render};
 use delegate::delegate;
 use parking_lot::{Mutex, MutexGuard};
+use rayon::ThreadPoolBuilder;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{mem, thread};
@@ -56,7 +57,7 @@ pub mod render_buffer {
                 if *done {
                     let buf = self.buffer.lock();
                     let buf = unsafe { mem::transmute(buf) };
-                    return buf
+                    return buf;
                 }
 
                 let _ = done;
@@ -101,19 +102,32 @@ pub fn spawn(width: usize, height: usize) -> Handle {
 
     let (buffer, done_clone, buf_clone) = RenderBuffer::new(width, height);
 
+    let tp = ThreadPoolBuilder::new().num_threads(12).build().unwrap();
+
     let handle = thread::spawn(move || {
-        receiver.run_multithreaded(Duration::from_millis(200), |(new_zoomed_coords, iterations), int| {
-            *done_clone.lock() = false;
+        receiver.run_multithreaded(
+            Duration::from_millis(200),
+            |(new_zoomed_coords, iterations), int| {
+                *done_clone.lock() = false;
 
-            let mut buf_lock = buf_clone.lock();
+                let mut buf_lock = buf_clone.lock();
 
-            for pixel in buf_lock.iter_mut() {
-                pixel.set_none()
-            }
+                for pixel in buf_lock.iter_mut() {
+                    pixel.set_none()
+                }
 
-            render(&mut *buf_lock, width, height, new_zoomed_coords, iterations, int);
-            *done_clone.lock() = true;
-        });
+                render(
+                    &mut *buf_lock,
+                    width,
+                    height,
+                    new_zoomed_coords,
+                    iterations,
+                    int,
+                    &tp,
+                );
+                *done_clone.lock() = true;
+            },
+        );
     });
 
     Handle {

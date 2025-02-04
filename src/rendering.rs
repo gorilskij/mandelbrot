@@ -5,7 +5,7 @@ use indicatif::ProgressBar;
 use num::Complex;
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
-use rayon::prelude::*;
+use rayon::ThreadPool;
 use std::cmp::min;
 use std::ops::Range;
 use waker_interrupter::MultiInterrupter;
@@ -196,7 +196,7 @@ unsafe impl Send for BufView {}
 unsafe impl Sync for BufView {}
 
 fn chunks_2d(width: usize, height: usize, side: usize) -> Vec<(Range<usize>, Range<usize>)> {
-    (0..width)
+    let mut chunks: Vec<_> = (0..width)
         .step_by(side)
         .flat_map(move |x_start| {
             (0..height).step_by(side).map(move |y_start| {
@@ -206,7 +206,14 @@ fn chunks_2d(width: usize, height: usize, side: usize) -> Vec<(Range<usize>, Ran
                 )
             })
         })
-        .collect()
+        .collect();
+
+    chunks.sort_unstable_by_key(|(range_x, range_y)| {
+        let x_diff = range_x.start.abs_diff(width / 2);
+        let y_diff = range_y.start.abs_diff(height / 2);
+        ((x_diff * x_diff) as f64 + (y_diff * y_diff) as f64).sqrt() as usize
+    });
+    chunks
 }
 
 pub fn render(
@@ -216,6 +223,7 @@ pub fn render(
     coords: CoordinatesBox,
     iterations: usize,
     int: MultiInterrupter,
+    tp: &ThreadPool,
 ) {
     let CoordinatesBox { origin, view } = coords;
 
@@ -225,35 +233,43 @@ pub fn render(
     let chunks = chunks_2d(width, height, side);
 
     let pbar = &ProgressBar::new(chunks.len() as u64);
+    let int = &int;
 
-    chunks.into_par_iter().for_each(move |(x_range, y_range)| {
-        if int.interrupted() {
-            pbar.abandon();
-            return;
-        }
-
-        let buf_view = buf_view;
-
-        for r in y_range {
-            for c in x_range.clone() {
-                let c_typed = Length::<_, Pixels>::new(c as f64);
-                let r_typed = Length::<_, Pixels>::new(r as f64);
-
-                let val = calculate(Complex::new(
-                    (c_typed * view + origin.x()).0,
-                    (r_typed * view + origin.y()).0,
-                ), iterations);
-
-                // SAFETY: all writes are disjoint
-                unsafe {
-                    buf_view
-                        .0
-                        .add(r * width + c)
-                        .write(render_pixel(val).into());
+    tp.scope(|s| {
+        for (x_range, y_range) in chunks {
+            s.spawn(move |_| {
+                if int.interrupted() {
+                    pbar.abandon();
+                    return;
                 }
-            }
+
+                let buf_view = buf_view;
+
+                for r in y_range {
+                    for c in x_range.clone() {
+                        let c_typed = Length::<_, Pixels>::new(c as f64);
+                        let r_typed = Length::<_, Pixels>::new(r as f64);
+
+                        let val = calculate(
+                            Complex::new(
+                                (c_typed * view + origin.x()).0,
+                                (r_typed * view + origin.y()).0,
+                            ),
+                            iterations,
+                        );
+
+                        // SAFETY: all writes are disjoint
+                        unsafe {
+                            buf_view
+                                .0
+                                .add(r * width + c)
+                                .write(render_pixel(val).into());
+                        }
+                    }
+                }
+                pbar.inc(1);
+            });
         }
-        pbar.inc(1);
     });
 
     pbar.finish();

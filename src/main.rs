@@ -91,9 +91,11 @@ fn main() {
 
         drawer.update_display_buf();
 
-        if drawer.try_replace_base_buf() {
-            trace!("replaced base buffer");
-            cached = true;
+        if !cached {
+            if drawer.try_replace_base_buf() {
+                trace!("replaced base buffer");
+                cached = true;
+            }
         }
 
         window
