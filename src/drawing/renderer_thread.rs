@@ -88,13 +88,14 @@ pub fn spawn(width: usize, height: usize) -> Handle {
     let handle = thread::spawn(move || {
         receiver.run(Duration::from_millis(200), |new_zoomed_coords, int| {
             *done_clone.lock() = false;
-            render(
-                &mut *buf_clone.lock(),
-                width,
-                height,
-                new_zoomed_coords,
-                int,
-            );
+
+            let mut buf_lock = buf_clone.lock();
+
+            for pixel in buf_lock.iter_mut() {
+                pixel.set_none()
+            }
+
+            render(&mut *buf_lock, width, height, new_zoomed_coords, int);
             *done_clone.lock() = true;
         });
     });

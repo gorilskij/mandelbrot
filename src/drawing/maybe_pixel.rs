@@ -10,6 +10,10 @@ impl MaybePixel {
         MaybePixel(Self::FLAG_BIT)
     }
 
+    pub fn set_none(&mut self) {
+        self.0 |= Self::FLAG_BIT
+    }
+
     pub fn get(self) -> Option<u32> {
         (self.0 & Self::FLAG_BIT == 0).then_some(self.0)
     }

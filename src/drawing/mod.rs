@@ -59,6 +59,8 @@ impl Drawer {
         self.zoomed_coords = new_zoomed_coords;
 
         trace!("drawer: updated zoomed buffer");
+
+        self.update_display_buf();
     }
 
     pub fn update_display_buf(&mut self) {
@@ -66,13 +68,19 @@ impl Drawer {
         // self.display_buf.copy_from_slice(&self.zoomed_buf);
         let render_buf = self.renderer.concurrent_view();
 
+        let mut rendered = 0;
         for i in 0..self.display_buf.len() {
             let rendered_pixel = unsafe { render_buf.add(i).read() };
             self.display_buf[i] = match rendered_pixel.get() {
-                Some(pixel) => pixel,
+                Some(pixel) => {
+                    rendered += 1;
+                    pixel
+                }
                 None => self.zoomed_buf[i],
             }
         }
+
+        trace!("rendered {} / {} pixels", rendered, self.display_buf.len());
     }
 
     // returns true if the base buffer was updated
