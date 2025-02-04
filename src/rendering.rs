@@ -1,3 +1,4 @@
+use crate::drawing::maybe_pixel::MaybePixel;
 use euclid::{Length, Point2D, Scale};
 use hsl::HSL;
 use indicatif::ProgressBar;
@@ -5,7 +6,6 @@ use num::Complex;
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
 use waker_interrupter::Interrupter;
-use crate::drawing::maybe_pixel::MaybePixel;
 
 const ITERATIONS: usize = 2000;
 
@@ -194,7 +194,13 @@ struct BufView(*mut MaybePixel);
 unsafe impl Send for BufView {}
 unsafe impl Sync for BufView {}
 
-pub fn render(buf: &mut [MaybePixel], width: usize, height: usize, coords: CoordinatesBox, mut int: Interrupter) {
+pub fn render(
+    buf: &mut [MaybePixel],
+    width: usize,
+    height: usize,
+    coords: CoordinatesBox,
+    mut int: Interrupter,
+) {
     let CoordinatesBox { origin, view } = coords;
 
     let buf_view = BufView(buf.as_mut_ptr());
@@ -220,7 +226,10 @@ pub fn render(buf: &mut [MaybePixel], width: usize, height: usize, coords: Coord
 
             // SAFETY: all writes are disjoint
             unsafe {
-                buf_view.0.add(r * width + c).write(render_pixel(val).into());
+                buf_view
+                    .0
+                    .add(r * width + c)
+                    .write(render_pixel(val).into());
             }
         }
         pbar.inc(1);

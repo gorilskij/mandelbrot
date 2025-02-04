@@ -1,17 +1,65 @@
-use std::sync::Arc;
-use std::{mem, thread};
-use std::time::Duration;
-use parking_lot::{Mutex, MutexGuard};
-use crate::rendering::{render, CoordinatesBox};
-use waker_interrupter::*;
 use crate::drawing::maybe_pixel::MaybePixel;
+use crate::drawing::renderer_thread::render_buffer::RenderBuffer;
+use crate::rendering::{CoordinatesBox, render};
+use delegate::delegate;
+use parking_lot::{Mutex, MutexGuard};
+use std::sync::Arc;
+use std::time::Duration;
+use std::{mem, thread};
+use waker_interrupter::*;
+
+pub mod render_buffer {
+    use super::*;
+
+    pub type Done = Arc<Mutex<bool>>;
+    pub type Buffer = Arc<Mutex<Box<[MaybePixel]>>>;
+
+    pub struct RenderBuffer {
+        // when the `done` Mutex is held, buffer can be updated but not cleared
+        done: Done,
+        buffer: Buffer,
+        concurrent_view: *const MaybePixel,
+    }
+
+    impl RenderBuffer {
+        pub fn new(width: usize, height: usize) -> (Self, Done, Buffer) {
+            let done = Arc::new(Mutex::new(false));
+
+            let buf = vec![MaybePixel::none(); width * height].into_boxed_slice();
+            let concurrent_view = buf.as_ptr();
+            let buffer = Arc::new(Mutex::new(buf));
+
+            let this = Self {
+                done: done.clone(),
+                buffer: buffer.clone(),
+                concurrent_view,
+            };
+
+            (this, done, buffer)
+        }
+
+        pub fn lock_if_done(&self) -> Option<MutexGuard<Box<[u32]>>> {
+            let done = self.done.lock();
+            if *done {
+                let buf = self.buffer.lock();
+                // SAFETY: if `done` is true, all the values in the buffer are valid u32 colors
+                let buf = unsafe { mem::transmute(buf) };
+                Some(buf)
+            } else {
+                None
+            }
+        }
+
+        pub fn concurrent_view(&self) -> *const MaybePixel {
+            self.concurrent_view
+        }
+    }
+}
 
 pub struct Handle {
     handle: thread::JoinHandle<()>,
     sender: Sender<CoordinatesBox>,
-    // when the `done` Mutex is held, buffer can be updated but not cleared
-    done: Arc<Mutex<bool>>,
-    buffer: Arc<Mutex<Box<[MaybePixel]>>>,
+    buffer: RenderBuffer,
 }
 
 impl Handle {
@@ -19,20 +67,10 @@ impl Handle {
         self.sender.send(coords)
     }
 
-    pub fn get_partial_buffer(&self) -> MutexGuard<Box<[MaybePixel]>> {
-        self.buffer.lock()
-    }
-
-    pub fn get_buffer_if_done(&self) -> Option<&[u32]> {
-        let done = self.done.lock();
-        if *done {
-            let buf = self.buffer.lock();
-            // SAFETY: if `done` is true, all the values in the buffer are valid u32 colors
-            let buf: &[MaybePixel] = &buf;
-            let buf: &[u32] = unsafe { mem::transmute(buf) };
-            Some(buf)
-        } else {
-            None
+    delegate! {
+        to self.buffer {
+            pub fn lock_if_done(&self) -> Option<MutexGuard<Box<[u32]>>>;
+            pub fn concurrent_view(&self) -> *const MaybePixel;
         }
     }
 
@@ -44,15 +82,19 @@ impl Handle {
 
 pub fn spawn(width: usize, height: usize) -> Handle {
     let (sender, receiver) = channel();
-    let done = Arc::new(Mutex::new(false));
-    let buffer = Arc::new(Mutex::new(vec![MaybePixel::none(); width * height].into_boxed_slice()));
 
-    let done_clone = done.clone();
-    let buffer_clone = buffer.clone();
+    let (buffer, done_clone, buf_clone) = RenderBuffer::new(width, height);
+
     let handle = thread::spawn(move || {
         receiver.run(Duration::from_millis(200), |new_zoomed_coords, int| {
             *done_clone.lock() = false;
-            render(&mut *buffer_clone.lock(), width, height, new_zoomed_coords, int);
+            render(
+                &mut *buf_clone.lock(),
+                width,
+                height,
+                new_zoomed_coords,
+                int,
+            );
             *done_clone.lock() = true;
         });
     });
@@ -60,7 +102,6 @@ pub fn spawn(width: usize, height: usize) -> Handle {
     Handle {
         handle,
         sender,
-        done,
         buffer,
     }
 }

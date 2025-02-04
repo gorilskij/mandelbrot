@@ -1,10 +1,10 @@
 mod drawing;
 mod rendering;
 
+use crate::drawing::Drawer;
 use log::trace;
 use minifb::{MouseButton, MouseMode, Window, WindowOptions};
 use rendering::*;
-use crate::drawing::Drawer;
 
 fn main() {
     env_logger::init();
@@ -76,7 +76,11 @@ fn main() {
             trace!("done sending update to drawer");
         }
 
-        if drawer.done
+        drawer.update_display_buf();
+
+        if drawer.try_replace_base_buf() {
+            trace!("replaced base buffer");
+        }
 
         window
             .update_with_buffer(drawer.display_buf(), width, height)

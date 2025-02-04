@@ -1,10 +1,9 @@
-mod renderer_thread;
 pub mod maybe_pixel;
+mod renderer_thread;
 
 use crate::rendering::{CoordinatesBox, sample_zoomed};
-use std::{thread};
-use itertools::izip;
 use log::trace;
+use std::thread;
 
 pub struct Drawer {
     width: usize,
@@ -62,21 +61,33 @@ impl Drawer {
         trace!("drawer: updated zoomed buffer");
     }
 
-    fn update_display_buf(&mut self) {
+    pub fn update_display_buf(&mut self) {
         // TODO: benchmark
         // self.display_buf.copy_from_slice(&self.zoomed_buf);
-        let render_buf = self.renderer.get_partial_buffer();
-        for (zoomed, render, display) in izip!(self.zoomed_buf.iter(), render_buf.iter(), self.display_buf.iter_mut()) {
-            *display = match render.get() {
+        let render_buf = self.renderer.concurrent_view();
+
+        for i in 0..self.display_buf.len() {
+            let rendered_pixel = unsafe { render_buf.add(i).read() };
+            self.display_buf[i] = match rendered_pixel.get() {
                 Some(pixel) => pixel,
-                None => *zoomed,
+                None => self.zoomed_buf[i],
             }
         }
     }
 
-    // returns whether the buffer was updated
-    pub fn try_update_display_buf(&mut self) -> bool {
-        self.renderer.get_partial_buffer()
+    // returns true if the base buffer was updated
+    pub fn try_replace_base_buf(&mut self) -> bool {
+        if self.base_coords == self.zoomed_coords {
+            return false;
+        }
+
+        if let Some(lock) = self.renderer.lock_if_done() {
+            self.base_buf.copy_from_slice(&lock);
+            self.base_coords = self.zoomed_coords;
+            return true;
+        }
+
+        false
     }
 
     pub fn display_buf(&self) -> &[u32] {
