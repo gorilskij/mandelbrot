@@ -50,6 +50,21 @@ pub mod render_buffer {
             }
         }
 
+        pub fn lock_when_done(&self) -> MutexGuard<Box<[u32]>> {
+            loop {
+                let done = self.done.lock();
+                if *done {
+                    let buf = self.buffer.lock();
+                    let buf = unsafe { mem::transmute(buf) };
+                    return buf
+                }
+
+                let _ = done;
+                thread::yield_now();
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+
         pub fn concurrent_view(&self) -> *const MaybePixel {
             self.concurrent_view
         }
@@ -58,19 +73,20 @@ pub mod render_buffer {
 
 pub struct Handle {
     handle: thread::JoinHandle<()>,
-    sender: Sender<CoordinatesBox>,
+    sender: Sender<(CoordinatesBox, usize)>,
     buffer: RenderBuffer,
 }
 
 impl Handle {
-    pub fn update(&self, coords: CoordinatesBox) {
-        self.sender.send(coords)
+    pub fn update(&self, coords: CoordinatesBox, iterations: usize) {
+        self.sender.send((coords, iterations));
     }
 
     delegate! {
         to self.buffer {
             pub fn lock_if_done(&self) -> Option<MutexGuard<Box<[u32]>>>;
             pub fn concurrent_view(&self) -> *const MaybePixel;
+            pub fn lock_when_done(&self) -> MutexGuard<Box<[u32]>>;
         }
     }
 
@@ -86,7 +102,7 @@ pub fn spawn(width: usize, height: usize) -> Handle {
     let (buffer, done_clone, buf_clone) = RenderBuffer::new(width, height);
 
     let handle = thread::spawn(move || {
-        receiver.run_multithreaded(Duration::from_millis(200), |new_zoomed_coords, int| {
+        receiver.run_multithreaded(Duration::from_millis(200), |(new_zoomed_coords, iterations), int| {
             *done_clone.lock() = false;
 
             let mut buf_lock = buf_clone.lock();
@@ -95,7 +111,7 @@ pub fn spawn(width: usize, height: usize) -> Handle {
                 pixel.set_none()
             }
 
-            render(&mut *buf_lock, width, height, new_zoomed_coords, int);
+            render(&mut *buf_lock, width, height, new_zoomed_coords, iterations, int);
             *done_clone.lock() = true;
         });
     });

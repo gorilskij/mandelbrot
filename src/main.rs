@@ -3,7 +3,7 @@ mod rendering;
 
 use crate::drawing::Drawer;
 use log::trace;
-use minifb::{MouseButton, MouseMode, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use rendering::*;
 
 fn main() {
@@ -23,9 +23,13 @@ fn main() {
         view: View::new(1.0 / 300.0),
     };
 
-    let mut drawer = Drawer::new(width, height, coords);
+    let mut iterations = 2000;
+
+    let mut drawer = Drawer::new(width, height, coords, iterations);
 
     let mut dragging = None;
+
+    let mut cached = true;
 
     while window.is_open() {
         let mut zoomed = false;
@@ -72,14 +76,24 @@ fn main() {
 
         if dragged || zoomed {
             trace!("send update to drawer");
-            drawer.new_coords(coords);
+            drawer.update(coords, iterations);
+            cached = false;
             trace!("done sending update to drawer");
+        } else if window.is_key_pressed(Key::Up, KeyRepeat::No) {
+            iterations += 1000;
+            drawer.update(coords, iterations);
+            cached = false;
+        } else if window.is_key_pressed(Key::Down, KeyRepeat::No) {
+            iterations = iterations.saturating_sub(1000);
+            drawer.update(coords, iterations);
+            cached = false;
         }
 
         drawer.update_display_buf();
 
         if drawer.try_replace_base_buf() {
             trace!("replaced base buffer");
+            cached = true;
         }
 
         window

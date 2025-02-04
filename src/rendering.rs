@@ -6,11 +6,9 @@ use num::Complex;
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
 use rayon::prelude::*;
-use std::cmp::{max, min};
+use std::cmp::min;
 use std::ops::Range;
 use waker_interrupter::MultiInterrupter;
-
-const ITERATIONS: usize = 2000;
 
 pub enum Units {}
 pub enum Pixels {}
@@ -43,12 +41,12 @@ where
     }
 }
 
-fn calculate(c: Complex<f64>) -> f64 {
+fn calculate(c: Complex<f64>, iterations: usize) -> f64 {
     let mut z: Complex<f64> = Complex::ZERO;
-    for i in 0..ITERATIONS {
+    for i in 0..iterations {
         z = z * z + c;
         if z.norm() > 4.0 {
-            return i as f64 / ITERATIONS as f64;
+            return i as f64 / iterations as f64;
         }
     }
     0.0
@@ -216,13 +214,14 @@ pub fn render(
     width: usize,
     height: usize,
     coords: CoordinatesBox,
+    iterations: usize,
     int: MultiInterrupter,
 ) {
     let CoordinatesBox { origin, view } = coords;
 
     let buf_view = BufView(buf.as_mut_ptr());
 
-    let side = 100;
+    let side = 50;
     let chunks = chunks_2d(width, height, side);
 
     let pbar = &ProgressBar::new(chunks.len() as u64);
@@ -243,7 +242,7 @@ pub fn render(
                 let val = calculate(Complex::new(
                     (c_typed * view + origin.x()).0,
                     (r_typed * view + origin.y()).0,
-                ));
+                ), iterations);
 
                 // SAFETY: all writes are disjoint
                 unsafe {

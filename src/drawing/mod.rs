@@ -19,7 +19,7 @@ pub struct Drawer {
 }
 
 impl Drawer {
-    pub fn new(width: usize, height: usize, coords: CoordinatesBox) -> Self {
+    pub fn new(width: usize, height: usize, coords: CoordinatesBox, iterations: usize) -> Self {
         let mut this = Self {
             width,
             height,
@@ -33,15 +33,17 @@ impl Drawer {
             renderer: renderer_thread::spawn(width, height),
         };
 
-        // force redraw
-        this.new_coords(coords);
+        // initial render
+        this.update(coords, iterations);
         this.update_display_buf();
+        this.force_replace_base_buf();
+
         this
     }
 
-    pub fn new_coords(&mut self, new_zoomed_coords: CoordinatesBox) {
+    pub fn update(&mut self, new_zoomed_coords: CoordinatesBox, iterations: usize) {
         // relaunch renderer thread
-        self.renderer.update(new_zoomed_coords);
+        self.renderer.update(new_zoomed_coords, iterations);
 
         trace!("drawer: sent update to renderer");
 
@@ -85,10 +87,6 @@ impl Drawer {
 
     // returns true if the base buffer was updated
     pub fn try_replace_base_buf(&mut self) -> bool {
-        if self.base_coords == self.zoomed_coords {
-            return false;
-        }
-
         if let Some(lock) = self.renderer.lock_if_done() {
             self.base_buf.copy_from_slice(&lock);
             self.base_coords = self.zoomed_coords;
@@ -96,6 +94,13 @@ impl Drawer {
         }
 
         false
+    }
+
+    // blocking
+    pub fn force_replace_base_buf(&mut self) {
+        let lock = self.renderer.lock_when_done();
+        self.base_buf.copy_from_slice(&lock);
+        self.base_coords = self.zoomed_coords;
     }
 
     pub fn display_buf(&self) -> &[u32] {
