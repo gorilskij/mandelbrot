@@ -6,6 +6,8 @@ use num::Complex;
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
 use rayon::prelude::*;
+use std::cmp::{max, min};
+use std::ops::Range;
 use waker_interrupter::MultiInterrupter;
 
 const ITERATIONS: usize = 2000;
@@ -195,6 +197,20 @@ struct BufView(*mut MaybePixel);
 unsafe impl Send for BufView {}
 unsafe impl Sync for BufView {}
 
+fn chunks_2d(width: usize, height: usize, side: usize) -> Vec<(Range<usize>, Range<usize>)> {
+    (0..width)
+        .step_by(side)
+        .flat_map(move |x_start| {
+            (0..height).step_by(side).map(move |y_start| {
+                (
+                    x_start..min(x_start + side, width),
+                    y_start..min(y_start + side, height),
+                )
+            })
+        })
+        .collect()
+}
+
 pub fn render(
     buf: &mut [MaybePixel],
     width: usize,
@@ -206,10 +222,12 @@ pub fn render(
 
     let buf_view = BufView(buf.as_mut_ptr());
 
-    let pbar = &ProgressBar::new(height as u64);
+    let side = 100;
+    let chunks = chunks_2d(width, height, side);
 
-    (0..height).into_par_iter().for_each(move |r| {
-        // for r in 0..height {
+    let pbar = &ProgressBar::new(chunks.len() as u64);
+
+    chunks.into_par_iter().for_each(move |(x_range, y_range)| {
         if int.interrupted() {
             pbar.abandon();
             return;
@@ -217,21 +235,23 @@ pub fn render(
 
         let buf_view = buf_view;
 
-        for c in 0..width {
-            let c_typed = Length::<_, Pixels>::new(c as f64);
-            let r_typed = Length::<_, Pixels>::new(r as f64);
+        for r in y_range {
+            for c in x_range.clone() {
+                let c_typed = Length::<_, Pixels>::new(c as f64);
+                let r_typed = Length::<_, Pixels>::new(r as f64);
 
-            let val = calculate(Complex::new(
-                (c_typed * view + origin.x()).0,
-                (r_typed * view + origin.y()).0,
-            ));
+                let val = calculate(Complex::new(
+                    (c_typed * view + origin.x()).0,
+                    (r_typed * view + origin.y()).0,
+                ));
 
-            // SAFETY: all writes are disjoint
-            unsafe {
-                buf_view
-                    .0
-                    .add(r * width + c)
-                    .write(render_pixel(val).into());
+                // SAFETY: all writes are disjoint
+                unsafe {
+                    buf_view
+                        .0
+                        .add(r * width + c)
+                        .write(render_pixel(val).into());
+                }
             }
         }
         pbar.inc(1);
