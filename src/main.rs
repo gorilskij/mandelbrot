@@ -1,9 +1,10 @@
-mod draw_thread;
+mod drawing;
 mod rendering;
 
 use log::trace;
 use minifb::{MouseButton, MouseMode, Window, WindowOptions};
 use rendering::*;
+use crate::drawing::Drawer;
 
 fn main() {
     env_logger::init();
@@ -22,10 +23,8 @@ fn main() {
         view: View::new(1.0 / 300.0),
     };
 
-    let draw_thread = draw_thread::spawn(width, height, coords);
+    let mut drawer = Drawer::new(width, height, coords);
 
-    let mut first_time = true;
-    let mut cached = None;
     let mut dragging = None;
 
     while window.is_open() {
@@ -46,10 +45,6 @@ fn main() {
                     let drag =
                         Point::<Pixels>::new((mouse_x - last_x) as f64, (mouse_y - last_y) as f64);
                     coords.origin -= (drag * coords.view).to_vector();
-                    {
-                        let zoomed = &mut draw_thread.buffer.zoomed.lock();
-                        zoomed.coords.origin = coords.origin;
-                    }
                 }
                 dragging = Some((mouse_x, mouse_y));
             } else {
@@ -71,60 +66,22 @@ fn main() {
 
                     coords.origin = cursor_abs + (coords.origin - cursor_abs) / multiplier;
                     coords.view = View::new(coords.view.0 / multiplier);
-
-                    {
-                        let zoomed = &mut draw_thread.buffer.zoomed.lock();
-                        zoomed.coords = coords;
-                    }
                 }
             }
         }
 
-        let cache_key = coords;
-
-        if cached != Some(cache_key) {
-            if first_time {
-                {
-                    let base = &mut draw_thread.buffer.base.lock();
-                    let zoomed = &mut draw_thread.buffer.zoomed.lock();
-
-                    render(&mut base.buffer, width, height, coords);
-                    zoomed.buffer.copy_from_slice(&base.buffer);
-                    base.coords = coords;
-                }
-
-                first_time = false;
-            } else if dragged || zoomed {
-                {
-                    let base = &mut draw_thread.buffer.base.lock();
-                    let zoomed = &mut draw_thread.buffer.zoomed.lock();
-
-                    sample_zoomed(
-                        &base.buffer,
-                        &mut zoomed.buffer,
-                        //
-                        width,
-                        height,
-                        //
-                        base.coords,
-                        //
-                        coords,
-                    );
-                }
-
-                draw_thread.notify_run();
-            }
-            cached = Some(cache_key);
+        if dragged || zoomed {
+            trace!("send update to drawer");
+            drawer.new_coords(coords);
+            trace!("done sending update to drawer");
         }
 
-        {
-            let zoomed = &draw_thread.buffer.zoomed.lock();
-            window
-                .update_with_buffer(&zoomed.buffer, width, height)
-                .unwrap();
-        }
+        if drawer.done
+
+        window
+            .update_with_buffer(drawer.display_buf(), width, height)
+            .unwrap();
     }
 
-    draw_thread.notify_terminate();
-    draw_thread.join().unwrap();
+    drawer.stop().unwrap();
 }

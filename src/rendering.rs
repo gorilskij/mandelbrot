@@ -4,7 +4,8 @@ use indicatif::ProgressBar;
 use num::Complex;
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
-use rayon::prelude::*;
+use waker_interrupter::Interrupter;
+use crate::drawing::maybe_pixel::MaybePixel;
 
 const ITERATIONS: usize = 2000;
 
@@ -119,7 +120,6 @@ pub fn sample_zoomed(
     height: usize,
     //
     src_coords: CoordinatesBox,
-    //
     dest_coords: CoordinatesBox,
 ) {
     let fwidth = width as f64;
@@ -189,18 +189,24 @@ pub fn sample_zoomed(
 }
 
 #[derive(Copy, Clone)]
-struct BufView(*mut u32);
+struct BufView(*mut MaybePixel);
 
 unsafe impl Send for BufView {}
 unsafe impl Sync for BufView {}
 
-pub fn render(buf: &mut [u32], width: usize, height: usize, coords: CoordinatesBox) {
+pub fn render(buf: &mut [MaybePixel], width: usize, height: usize, coords: CoordinatesBox, mut int: Interrupter) {
     let CoordinatesBox { origin, view } = coords;
 
     let buf_view = BufView(buf.as_mut_ptr());
 
     let pbar = &ProgressBar::new(height as u64);
-    (0..height).into_par_iter().for_each(move |r| {
+    // (0..height).into_par_iter().for_each(move |r| {
+    for r in 0..height {
+        if int.interrupted() {
+            pbar.abandon();
+            return;
+        }
+
         let buf_view = buf_view;
 
         for c in 0..width {
@@ -214,10 +220,11 @@ pub fn render(buf: &mut [u32], width: usize, height: usize, coords: CoordinatesB
 
             // SAFETY: all writes are disjoint
             unsafe {
-                buf_view.0.add(r * width + c).write(render_pixel(val));
+                buf_view.0.add(r * width + c).write(render_pixel(val).into());
             }
         }
         pbar.inc(1);
-    });
+    }
+
     pbar.finish();
 }
