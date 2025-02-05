@@ -15,5 +15,5 @@ num = "0.4.3"
 palette = "0.7.6"
 parking_lot = "0.12.3"
 rayon = "1.10.0"
-threadpool = "1.8.1"
-waker_interrupter = { git = "https://github.com/gorilskij/waker_interrupter" }
+#waker_interrupter = { git = "https://github.com/gorilskij/waker_interrupter" }
+waker_interrupter = { path = "../waker_interrupter" }

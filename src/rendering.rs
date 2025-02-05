@@ -229,7 +229,7 @@ pub fn render(
 
     let buf_view = BufView(buf.as_mut_ptr());
 
-    let side = 50;
+    let side = 20;
     let chunks = chunks_2d(width, height, side);
 
     let pbar = &ProgressBar::new(chunks.len() as u64);

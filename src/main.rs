@@ -1,8 +1,9 @@
 mod drawing;
 mod rendering;
 
+use std::time::{Duration, Instant};
 use crate::drawing::Drawer;
-use log::trace;
+use log::{info, trace};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use rendering::*;
 
@@ -23,7 +24,7 @@ fn main() {
         view: View::new(1.0 / 300.0),
     };
 
-    let mut iterations = 2000;
+    let mut iterations = 2048;
 
     let mut drawer = Drawer::new(width, height, coords, iterations);
 
@@ -80,13 +81,17 @@ fn main() {
             cached = false;
             trace!("done sending update to drawer");
         } else if window.is_key_pressed(Key::Up, KeyRepeat::No) {
-            iterations += 1000;
+            iterations *= 2;
+            info!("iterations: {iterations}");
             drawer.update(coords, iterations);
             cached = false;
         } else if window.is_key_pressed(Key::Down, KeyRepeat::No) {
-            iterations = iterations.saturating_sub(1000);
-            drawer.update(coords, iterations);
-            cached = false;
+            if iterations > 1 {
+                iterations /= 2;
+                info!("iterations: {iterations}");
+                drawer.update(coords, iterations);
+                cached = false;
+            }
         }
 
         drawer.update_display_buf();

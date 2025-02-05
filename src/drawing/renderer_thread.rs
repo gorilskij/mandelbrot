@@ -106,7 +106,9 @@ pub fn spawn(width: usize, height: usize) -> Handle {
 
     let handle = thread::spawn(move || {
         receiver.run_multithreaded(
-            Duration::from_millis(200),
+            None,
+            // Some(Duration::from_millis(100)),
+            None,
             |(new_zoomed_coords, iterations), int| {
                 *done_clone.lock() = false;
 
