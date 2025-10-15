@@ -5,9 +5,10 @@ use hsl::HSL;
 use indicatif::ProgressBar;
 use num::Complex;
 use palette::rgb::Rgb;
-use palette::{Mix, Srgb, rgb};
+use palette::{IntoColor, Mix, Srgb, rgb};
 use rayon::ThreadPool;
 use std::cmp::min;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use waker_interrupter::MultiInterrupter;
 
@@ -42,15 +43,15 @@ where
     }
 }
 
-fn calculate(c: Complex<f64>, iterations: usize) -> f64 {
+fn calculate(c: Complex<f64>, iterations: usize) -> Option<NonZeroUsize> {
     let mut z: Complex<f64> = Complex::ZERO;
-    for i in 0..iterations {
+    for i in 1..iterations + 1 {
         z = z * z + c;
         if z.norm() > 4.0 {
-            return i as f64 / iterations as f64;
+            return Some(NonZeroUsize::new(i).unwrap());
         }
     }
-    0.0
+    None
 }
 
 fn apply_sharpness(val: f64, sharpness: f64) -> f64 {
@@ -68,28 +69,26 @@ fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-fn render_pixel(val: f64) -> u32 {
-    if val == 0.0 {
-        0
-    } else {
-        // let h = apply_sharpness(val, 30.0) / 6.0;
-        // let l = apply_sharpness(val, 20.0) * 0.6;
-        //
-        // let hsl = HSL {
-        //     h: h * 360.0,
-        //     s: 1.0,
-        //     l,
-        // };
+fn render_pixel(val: Option<NonZeroUsize>) -> u32 {
+    if let Some(val) = val {
+        // [0, 1)
+        let f = 1.0 - 1.0 / (val.get() as f64 / 100.0 + 1.0);
 
         let hsl = HSL {
-            h: val * 360.0,
-            s: 1.0,
-            l: 0.5,
+            // h: val.get() as f64 % 360.0,
+            // s: 0.7,
+            // // l: 0.5,
+            // l: (val.get() as f64 / 10.0).sin() * 0.1 + 0.5,
+            h: (val.get() as f64 / 10.0).sin() * 180.0,
+            s: 0.7,
+            // l: 0.5,
+            l: (val.get() as f64 / (10.0 * std::f64::consts::E)).sin() * 0.4 + 0.5,
         };
 
         let (r, g, b) = hsl.to_rgb();
-
         rgb_to_u32(r, g, b)
+    } else {
+        0
     }
 }
 

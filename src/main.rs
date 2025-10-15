@@ -5,6 +5,7 @@ use crate::drawing::Drawer;
 use log::{info, trace};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use rendering::*;
+use std::time::{Duration, Instant};
 
 fn main() {
     env_logger::init();
