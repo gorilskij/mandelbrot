@@ -1,7 +1,8 @@
 pub mod maybe_pixel;
 mod renderer_thread;
 
-use crate::rendering::{CoordinatesBox, sample_zoomed};
+use crate::rendering::{CoordinatesBox, Pixels, sample_zoomed};
+use euclid::Point2D;
 use log::trace;
 use std::thread;
 
@@ -56,7 +57,7 @@ impl Drawer {
         };
 
         // initial render
-        this.update(coords, iterations);
+        this.update(coords, iterations, None);
         this.update_display_buf();
         this.force_cache_buf();
 
@@ -66,12 +67,18 @@ impl Drawer {
     /// Pass new view and iterations parameters to the renderer and start
     /// a rendering run (cancel any ongoing rendering). Also update the
     /// zoom buffer (fast) as a preview.
-    pub fn update(&mut self, new_zoomed_coords: CoordinatesBox, iterations: usize) {
+    pub fn update(
+        &mut self,
+        new_zoomed_coords: CoordinatesBox,
+        iterations: usize,
+        cursor_rel: Option<Point2D<usize, Pixels>>,
+    ) {
         // invalidate cache
         self.cache_fresh = false;
 
         // relaunch renderer thread
-        self.renderer.update(new_zoomed_coords, iterations);
+        self.renderer
+            .update(new_zoomed_coords, iterations, cursor_rel);
 
         trace!("drawer: sent update to renderer");
 

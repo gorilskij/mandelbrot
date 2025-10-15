@@ -2,6 +2,7 @@ mod drawing;
 mod rendering;
 
 use crate::drawing::Drawer;
+use euclid::Point2D;
 use log::{info, trace};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use rendering::*;
@@ -27,13 +28,18 @@ fn main() {
 
     let mut drawer = Drawer::new(width, height, coords, iterations);
 
-    let mut dragging = None;
+    let mut dragging = None::<Point2D<f64, Pixels>>;
 
     while window.is_open() {
         let mut zoomed = false;
         let mut dragged = false;
 
-        if let Some((mouse_x, mouse_y)) = window.get_mouse_pos(MouseMode::Discard) {
+        // mouse position in pixels with the top-left corner of the window as the origin
+        let cursor_rel = window
+            .get_mouse_pos(MouseMode::Discard)
+            .map(|(x, y)| Point::<Pixels>::new(x as f64, y as f64));
+
+        if let Some(cursor_rel) = cursor_rel {
             let left_mouse_down = window.get_mouse_down(MouseButton::Left);
 
             if left_mouse_down {
@@ -41,14 +47,13 @@ fn main() {
                     trace!("start dragging");
                 }
 
-                if let Some((last_x, last_y)) = dragging {
+                if let Some(last) = dragging {
                     dragged = true;
 
-                    let drag =
-                        Point::<Pixels>::new((mouse_x - last_x) as f64, (mouse_y - last_y) as f64);
+                    let drag: Point2D<f64, Pixels> = (cursor_rel - last).to_point();
                     coords.origin -= (drag * coords.view).to_vector();
                 }
-                dragging = Some((mouse_x, mouse_y));
+                dragging = Some(cursor_rel);
             } else {
                 if dragging.is_some() {
                     trace!("stop dragging");
@@ -62,7 +67,6 @@ fn main() {
                 if let Some((_, scroll_y)) = window.get_scroll_wheel() {
                     zoomed = true;
 
-                    let cursor_rel = Point::<Pixels>::new(mouse_x as f64, mouse_y as f64);
                     let cursor_abs = coords.origin + (cursor_rel * coords.view).to_vector();
                     let multiplier = 1.0 + (scroll_y as f64 / 100.0).clamp(-0.2, 0.2);
 
@@ -72,19 +76,22 @@ fn main() {
             }
         }
 
+        // cast to usize
+        let cursor_rel = cursor_rel.map(|p| Point2D::<_, Pixels>::new(p.x as usize, p.y as usize));
+
         if dragged || zoomed {
             trace!("send update to drawer");
-            drawer.update(coords, iterations);
+            drawer.update(coords, iterations, cursor_rel);
             trace!("done sending update to drawer");
         } else if window.is_key_pressed(Key::Up, KeyRepeat::No) {
             iterations *= 2;
             info!("iterations: {iterations}");
-            drawer.update(coords, iterations);
+            drawer.update(coords, iterations, cursor_rel);
         } else if window.is_key_pressed(Key::Down, KeyRepeat::No) {
             if iterations > 1 {
                 iterations /= 2;
                 info!("iterations: {iterations}");
-                drawer.update(coords, iterations);
+                drawer.update(coords, iterations, cursor_rel);
             }
         }
 

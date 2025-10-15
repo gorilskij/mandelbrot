@@ -200,7 +200,12 @@ unsafe impl Sync for BufView {}
 /// by distance from the center, the idea is to redraw the
 /// canvas in a circle emanating from the center to prioritize
 /// the most interesting parts
-fn chunks_2d(width: usize, height: usize, side: usize) -> Vec<(Range<usize>, Range<usize>)> {
+fn chunks_2d(
+    width: usize,
+    height: usize,
+    center: Point2D<usize, Pixels>,
+    side: usize,
+) -> Vec<(Range<usize>, Range<usize>)> {
     let mut chunks: Vec<_> = (0..width)
         .step_by(side)
         .flat_map(move |x_start| {
@@ -214,8 +219,8 @@ fn chunks_2d(width: usize, height: usize, side: usize) -> Vec<(Range<usize>, Ran
         .collect();
 
     chunks.sort_unstable_by_key(|(range_x, range_y)| {
-        let x_diff = range_x.start.abs_diff(width / 2);
-        let y_diff = range_y.start.abs_diff(height / 2);
+        let x_diff = range_x.start.abs_diff(center.x as usize);
+        let y_diff = range_y.start.abs_diff(center.y as usize);
         ((x_diff * x_diff) as f64 + (y_diff * y_diff) as f64).sqrt() as usize
     });
     chunks
@@ -225,6 +230,7 @@ pub fn render(
     buf: &mut [MaybePixel],
     width: usize,
     height: usize,
+    center: Point2D<usize, Pixels>,
     coords: CoordinatesBox,
     iterations: usize,
     int: MultiInterrupter,
@@ -235,7 +241,7 @@ pub fn render(
     let buf_view = BufView(buf.as_mut_ptr());
 
     let side = 20;
-    let chunks = chunks_2d(width, height, side);
+    let chunks = chunks_2d(width, height, center, side);
 
     let pbar = &ProgressBar::new(chunks.len() as u64);
     let int = &int;

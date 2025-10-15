@@ -1,7 +1,8 @@
 use crate::drawing::maybe_pixel::MaybePixel;
 use crate::drawing::renderer_thread::render_buffer::RenderBuffer;
-use crate::rendering::{CoordinatesBox, render};
+use crate::rendering::{CoordinatesBox, Pixels, render};
 use delegate::delegate;
+use euclid::Point2D;
 use parking_lot::{Mutex, MutexGuard};
 use rayon::ThreadPoolBuilder;
 use std::sync::Arc;
@@ -74,13 +75,18 @@ pub mod render_buffer {
 
 pub struct Handle {
     handle: thread::JoinHandle<()>,
-    sender: wi::Sender<(CoordinatesBox, usize)>,
+    sender: wi::Sender<(CoordinatesBox, usize, Option<Point2D<usize, Pixels>>)>,
     buffer: RenderBuffer,
 }
 
 impl Handle {
-    pub fn update(&self, coords: CoordinatesBox, iterations: usize) {
-        self.sender.send((coords, iterations));
+    pub fn update(
+        &self,
+        coords: CoordinatesBox,
+        iterations: usize,
+        cursor_rel: Option<Point2D<usize, Pixels>>,
+    ) {
+        self.sender.send((coords, iterations, cursor_rel));
     }
 
     delegate! {
@@ -105,26 +111,33 @@ pub fn spawn(width: usize, height: usize) -> Handle {
     let tp = ThreadPoolBuilder::new().num_threads(12).build().unwrap();
 
     let handle = thread::spawn(move || {
-        receiver.run_multithreaded(None, None, |(new_zoomed_coords, iterations), int| {
-            *done_clone.lock() = false;
+        receiver.run_multithreaded(
+            None,
+            None,
+            |(new_zoomed_coords, iterations, cursor_rel): (_, _, Option<_>), int| {
+                *done_clone.lock() = false;
 
-            let mut buf_lock = buf_clone.lock();
+                let mut buf_lock = buf_clone.lock();
 
-            for pixel in buf_lock.iter_mut() {
-                pixel.set_none()
-            }
+                for pixel in buf_lock.iter_mut() {
+                    pixel.set_none()
+                }
 
-            render(
-                &mut *buf_lock,
-                width,
-                height,
-                new_zoomed_coords,
-                iterations,
-                int,
-                &tp,
-            );
-            *done_clone.lock() = true;
-        });
+                let center = cursor_rel.unwrap_or(Point2D::<_, Pixels>::new(width / 2, height / 2));
+
+                render(
+                    &mut *buf_lock,
+                    width,
+                    height,
+                    center,
+                    new_zoomed_coords,
+                    iterations,
+                    int,
+                    &tp,
+                );
+                *done_clone.lock() = true;
+            },
+        );
     });
 
     Handle {
