@@ -7,7 +7,7 @@ use rayon::ThreadPoolBuilder;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{mem, thread};
-use waker_interrupter::*;
+use waker_interrupter as wi;
 
 pub mod render_buffer {
     use super::*;
@@ -74,7 +74,7 @@ pub mod render_buffer {
 
 pub struct Handle {
     handle: thread::JoinHandle<()>,
-    sender: Sender<(CoordinatesBox, usize)>,
+    sender: wi::Sender<(CoordinatesBox, usize)>,
     buffer: RenderBuffer,
 }
 
@@ -98,7 +98,7 @@ impl Handle {
 }
 
 pub fn spawn(width: usize, height: usize) -> Handle {
-    let (sender, receiver) = channel();
+    let (sender, receiver) = wi::channel();
 
     let (buffer, done_clone, buf_clone) = RenderBuffer::new(width, height);
 

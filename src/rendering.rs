@@ -5,7 +5,7 @@ use hsl::HSL;
 use indicatif::ProgressBar;
 use num::Complex;
 use palette::rgb::Rgb;
-use palette::{IntoColor, Mix, Srgb, rgb};
+use palette::{Mix, Srgb, rgb};
 use rayon::ThreadPool;
 use std::cmp::min;
 use std::num::NonZeroUsize;
