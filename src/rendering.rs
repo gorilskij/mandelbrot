@@ -41,8 +41,7 @@ where
     }
 }
 
-fn calculate(c: Complex<f64>, iterations: usize) -> f64 {
-    let mut z: Complex<f64> = Complex::ZERO;
+fn calculate(mut z: Complex<f64>, c: Complex<f64>, iterations: usize) -> f64 {
     for i in 0..iterations {
         z = z * z + c;
         if z.norm() > 4.0 {
@@ -221,6 +220,7 @@ pub fn render(
     width: usize,
     height: usize,
     coords: CoordinatesBox,
+    z: Complex<f64>,
     iterations: usize,
     int: MultiInterrupter,
     tp: &ThreadPool,
@@ -251,6 +251,7 @@ pub fn render(
                         let r_typed = Length::<_, Pixels>::new(r as f64);
 
                         let val = calculate(
+                            z,
                             Complex::new(
                                 (c_typed * view + origin.x()).0,
                                 (r_typed * view + origin.y()).0,

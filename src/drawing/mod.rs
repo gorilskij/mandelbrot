@@ -3,6 +3,7 @@ mod renderer_thread;
 
 use crate::rendering::{CoordinatesBox, sample_zoomed};
 use log::trace;
+use num::Complex;
 use std::thread;
 
 pub struct Drawer {
@@ -19,7 +20,13 @@ pub struct Drawer {
 }
 
 impl Drawer {
-    pub fn new(width: usize, height: usize, coords: CoordinatesBox, iterations: usize) -> Self {
+    pub fn new(
+        width: usize,
+        height: usize,
+        coords: CoordinatesBox,
+        z: Complex<f64>,
+        iterations: usize,
+    ) -> Self {
         let mut this = Self {
             width,
             height,
@@ -34,16 +41,21 @@ impl Drawer {
         };
 
         // initial render
-        this.update(coords, iterations);
+        this.update(coords, z, iterations);
         this.update_display_buf();
         this.force_replace_base_buf();
 
         this
     }
 
-    pub fn update(&mut self, new_zoomed_coords: CoordinatesBox, iterations: usize) {
+    pub fn update(
+        &mut self,
+        new_zoomed_coords: CoordinatesBox,
+        z: Complex<f64>,
+        iterations: usize,
+    ) {
         // relaunch renderer thread
-        self.renderer.update(new_zoomed_coords, iterations);
+        self.renderer.update(new_zoomed_coords, z, iterations);
 
         trace!("drawer: sent update to renderer");
 

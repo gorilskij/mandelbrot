@@ -2,6 +2,7 @@ use crate::drawing::maybe_pixel::MaybePixel;
 use crate::drawing::renderer_thread::render_buffer::RenderBuffer;
 use crate::rendering::{CoordinatesBox, render};
 use delegate::delegate;
+use num::Complex;
 use parking_lot::{Mutex, MutexGuard};
 use rayon::ThreadPoolBuilder;
 use std::sync::Arc;
@@ -74,13 +75,13 @@ pub mod render_buffer {
 
 pub struct Handle {
     handle: thread::JoinHandle<()>,
-    sender: Sender<(CoordinatesBox, usize)>,
+    sender: Sender<(CoordinatesBox, Complex<f64>, usize)>,
     buffer: RenderBuffer,
 }
 
 impl Handle {
-    pub fn update(&self, coords: CoordinatesBox, iterations: usize) {
-        self.sender.send((coords, iterations));
+    pub fn update(&self, coords: CoordinatesBox, z: Complex<f64>, iterations: usize) {
+        self.sender.send((coords, z, iterations));
     }
 
     delegate! {
@@ -109,7 +110,7 @@ pub fn spawn(width: usize, height: usize) -> Handle {
             None,
             // Some(Duration::from_millis(100)),
             None,
-            |(new_zoomed_coords, iterations), int| {
+            |(new_zoomed_coords, z, iterations), int| {
                 *done_clone.lock() = false;
 
                 let mut buf_lock = buf_clone.lock();
@@ -123,6 +124,7 @@ pub fn spawn(width: usize, height: usize) -> Handle {
                     width,
                     height,
                     new_zoomed_coords,
+                    z,
                     iterations,
                     int,
                     &tp,

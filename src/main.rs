@@ -1,10 +1,10 @@
 mod drawing;
 mod rendering;
 
-use std::time::{Duration, Instant};
 use crate::drawing::Drawer;
 use log::{info, trace};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use num::Complex;
 use rendering::*;
 
 fn main() {
@@ -26,7 +26,8 @@ fn main() {
 
     let mut iterations = 2048;
 
-    let mut drawer = Drawer::new(width, height, coords, iterations);
+    let mut z = Complex::ZERO;
+    let mut drawer = Drawer::new(width, height, coords, z, iterations);
 
     let mut dragging = None;
 
@@ -77,21 +78,41 @@ fn main() {
 
         if dragged || zoomed {
             trace!("send update to drawer");
-            drawer.update(coords, iterations);
+            drawer.update(coords, z, iterations);
             cached = false;
             trace!("done sending update to drawer");
-        } else if window.is_key_pressed(Key::Up, KeyRepeat::No) {
+        } else if window.is_key_pressed(Key::Key1, KeyRepeat::No) {
             iterations *= 2;
             info!("iterations: {iterations}");
-            drawer.update(coords, iterations);
+            drawer.update(coords, z, iterations);
             cached = false;
-        } else if window.is_key_pressed(Key::Down, KeyRepeat::No) {
+        } else if window.is_key_pressed(Key::Key2, KeyRepeat::No) {
             if iterations > 1 {
                 iterations /= 2;
                 info!("iterations: {iterations}");
-                drawer.update(coords, iterations);
+                drawer.update(coords, z, iterations);
                 cached = false;
             }
+        } else if window.is_key_pressed(Key::Up, KeyRepeat::Yes) {
+            z.im += 0.01;
+            info!("z: {z}");
+            drawer.update(coords, z, iterations);
+            cached = false;
+        } else if window.is_key_pressed(Key::Down, KeyRepeat::Yes) {
+            z.im -= 0.01;
+            info!("z: {z}");
+            drawer.update(coords, z, iterations);
+            cached = false;
+        } else if window.is_key_pressed(Key::Left, KeyRepeat::Yes) {
+            z.re -= 0.01;
+            info!("z: {z}");
+            drawer.update(coords, z, iterations);
+            cached = false;
+        } else if window.is_key_pressed(Key::Right, KeyRepeat::Yes) {
+            z.re += 0.01;
+            info!("z: {z}");
+            drawer.update(coords, z, iterations);
+            cached = false;
         }
 
         drawer.update_display_buf();
