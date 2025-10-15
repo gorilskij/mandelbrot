@@ -39,7 +39,7 @@ pub mod render_buffer {
             (this, done, buffer)
         }
 
-        pub fn lock_if_done(&self) -> Option<MutexGuard<Box<[u32]>>> {
+        pub fn lock_if_done(&self) -> Option<MutexGuard<'_, Box<[u32]>>> {
             let done = self.done.lock();
             if *done {
                 let buf = self.buffer.lock();
@@ -51,7 +51,7 @@ pub mod render_buffer {
             }
         }
 
-        pub fn lock_when_done(&self) -> MutexGuard<Box<[u32]>> {
+        pub fn lock_when_done(&self) -> MutexGuard<'_, Box<[u32]>> {
             loop {
                 let done = self.done.lock();
                 if *done {
@@ -85,9 +85,9 @@ impl Handle {
 
     delegate! {
         to self.buffer {
-            pub fn lock_if_done(&self) -> Option<MutexGuard<Box<[u32]>>>;
+            pub fn lock_if_done(&self) -> Option<MutexGuard<'_, Box<[u32]>>>;
             pub fn concurrent_view(&self) -> *const MaybePixel;
-            pub fn lock_when_done(&self) -> MutexGuard<Box<[u32]>>;
+            pub fn lock_when_done(&self) -> MutexGuard<'_, Box<[u32]>>;
         }
     }
 
@@ -105,31 +105,26 @@ pub fn spawn(width: usize, height: usize) -> Handle {
     let tp = ThreadPoolBuilder::new().num_threads(12).build().unwrap();
 
     let handle = thread::spawn(move || {
-        receiver.run_multithreaded(
-            None,
-            // Some(Duration::from_millis(100)),
-            None,
-            |(new_zoomed_coords, iterations), int| {
-                *done_clone.lock() = false;
+        receiver.run_multithreaded(None, None, |(new_zoomed_coords, iterations), int| {
+            *done_clone.lock() = false;
 
-                let mut buf_lock = buf_clone.lock();
+            let mut buf_lock = buf_clone.lock();
 
-                for pixel in buf_lock.iter_mut() {
-                    pixel.set_none()
-                }
+            for pixel in buf_lock.iter_mut() {
+                pixel.set_none()
+            }
 
-                render(
-                    &mut *buf_lock,
-                    width,
-                    height,
-                    new_zoomed_coords,
-                    iterations,
-                    int,
-                    &tp,
-                );
-                *done_clone.lock() = true;
-            },
-        );
+            render(
+                &mut *buf_lock,
+                width,
+                height,
+                new_zoomed_coords,
+                iterations,
+                int,
+                &tp,
+            );
+            *done_clone.lock() = true;
+        });
     });
 
     Handle {
