@@ -1,11 +1,13 @@
 use crate::drawing::maybe_pixel::MaybePixel;
 use euclid::{Length, Point2D, Scale};
+use gat_lending_iterator::LendingIterator;
 use hsl::HSL;
 use indicatif::ProgressBar;
-use num::Complex;
+use num::{Complex, Integer};
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
 use rayon::ThreadPool;
+use simd_quad::*;
 use std::cmp::min;
 use std::ops::Range;
 use waker_interrupter::MultiInterrupter;
@@ -52,7 +54,137 @@ fn calculate(c: Complex<f64>, iterations: usize) -> f64 {
     0.0
 }
 
-fn apply_sharpness(val: f64, sharpness: f64) -> f64 {
+fn calculate_abs(c: Complex<f32>, iterations: usize) -> usize {
+    let mut z: Complex<f32> = Complex::ZERO;
+    for i in 0..iterations {
+        z = z * z + c;
+        if z.norm() > 4.0 {
+            return i;
+        }
+    }
+    0
+}
+
+fn calculate_simd<F>(c_re: X4<F>, c_im: X4<F>, iterations: usize) -> X4<<F as SimdX4>::BoolType>
+where
+    X4<F>: SimdX4Float<F>,
+{
+    #[allow(type_alias_bounds)]
+    type U<T: SimdX4> = T::BoolType;
+
+    let mut z_re = X4::<F>::dup(0.0);
+    let mut z_im = X4::<F>::dup(0.0);
+
+    let one_uint = X4::<U<F>>::dup(1u8);
+    let two_float = X4::<F>::dup(2.0);
+    let four_float = X4::<F>::dup(4.0);
+
+    let mut final_i = X4::<U<F>>::dup(0u8);
+
+    let mut z_re_sq = z_re * z_re;
+    let mut z_im_sq = z_im * z_im;
+
+    let mut i = X4::<U<F>>::dup(0u8);
+    for _ in 0..iterations {
+        let final_unset = final_i.eq_zero();
+
+        // if all final_i are set
+        if final_unset.all_zero() {
+            return final_i;
+        }
+
+        // z = z * z + c;
+        let new_z_re = z_re_sq - z_im_sq + c_re;
+        z_im = two_float * z_re * z_im + c_im;
+        z_re = new_z_re;
+
+        z_re_sq = z_re * z_re;
+        z_im_sq = z_im * z_im;
+        let norm = (z_re_sq + z_im_sq).sqrt();
+        let gt4 = norm.gt(four_float);
+
+        final_i |= i & final_unset & gt4;
+
+        i += one_uint;
+    }
+
+    final_i
+}
+
+struct RangeIterator<'a> {
+    range_re: Range<usize>,
+    im: f32,
+    quad_im: X4<f32>,
+    view: View,
+    origin: Origin,
+    iterations: usize,
+    out: &'a mut [u32; u32::LANES],
+}
+
+impl<'a> RangeIterator<'a> {
+    fn new<'b: 'a>(
+        range_re: Range<usize>,
+        im: f32,
+        view: View,
+        origin: Origin,
+        iterations: usize,
+        out: &'b mut [u32; u32::LANES],
+    ) -> Self {
+        assert_eq!(out.len(), f32::LANES);
+
+        Self {
+            range_re,
+            im,
+            quad_im: X4::dup(im),
+            view,
+            origin,
+            iterations,
+            out,
+        }
+    }
+}
+
+impl<'a> LendingIterator for RangeIterator<'a> {
+    type Item<'b>
+        = &'b [u32]
+    where
+        Self: 'b;
+
+    fn next(&mut self) -> Option<Self::Item<'_>> {
+        let range_len = self.range_re.len();
+        if range_len >= f32::LANES {
+            let mut chunk = [0.0; f32::LANES];
+            for i in 0..f32::LANES {
+                // SAFETY: we just checked
+                let x = unsafe { self.range_re.next().unwrap_unchecked() };
+                let re = Length::<_, Pixels>::new(x as f64) * self.view + self.origin.x();
+                chunk[i] = re.0 as f32;
+            }
+
+            let quad_re = unsafe { X4::read_from_ptr(&chunk[0]) };
+            let quad_result = calculate_simd(quad_re, self.quad_im, self.iterations);
+            unsafe { quad_result.write_to_ptr(&raw mut self.out[0]) };
+            Some(self.out)
+        } else {
+            for (i, x) in self.range_re.clone().enumerate() {
+                let re = Length::<_, Pixels>::new(x as f64) * self.view + self.origin.x();
+                self.out[i] = calculate_abs(
+                    Complex {
+                        re: re.0 as f32,
+                        im: self.im,
+                    },
+                    self.iterations,
+                ) as u32;
+            }
+            for i in range_len..self.out.len() {
+                self.out[i] = u32::MAX; // sentinel value
+            }
+            Some(self.out)
+        }
+    }
+}
+
+fn _apply_sharpness(val: f64, sharpness: f64) -> f64 {
     assert!((0.0..=1.0).contains(&val));
     assert!(sharpness >= 2.0);
     if val < 1.0 / sharpness {
@@ -195,7 +327,14 @@ struct BufView(*mut MaybePixel);
 unsafe impl Send for BufView {}
 unsafe impl Sync for BufView {}
 
-fn chunks_2d(width: usize, height: usize, side: usize) -> Vec<(Range<usize>, Range<usize>)> {
+fn chunks_2d(
+    // canvas width
+    width: usize,
+    // canvas height
+    height: usize,
+    // chunk side length
+    side: usize,
+) -> Vec<(Range<usize>, Range<usize>)> {
     let mut chunks: Vec<_> = (0..width)
         .step_by(side)
         .flat_map(move |x_start| {
@@ -229,6 +368,7 @@ pub fn render(
 
     let buf_view = BufView(buf.as_mut_ptr());
 
+    // side should be a multiple of 4 to optimize for simd
     let side = 20;
     let chunks = chunks_2d(width, height, side);
 
@@ -245,27 +385,59 @@ pub fn render(
 
                 let buf_view = buf_view;
 
+                let mut out_buf = [0; <f32 as simd_quad::SimdX4>::BoolType::LANES];
+
+                // c ~ re
+                // r ~ im
+
                 for r in y_range {
-                    for c in x_range.clone() {
-                        let c_typed = Length::<_, Pixels>::new(c as f64);
-                        let r_typed = Length::<_, Pixels>::new(r as f64);
+                    let im = Length::<_, Pixels>::new(r as f64) * view + origin.y();
 
-                        let val = calculate(
-                            Complex::new(
-                                (c_typed * view + origin.x()).0,
-                                (r_typed * view + origin.y()).0,
-                            ),
-                            iterations,
-                        );
+                    let mut iter = RangeIterator::new(
+                        x_range.clone(),
+                        im.0 as f32,
+                        view,
+                        origin,
+                        iterations,
+                        &mut out_buf,
+                    );
 
-                        // SAFETY: all writes are disjoint
-                        unsafe {
-                            buf_view
-                                .0
-                                .add(r * width + c)
-                                .write(render_pixel(val).into());
+                    iter.enumerate().for_each(|(i, out)| {
+                        for (j, &v) in out.iter().enumerate() {
+                            if v == u32::MAX {
+                                break;
+                            }
+
+                            // SAFETY: all writes are disjoint
+                            unsafe {
+                                buf_view
+                                    .0
+                                    .add(r * width + (i * 4 + j))
+                                    .write(render_pixel(v as f64 / iterations as f64).into());
+                            }
                         }
-                    }
+                    });
+
+                    // for c in x_range.clone() {
+                    //     let c_typed = Length::<_, Pixels>::new(c as f64);
+                    //     let r_typed = Length::<_, Pixels>::new(r as f64);
+
+                    //     let val = calculate(
+                    //         Complex::new(
+                    //             (c_typed * view + origin.x()).0,
+                    //             (r_typed * view + origin.y()).0,
+                    //         ),
+                    //         iterations,
+                    //     );
+
+                    //     // SAFETY: all writes are disjoint
+                    //     unsafe {
+                    //         buf_view
+                    //             .0
+                    //             .add(r * width + c)
+                    //             .write(render_pixel(val).into());
+                    //     }
+                    // }
                 }
                 pbar.inc(1);
             });

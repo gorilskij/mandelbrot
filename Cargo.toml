@@ -17,3 +17,11 @@ parking_lot = "0.12.3"
 rayon = "1.10.0"
 #waker_interrupter = { git = "https://github.com/gorilskij/waker_interrupter" }
 waker_interrupter = { path = "../waker_interrupter" }
+simd_quad = { path = "../simd_quad" }
+gat-lending-iterator = "0.1.6"
+
+[profile.dev]
+lto = "fat"
+
+[profile.release]
+lto = "fat"
