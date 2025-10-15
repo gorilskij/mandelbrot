@@ -48,7 +48,8 @@ fn calculate(c: Complex<f64>, iterations: usize) -> Option<NonZeroUsize> {
     for i in 1..iterations + 1 {
         z = z * z + c;
         if z.norm() > 4.0 {
-            return Some(NonZeroUsize::new(i).unwrap());
+            // SAFETY: i starts iterating at 1, it is never 0
+            unsafe { return Some(NonZeroUsize::new_unchecked(i)) };
         }
     }
     None

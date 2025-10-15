@@ -29,8 +29,6 @@ fn main() {
 
     let mut dragging = None;
 
-    let mut cached = true;
-
     while window.is_open() {
         let mut zoomed = false;
         let mut dragged = false;
@@ -60,7 +58,7 @@ fn main() {
 
                 dragging = None;
 
-                // scroll wheel is ignored while dragging
+                // scroll wheel is only read outside of dragging
                 if let Some((_, scroll_y)) = window.get_scroll_wheel() {
                     zoomed = true;
 
@@ -77,29 +75,22 @@ fn main() {
         if dragged || zoomed {
             trace!("send update to drawer");
             drawer.update(coords, iterations);
-            cached = false;
             trace!("done sending update to drawer");
         } else if window.is_key_pressed(Key::Up, KeyRepeat::No) {
             iterations *= 2;
             info!("iterations: {iterations}");
             drawer.update(coords, iterations);
-            cached = false;
         } else if window.is_key_pressed(Key::Down, KeyRepeat::No) {
             if iterations > 1 {
                 iterations /= 2;
                 info!("iterations: {iterations}");
                 drawer.update(coords, iterations);
-                cached = false;
             }
         }
 
         drawer.update_display_buf();
-
-        if !cached {
-            if drawer.try_replace_base_buf() {
-                trace!("replaced base buffer");
-                cached = true;
-            }
+        if drawer.try_cache_buf() {
+            trace!("updated cache buffer");
         }
 
         window
