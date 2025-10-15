@@ -1,3 +1,7 @@
 /target
 /images
 Cargo.lock
+.idea
+flamegraph.svg
+*.png
+.DS_Store

@@ -1,18 +1,28 @@
+use crate::drawing::maybe_pixel::MaybePixel;
+use crossbeam_channel;
 use euclid::{Length, Point2D, Scale};
 use hsl::HSL;
 use indicatif::ProgressBar;
 use num::Complex;
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
-use rayon::prelude::*;
-
-const ITERATIONS: usize = 2000;
+use rayon::ThreadPool;
+use std::cmp::min;
+use std::ops::Range;
+use waker_interrupter::MultiInterrupter;
 
 pub enum Units {}
 pub enum Pixels {}
 pub enum Relative {}
 pub type Point<U> = Point2D<f64, U>;
+pub type Origin = Point<Units>;
 pub type View = Scale<f64, Pixels, Units>;
+
+#[derive(Copy, Clone, PartialEq)]
+pub struct CoordinatesBox {
+    pub origin: Origin,
+    pub view: View,
+}
 
 trait TypedXY<T, U> {
     fn x(&self) -> Length<T, U>;
@@ -32,12 +42,12 @@ where
     }
 }
 
-fn calculate(c: Complex<f64>) -> f64 {
+fn calculate(c: Complex<f64>, iterations: usize) -> f64 {
     let mut z: Complex<f64> = Complex::ZERO;
-    for i in 0..ITERATIONS {
+    for i in 0..iterations {
         z = z * z + c;
         if z.norm() > 4.0 {
-            return i as f64 / ITERATIONS as f64;
+            return i as f64 / iterations as f64;
         }
     }
     0.0
@@ -111,14 +121,20 @@ pub fn sample_zoomed(
     width: usize,
     height: usize,
     //
-    src_origin: Point<Units>,
-    src_view: View,
-    //
-    dest_origin: Point<Units>,
-    dest_view: View,
+    src_coords: CoordinatesBox,
+    dest_coords: CoordinatesBox,
 ) {
     let fwidth = width as f64;
     let fheight = height as f64;
+
+    let CoordinatesBox {
+        origin: src_origin,
+        view: src_view,
+    } = src_coords;
+    let CoordinatesBox {
+        origin: dest_origin,
+        view: dest_view,
+    } = dest_coords;
 
     // src_origin and dest_origin are both absolute
     // calculate dest_origin in the [0, 1] reference frame given by src
@@ -175,33 +191,99 @@ pub fn sample_zoomed(
 }
 
 #[derive(Copy, Clone)]
-struct BufView(*mut u32);
+struct BufView(*mut MaybePixel);
 
 unsafe impl Send for BufView {}
 unsafe impl Sync for BufView {}
 
-pub fn render(buf: &mut [u32], width: usize, height: usize, origin: Point<Units>, view: View) {
+/// Split up a 2d plane into side*side chunks and sort them
+/// by distance from the center, the idea is to redraw the
+/// canvas in a circle emanating from the center to prioritize
+/// the most interesting parts
+fn chunks_2d(width: usize, height: usize, side: usize) -> Vec<(Range<usize>, Range<usize>)> {
+    let mut chunks: Vec<_> = (0..width)
+        .step_by(side)
+        .flat_map(move |x_start| {
+            (0..height).step_by(side).map(move |y_start| {
+                (
+                    x_start..min(x_start + side, width),
+                    y_start..min(y_start + side, height),
+                )
+            })
+        })
+        .collect();
+
+    chunks.sort_unstable_by_key(|(range_x, range_y)| {
+        let x_diff = range_x.start.abs_diff(width / 2);
+        let y_diff = range_y.start.abs_diff(height / 2);
+        ((x_diff * x_diff) as f64 + (y_diff * y_diff) as f64).sqrt() as usize
+    });
+    chunks
+}
+
+pub fn render(
+    buf: &mut [MaybePixel],
+    width: usize,
+    height: usize,
+    coords: CoordinatesBox,
+    iterations: usize,
+    int: MultiInterrupter,
+    tp: &ThreadPool,
+) {
+    let CoordinatesBox { origin, view } = coords;
+
     let buf_view = BufView(buf.as_mut_ptr());
 
-    let pbar = &ProgressBar::new(height as u64);
-    (0..height).into_par_iter().for_each(move |r| {
-        let buf_view = buf_view;
+    let side = 20;
+    let chunks = chunks_2d(width, height, side);
 
-        for c in 0..width {
-            let c_typed = Length::<_, Pixels>::new(c as f64);
-            let r_typed = Length::<_, Pixels>::new(r as f64);
+    let pbar = &ProgressBar::new(chunks.len() as u64);
+    let int = &int;
 
-            let val = calculate(Complex::new(
-                (c_typed * view + origin.x()).0,
-                (r_typed * view + origin.y()).0,
-            ));
+    let (chunks_tx, ref chunks_rx) = crossbeam_channel::unbounded();
+    chunks
+        .into_iter()
+        .try_for_each(|c| chunks_tx.send(c))
+        .expect("crossbeam channel failed");
 
-            // SAFETY: all writes are disjoint
-            unsafe {
-                buf_view.0.add(r * width + c).write(render_pixel(val));
-            }
+    tp.scope(|s| {
+        for _ in 0..tp.current_num_threads() {
+            s.spawn(move |_| {
+                while let Ok((x_range, y_range)) = chunks_rx.try_recv() {
+                    if int.interrupted() {
+                        pbar.abandon();
+                        return;
+                    }
+
+                    let buf_view = buf_view;
+
+                    for r in y_range {
+                        for c in x_range.clone() {
+                            let c_typed = Length::<_, Pixels>::new(c as f64);
+                            let r_typed = Length::<_, Pixels>::new(r as f64);
+
+                            let val = calculate(
+                                Complex::new(
+                                    (c_typed * view + origin.x()).0,
+                                    (r_typed * view + origin.y()).0,
+                                ),
+                                iterations,
+                            );
+
+                            // SAFETY: all writes are disjoint
+                            unsafe {
+                                buf_view
+                                    .0
+                                    .add(r * width + c)
+                                    .write(render_pixel(val).into());
+                            }
+                        }
+                    }
+                    pbar.inc(1);
+                }
+            });
         }
-        pbar.inc(1);
     });
+
     pbar.finish();
 }
