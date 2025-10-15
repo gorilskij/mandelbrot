@@ -1,4 +1,5 @@
 use crate::drawing::maybe_pixel::MaybePixel;
+use crossbeam_channel;
 use euclid::{Length, Point2D, Scale};
 use hsl::HSL;
 use indicatif::ProgressBar;
@@ -239,39 +240,47 @@ pub fn render(
     let pbar = &ProgressBar::new(chunks.len() as u64);
     let int = &int;
 
+    let (chunks_tx, ref chunks_rx) = crossbeam_channel::unbounded();
+    chunks
+        .into_iter()
+        .try_for_each(|c| chunks_tx.send(c))
+        .expect("crossbeam channel failed");
+
     tp.scope(|s| {
-        for (x_range, y_range) in chunks {
+        for _ in 0..tp.current_num_threads() {
             s.spawn(move |_| {
-                if int.interrupted() {
-                    pbar.abandon();
-                    return;
-                }
+                while let Ok((x_range, y_range)) = chunks_rx.try_recv() {
+                    if int.interrupted() {
+                        pbar.abandon();
+                        return;
+                    }
 
-                let buf_view = buf_view;
+                    let buf_view = buf_view;
 
-                for r in y_range {
-                    for c in x_range.clone() {
-                        let c_typed = Length::<_, Pixels>::new(c as f64);
-                        let r_typed = Length::<_, Pixels>::new(r as f64);
+                    for r in y_range {
+                        for c in x_range.clone() {
+                            let c_typed = Length::<_, Pixels>::new(c as f64);
+                            let r_typed = Length::<_, Pixels>::new(r as f64);
 
-                        let val = calculate(
-                            Complex::new(
-                                (c_typed * view + origin.x()).0,
-                                (r_typed * view + origin.y()).0,
-                            ),
-                            iterations,
-                        );
+                            let val = calculate(
+                                Complex::new(
+                                    (c_typed * view + origin.x()).0,
+                                    (r_typed * view + origin.y()).0,
+                                ),
+                                iterations,
+                            );
 
-                        // SAFETY: all writes are disjoint
-                        unsafe {
-                            buf_view
-                                .0
-                                .add(r * width + c)
-                                .write(render_pixel(val).into());
+                            // SAFETY: all writes are disjoint
+                            unsafe {
+                                buf_view
+                                    .0
+                                    .add(r * width + c)
+                                    .write(render_pixel(val).into());
+                            }
                         }
                     }
+                    pbar.inc(1);
                 }
-                pbar.inc(1);
             });
         }
     });
