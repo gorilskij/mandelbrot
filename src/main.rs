@@ -15,7 +15,7 @@ use std::fmt::{Display, Formatter};
 
 use crate::{complex::FromF64, extended_float::ExtendedFloat};
 
-const ITERATIONS: usize = 1000;
+const ITERATIONS: usize = 100;
 
 fn calculate<F: Float>(c: Complex<F>) -> F {
     let mut z = Complex::<F>::zero();
@@ -276,6 +276,21 @@ impl Display for RenderPrecision {
         }
     }
 }
+
+// fn main() {
+//     let mut start1 = 10_f64;
+//     let mut start2 = ExtendedFloat::new(10.0);
+
+//     for _ in 0..400 {
+//         start1 /= 10.0;
+//         start2 = start2 / ExtendedFloat::new(10.0);
+
+//         println!();
+//         println!("{}", start1);
+//         println!("{} | {}", start2.val(), start2.exp());
+//         println!("{}", start2.into_f64());
+//     }
+// }
 
 fn main() {
     let w = 1000;

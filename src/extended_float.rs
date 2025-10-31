@@ -11,15 +11,29 @@ pub struct ExtendedFloat {
 }
 
 impl ExtendedFloat {
+    pub fn val(&self) -> f32 {
+        self.val
+    }
+
+    pub fn exp(&self) -> i32 {
+        self.exp
+    }
+
     // make sure value is around 1
     fn normalize(&mut self) {
+        if self.val().abs() <= f32::EPSILON {
+            self.val = 0.0;
+            self.exp = 1;
+            return;
+        }
+
         let power = self.val.log2() as i32;
         self.val /= 2_f32.powi(power as i32);
         self.exp += power;
     }
 
     pub fn new(val: f32) -> Self {
-        let mut this = Self { val, exp: 1 };
+        let mut this = Self { val, exp: 0 };
         this.normalize();
         this
     }
