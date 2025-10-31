@@ -1,33 +1,53 @@
-use std::ops::{Add, Div, Mul, Sub};
 use f256::f256;
 use num_bigfloat::BigFloat;
+use std::ops::{Add, Div, Mul, Sub};
+
+use crate::extended_float::ExtendedFloat;
 
 pub trait Zero {
     fn zero() -> Self;
 }
 
 impl Zero for f16 {
-    fn zero() -> Self { 0.0 }
+    fn zero() -> Self {
+        0.0
+    }
 }
 
 impl Zero for f32 {
-    fn zero() -> Self { 0.0 }
+    fn zero() -> Self {
+        0.0
+    }
 }
 
 impl Zero for f64 {
-    fn zero() -> Self { 0.0 }
+    fn zero() -> Self {
+        0.0
+    }
 }
 
 impl Zero for f128 {
-    fn zero() -> Self { 0.0 }
+    fn zero() -> Self {
+        0.0
+    }
 }
 
 impl Zero for f256 {
-    fn zero() -> Self { f256::ZERO }
+    fn zero() -> Self {
+        f256::ZERO
+    }
 }
 
 impl Zero for BigFloat {
-    fn zero() -> Self { BigFloat::from_f64(0.0) }
+    fn zero() -> Self {
+        BigFloat::from_f64(0.0)
+    }
+}
+
+impl Zero for ExtendedFloat {
+    fn zero() -> Self {
+        ExtendedFloat::new(0.0)
+    }
 }
 
 pub trait Sqrt {
@@ -67,6 +87,12 @@ impl Sqrt for f256 {
 impl Sqrt for BigFloat {
     fn sqrt(self) -> Self {
         BigFloat::sqrt(&self)
+    }
+}
+
+impl Sqrt for ExtendedFloat {
+    fn sqrt(self) -> Self {
+        ExtendedFloat::sqrt(&self)
     }
 }
 
@@ -110,6 +136,13 @@ impl FromF64 for BigFloat {
     }
 }
 
+impl FromF64 for ExtendedFloat {
+    // TODO: redo
+    fn from_f64(n: f64) -> Self {
+        ExtendedFloat::new(n as f32)
+    }
+}
+
 pub trait FromUsize {
     fn from_usize(n: usize) -> Self;
 }
@@ -147,6 +180,13 @@ impl FromUsize for f256 {
 impl FromUsize for BigFloat {
     fn from_usize(n: usize) -> Self {
         Self::from(n as f64)
+    }
+}
+
+impl FromUsize for ExtendedFloat {
+    // TODO: redo
+    fn from_usize(n: usize) -> Self {
+        Self::new(n as f32)
     }
 }
 
@@ -194,8 +234,14 @@ impl IntoF64 for f256 {
         let (hi, lo) = self.to_bits();
         let sign = hi >> 127;
         let exp = (hi >> 108) & (!(1 << 20));
-        if exp > 0b0111_1111_1111 /* 11 bits */ {
-            return if sign == 0 { f64::INFINITY } else { -f64::INFINITY };
+        if exp > 0b0111_1111_1111
+        /* 11 bits */
+        {
+            return if sign == 0 {
+                f64::INFINITY
+            } else {
+                -f64::INFINITY
+            };
         }
         let mant = (0x0fff_ffff_ffff_ff00_0000_0000_0000 /* first 52 bits */ & hi) >> 56;
 
@@ -208,6 +254,12 @@ impl IntoF64 for f256 {
 impl IntoF64 for BigFloat {
     fn into_f64(self) -> f64 {
         self.to_f64()
+    }
+}
+
+impl IntoF64 for ExtendedFloat {
+    fn into_f64(self) -> f64 {
+        ExtendedFloat::into_f64(&self)
     }
 }
 
@@ -265,6 +317,12 @@ impl Float for BigFloat {
     }
 }
 
+impl Float for ExtendedFloat {
+    fn abs(self) -> Self {
+        ExtendedFloat::abs(&self)
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct Complex<F: Float> {
     re: F,
@@ -307,9 +365,13 @@ impl<F: Float> Complex<F> {
         Self { re, im }
     }
 
-    pub fn re(&self) -> F { self.re }
+    pub fn re(&self) -> F {
+        self.re
+    }
 
-    pub fn im(&self) -> F { self.im }
+    pub fn im(&self) -> F {
+        self.im
+    }
 
     pub fn norm(&self) -> F {
         (self.re * self.re + self.im * self.im).sqrt()
