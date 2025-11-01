@@ -29,40 +29,6 @@ fn is_bad_value(v: Complex<f64>) -> bool {
     !(v.re().abs() <= 1000.0 && v.im().abs() <= 1000.0)
 }
 
-// fn is_bad_value(v: Complex<BigFloat>) -> bool {
-//     // implicitly also checks that neither is NaN
-//     let k = BigFloat::from(1000.0);
-//     !(v.re().abs() <= k && v.im().abs() <= k)
-// }
-
-// fn calculate_delta_orbit(
-//     ref_orbit: &[Complex<BigFloat>],
-//     delta: Complex<BigFloat>,
-// ) -> Result<(Vec<Complex<BigFloat>>, Vec<Complex<BigFloat>>), ()> {
-//     // ref_orbit is [x_0, x_1, ...]
-//     // delta is delta_0
-//     // delta_{n+1} = 2 x_n delta_n + delta_n^2 + delta_0
-
-//     let mut deltas = vec![];
-//     let mut out = vec![];
-
-//     let delta_0 = delta;
-//     let mut delta = delta;
-//     for i in 0..ref_orbit.len() {
-//         if is_bad_value(ref_orbit[i]) {
-//             return Err(());
-//         }
-
-//         let cur_estimate = ref_orbit[i] + delta;
-
-//         deltas.push(delta);
-//         out.push(cur_estimate);
-//         let ee = ref_orbit[i] * BigFloat::from(2.0) * delta + delta * delta + delta_0;
-//         delta = ee;
-//     }
-//     Ok((deltas, out))
-// }
-
 fn check_orbit<F: Float>(orbit: &[Complex<F>]) -> Option<usize> {
     for (i, x) in orbit.iter().enumerate() {
         if x.norm() > F::from_f64(4.0) {
@@ -292,6 +258,7 @@ fn render(
     // the coordinate of the top-left corner (x, y)
     origin: (BigFloat, BigFloat),
     view: f64,
+    use_deltas: bool,
 ) {
     let (x_min, y_min) = origin;
     let x_range = w as f64 * view;
@@ -321,29 +288,38 @@ fn render(
             let delta_x = c as f64 / w as f64 * x_range;
             let delta_y = r as f64 / h as f64 * y_range;
 
-            let val = if let Ok(val) = check_divergence_delta(
-                &ref_orbit,
-                &ref_orbit_f64,
-                Complex::new(delta_x - delta_corr_x, delta_y - delta_corr_y),
-            ) {
-                val
+            let val;
+
+            if use_deltas {
+                val = if let Ok(val) = check_divergence_delta(
+                    &ref_orbit,
+                    &ref_orbit_f64,
+                    Complex::new(delta_x - delta_corr_x, delta_y - delta_corr_y),
+                ) {
+                    val
+                } else {
+                    println!("recalculating reference");
+                    ref_orbit = calculate_orbit(
+                        Complex::new(
+                            x_min + BigFloat::from(delta_x),
+                            y_min + BigFloat::from(delta_y),
+                        ),
+                        ITERATIONS,
+                    );
+                    ref_orbit_f64 = ref_orbit
+                        .iter()
+                        .map(|x| Complex::new(x.re().into_f64(), x.im().into_f64()))
+                        .collect();
+                    delta_corr_x = delta_x;
+                    delta_corr_y = delta_y;
+                    check_orbit(&ref_orbit)
+                };
             } else {
-                println!("recalculating reference");
-                ref_orbit = calculate_orbit(
-                    Complex::new(
-                        x_min + BigFloat::from(delta_x),
-                        y_min + BigFloat::from(delta_y),
-                    ),
+                val = check_orbit(&calculate_orbit(
+                    Complex::new(x_min.into_f64() + delta_x, y_min.into_f64() + delta_y),
                     ITERATIONS,
-                );
-                ref_orbit_f64 = ref_orbit
-                    .iter()
-                    .map(|x| Complex::new(x.re().into_f64(), x.im().into_f64()))
-                    .collect();
-                delta_corr_x = delta_x;
-                delta_corr_y = delta_y;
-                check_orbit(&ref_orbit)
-            };
+                ))
+            }
 
             // let val = check_orbit(&calculate_orbit(
             //     Complex::new(
@@ -366,41 +342,6 @@ fn render(
     pbar.finish();
 }
 
-fn pt(c: &Complex<BigFloat>) -> String {
-    format!("({}, {})", c.re().into_f64(), c.im().into_f64())
-}
-
-// fn main_() {
-//     let X = Complex::new(
-//         BigFloat::from(-0.6337777492436207),
-//         BigFloat::from(-0.9334837812869803),
-//     );
-//     let Y = Complex::new(
-//         BigFloat::from(-0.2016548049962961),
-//         BigFloat::from(-0.6742100147385854),
-//     );
-
-//     let D = Complex::new(Y.re() - X.re(), Y.im() - X.im());
-
-//     println!("D: {:?}\n\n", D);
-
-//     let o1 = calculate_orbit(X, 100);
-//     let o2 = calculate_orbit(Y, 100);
-//     if let Ok((deltas, o2_x)) = calculate_delta_orbit(&o1, D) {
-//         assert_eq!(o1.len(), o2_x.len());
-
-//         for (((a, b), d), x) in o2.iter().zip(&o2_x).zip(&deltas).zip(&o1) {
-//             println!("X_n  {}", pt(x));
-//             println!("Y_n  {}", pt(a));
-//             println!("Y_n' {}", pt(b));
-//             println!("D_n  {}", pt(d));
-//             println!();
-//         }
-//     } else {
-//         println!("error")
-//     }
-// }
-
 fn main() {
     let w = 1000;
     let h = 600;
@@ -419,6 +360,8 @@ fn main() {
     let mut cached = None;
 
     let mut first_time = true;
+
+    let mut use_deltas = true;
 
     while window.is_open() {
         let mut mouse01 = None;
@@ -451,12 +394,15 @@ fn main() {
                 h,
                 (origin_x.into(), origin_y.into()),
                 view.into(),
+                use_deltas,
             );
             cached = Some(cache_key);
+        } else if window.is_key_pressed(Key::Escape, KeyRepeat::No) {
+            use_deltas = !use_deltas
         } else {
             if cached != Some(cache_key) {
                 if first_time {
-                    render(&mut buffer, w, h, (origin_x, origin_y), view);
+                    render(&mut buffer, w, h, (origin_x, origin_y), view, use_deltas);
                     first_time = false;
                 } else if let Some((center_x, center_y, multiplier)) = mouse01 {
                     zoom(&mut buffer, h, w, center_x, center_y, multiplier);
