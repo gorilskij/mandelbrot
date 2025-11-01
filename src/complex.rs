@@ -1,8 +1,8 @@
+use crate::extended_float::ExtendedFloat;
 use f256::f256;
 use num_bigfloat::BigFloat;
+use std::fmt::Debug;
 use std::ops::{Add, Div, Mul, Sub};
-
-use crate::extended_float::ExtendedFloat;
 
 pub trait Zero {
     fn zero() -> Self;
@@ -137,9 +137,8 @@ impl FromF64 for BigFloat {
 }
 
 impl FromF64 for ExtendedFloat {
-    // TODO: redo
     fn from_f64(n: f64) -> Self {
-        ExtendedFloat::new(n as f32)
+        ExtendedFloat::from_f64(n)
     }
 }
 
@@ -186,7 +185,7 @@ impl FromUsize for BigFloat {
 impl FromUsize for ExtendedFloat {
     // TODO: redo
     fn from_usize(n: usize) -> Self {
-        Self::new(n as f32)
+        Self::new(n as f16)
     }
 }
 
@@ -264,7 +263,8 @@ impl IntoF64 for ExtendedFloat {
 }
 
 pub trait Float:
-    Copy
+    Debug
+    + Copy
     + Zero
     + Sqrt
     + Add<Self, Output = Self>

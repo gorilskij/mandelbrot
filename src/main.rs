@@ -15,7 +15,7 @@ use std::fmt::{Display, Formatter};
 
 use crate::{complex::FromF64, extended_float::ExtendedFloat};
 
-const ITERATIONS: usize = 100;
+const ITERATIONS: usize = 1000;
 
 fn calculate<F: Float>(c: Complex<F>) -> F {
     let mut z = Complex::<F>::zero();
@@ -229,6 +229,11 @@ fn render<F: Float>(
     let x_range = F::from_usize(w) * view;
     let y_range = F::from_usize(h) * view;
 
+    println!("w, h = {}, {}", w, h);
+    println!("view = {}", view.into_f64());
+    println!("x_range = {}", x_range.into_f64());
+    println!("y_range = {}", y_range.into_f64());
+
     let buf_view = BufView(buf.as_mut_ptr());
 
     let pbar = &ProgressBar::new(h as u64);
@@ -238,6 +243,22 @@ fn render<F: Float>(
         for c in 0..w {
             let x = F::from_usize(c) / F::from_usize(w) * x_range + x_min;
             let y = F::from_usize(r) / F::from_usize(h) * y_range + y_min;
+
+            if h - r < 5 && w - c < 5 {
+                println!("0. {:?}", c);
+                println!(
+                    "1. {:?} ({})",
+                    F::from_usize(c),
+                    F::from_usize(c).into_f64()
+                );
+                println!("2. {:?}", F::from_usize(c) / F::from_usize(w));
+                println!("3. {:?}", F::from_usize(c) / F::from_usize(w) * x_range);
+                println!(
+                    "4. {:?}",
+                    F::from_usize(c) / F::from_usize(w) * x_range + x_min
+                );
+            }
+
             let val = calculate(Complex::new(x, y));
 
             // SAFETY: all writes are disjoint
@@ -376,16 +397,20 @@ fn main() {
                     (origin_x.into(), origin_y.into()),
                     view.into(),
                 ),
-                RenderPrecision::EF => render::<ExtendedFloat>(
-                    &mut buffer,
-                    w,
-                    h,
-                    (
-                        ExtendedFloat::from_f64(origin_x),
-                        ExtendedFloat::from_f64(origin_y),
-                    ),
-                    ExtendedFloat::from_f64(view),
-                ),
+                RenderPrecision::EF => {
+                    let view_ = ExtendedFloat::from_f64(view);
+                    println!("{view} -> {}", view_.into_f64());
+                    render::<ExtendedFloat>(
+                        &mut buffer,
+                        w,
+                        h,
+                        (
+                            ExtendedFloat::from_f64(origin_x),
+                            ExtendedFloat::from_f64(origin_y),
+                        ),
+                        view_,
+                    )
+                }
             }
             cached = Some(cache_key);
         } else if window.is_key_pressed(Key::Escape, KeyRepeat::No) {

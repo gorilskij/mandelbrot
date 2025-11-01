@@ -1,17 +1,24 @@
 use std::{
     cmp::Ordering,
+    fmt::Debug,
     ops::{Add, Div, Mul, Neg, Sub},
 };
 
 // represents val * 2^exp
 #[derive(Clone, Copy)]
 pub struct ExtendedFloat {
-    val: f32,
+    val: f16,
     exp: i32,
 }
 
+impl Debug for ExtendedFloat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}*2^{}", self.val, self.exp)
+    }
+}
+
 impl ExtendedFloat {
-    pub fn val(&self) -> f32 {
+    pub fn val(&self) -> f16 {
         self.val
     }
 
@@ -21,21 +28,33 @@ impl ExtendedFloat {
 
     // make sure value is around 1
     fn normalize(&mut self) {
-        if self.val().abs() <= f32::EPSILON {
+        if self.val().abs() <= f16::EPSILON {
             self.val = 0.0;
             self.exp = 1;
             return;
         }
 
         let power = self.val.log2() as i32;
-        self.val /= 2_f32.powi(power as i32);
+        self.val /= 2_f16.powi(power as i32);
         self.exp += power;
     }
 
-    pub fn new(val: f32) -> Self {
+    pub fn new(val: f16) -> Self {
         let mut this = Self { val, exp: 0 };
         this.normalize();
         this
+    }
+
+    pub fn from_f64(val: f64) -> Self {
+        if val.abs() <= f64::EPSILON {
+            return Self { val: 0.0, exp: 1 };
+        }
+
+        let power = val.log2() as i32;
+        Self {
+            val: (val / 2_f64.powi(power as i32)) as f16,
+            exp: power,
+        }
     }
 
     pub fn abs(&self) -> Self {
@@ -77,12 +96,12 @@ impl Add for ExtendedFloat {
         // bump both numbers to the higher exponent
         let mut out = if self.exp <= rhs.exp {
             Self {
-                val: self.val * 2_f32.powi(self.exp - rhs.exp) + rhs.val,
+                val: self.val * 2_f16.powi(self.exp - rhs.exp) + rhs.val,
                 exp: rhs.exp,
             }
         } else {
             Self {
-                val: self.val + rhs.val * 2_f32.powi(rhs.exp - self.exp),
+                val: self.val + rhs.val * 2_f16.powi(rhs.exp - self.exp),
                 exp: self.exp,
             }
         };
