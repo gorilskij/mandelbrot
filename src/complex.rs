@@ -1,33 +1,32 @@
-use std::ops::{Add, Div, Mul, Sub};
-use f256::f256;
 use num_bigfloat::BigFloat;
+use std::ops::{Add, Div, Mul, Sub};
 
 pub trait Zero {
     fn zero() -> Self;
 }
 
 impl Zero for f16 {
-    fn zero() -> Self { 0.0 }
+    fn zero() -> Self {
+        0.0
+    }
 }
 
 impl Zero for f32 {
-    fn zero() -> Self { 0.0 }
+    fn zero() -> Self {
+        0.0
+    }
 }
 
 impl Zero for f64 {
-    fn zero() -> Self { 0.0 }
-}
-
-impl Zero for f128 {
-    fn zero() -> Self { 0.0 }
-}
-
-impl Zero for f256 {
-    fn zero() -> Self { f256::ZERO }
+    fn zero() -> Self {
+        0.0
+    }
 }
 
 impl Zero for BigFloat {
-    fn zero() -> Self { BigFloat::from_f64(0.0) }
+    fn zero() -> Self {
+        BigFloat::from_f64(0.0)
+    }
 }
 
 pub trait Sqrt {
@@ -49,18 +48,6 @@ impl Sqrt for f32 {
 impl Sqrt for f64 {
     fn sqrt(self) -> Self {
         f64::sqrt(self)
-    }
-}
-
-impl Sqrt for f128 {
-    fn sqrt(self) -> Self {
-        f128::sqrt(self)
-    }
-}
-
-impl Sqrt for f256 {
-    fn sqrt(self) -> Self {
-        f256::sqrt(self)
     }
 }
 
@@ -92,18 +79,6 @@ impl FromF64 for f64 {
     }
 }
 
-impl FromF64 for f128 {
-    fn from_f64(n: f64) -> Self {
-        n as f128
-    }
-}
-
-impl FromF64 for f256 {
-    fn from_f64(n: f64) -> Self {
-        f256::from(n)
-    }
-}
-
 impl FromF64 for BigFloat {
     fn from_f64(n: f64) -> Self {
         Self::from(n)
@@ -132,18 +107,6 @@ impl FromUsize for f64 {
     }
 }
 
-impl FromUsize for f128 {
-    fn from_usize(n: usize) -> Self {
-        n as f128
-    }
-}
-
-impl FromUsize for f256 {
-    fn from_usize(n: usize) -> Self {
-        f256::from(n as f64)
-    }
-}
-
 impl FromUsize for BigFloat {
     fn from_usize(n: usize) -> Self {
         Self::from(n as f64)
@@ -169,39 +132,6 @@ impl IntoF64 for f32 {
 impl IntoF64 for f64 {
     fn into_f64(self) -> f64 {
         self
-    }
-}
-
-impl IntoF64 for f128 {
-    fn into_f64(self) -> f64 {
-        self as f64
-    }
-}
-
-impl IntoF64 for f256 {
-    fn into_f64(self) -> f64 {
-        if self.is_nan() {
-            return f64::NAN;
-        }
-        if self.is_infinite() {
-            return if self.is_sign_positive() {
-                f64::INFINITY
-            } else {
-                -f64::INFINITY
-            };
-        }
-
-        let (hi, lo) = self.to_bits();
-        let sign = hi >> 127;
-        let exp = (hi >> 108) & (!(1 << 20));
-        if exp > 0b0111_1111_1111 /* 11 bits */ {
-            return if sign == 0 { f64::INFINITY } else { -f64::INFINITY };
-        }
-        let mant = (0x0fff_ffff_ffff_ff00_0000_0000_0000 /* first 52 bits */ & hi) >> 56;
-
-        let float = ((sign as u64) << 63) | ((exp as u64) << 52) | mant as u64;
-
-        f64::from_bits(float)
     }
 }
 
@@ -244,18 +174,6 @@ impl Float for f32 {
 impl Float for f64 {
     fn abs(self) -> Self {
         f64::abs(self)
-    }
-}
-
-impl Float for f128 {
-    fn abs(self) -> Self {
-        f128::abs(self)
-    }
-}
-
-impl Float for f256 {
-    fn abs(self) -> Self {
-        f256::abs(&self)
     }
 }
 
@@ -302,14 +220,40 @@ impl<F: Float> Mul for Complex<F> {
     }
 }
 
+impl<F: Float> Mul<F> for Complex<F> {
+    type Output = Self;
+
+    fn mul(self, rhs: F) -> Self::Output {
+        Self {
+            re: self.re * rhs,
+            im: self.im * rhs,
+        }
+    }
+}
+
+impl Mul<Complex<f64>> for f64 {
+    type Output = Complex<f64>;
+
+    fn mul(self, rhs: Complex<f64>) -> Self::Output {
+        Complex {
+            re: self * rhs.re,
+            im: self * rhs.im,
+        }
+    }
+}
+
 impl<F: Float> Complex<F> {
     pub fn new(re: F, im: F) -> Self {
         Self { re, im }
     }
 
-    pub fn re(&self) -> F { self.re }
+    pub fn re(&self) -> F {
+        self.re
+    }
 
-    pub fn im(&self) -> F { self.im }
+    pub fn im(&self) -> F {
+        self.im
+    }
 
     pub fn norm(&self) -> F {
         (self.re * self.re + self.im * self.im).sqrt()

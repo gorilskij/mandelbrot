@@ -1,69 +1,116 @@
 #![feature(f16)]
-#![feature(f128)]
 
 mod complex;
 
-use std::fmt::{Display, Formatter};
 use complex::{Complex, Float, Zero};
 use hsl::HSL;
 use indicatif::ProgressBar;
 use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
-use rayon::prelude::*;
-use f256::f256;
 use num_bigfloat::BigFloat;
+use rayon::prelude::*;
+
+use crate::complex::IntoF64;
 
 const ITERATIONS: usize = 10;
 
-fn calculate<F: Float>(c: Complex<F>) -> F {
-    let mut z = Complex::<F>::zero();
-    for i in 0..ITERATIONS {
-        z = z * z + c;
-        if z.re().abs() + z.im().abs() > F::from_f64(2.0) {
-            if z.norm() > F::from_f64(4.0) {
-                return F::from_usize(i) / F::from_usize(ITERATIONS);
-            }
-        }
+fn calculate_orbit<F: Float>(x_0: Complex<F>, iterations: usize) -> Vec<Complex<F>> {
+    let mut out = Vec::with_capacity(iterations + 1);
+    let mut x_n = x_0;
+    out.push(x_n);
+    for _ in 0..iterations {
+        x_n = x_n * x_n + x_0;
+        out.push(x_n);
     }
-    F::from_f64(0.0)
+    out
 }
 
-fn apply_sharpness(val: f64, sharpness: f64) -> f64 {
-    assert!(val >= 0.0 && val <= 1.0);
-    assert!(sharpness >= 2.0);
-    if val < 1.0 / sharpness {
-        sharpness * val
-    } else {
-        -1.0 / (1.0 - 1.0 / sharpness) * (val - 1.0)
-        // 1.0
+fn is_bad_value(v: Complex<BigFloat>) -> bool {
+    v.re().is_inf()
+        || v.re().is_nan()
+        || v.re() > BigFloat::from(1000.0)
+        || v.im().is_inf()
+        || v.im().is_nan()
+        || v.im() > BigFloat::from(1000.0)
+}
+
+fn calculate_delta_orbit(
+    ref_orbit: &[Complex<BigFloat>],
+    delta: Complex<BigFloat>,
+) -> Result<(Vec<Complex<BigFloat>>, Vec<Complex<BigFloat>>), ()> {
+    // ref_orbit is [x_0, x_1, ...]
+    // delta is delta_0
+    // delta_{n+1} = 2 x_n delta_n + delta_n^2 + delta_0
+
+    let mut deltas = vec![];
+    let mut out = vec![];
+
+    let delta_0 = delta;
+    let mut delta = delta;
+    for i in 0..ref_orbit.len() {
+        if is_bad_value(ref_orbit[i]) {
+            return Err(());
+        }
+
+        let cur_estimate = ref_orbit[i] + delta;
+
+        deltas.push(delta);
+        out.push(cur_estimate);
+        let ee = ref_orbit[i] * BigFloat::from(2.0) * delta + delta * delta + delta_0;
+        delta = ee;
     }
+    Ok((deltas, out))
+}
+
+fn check_orbit<F: Float>(orbit: &[Complex<F>]) -> Option<usize> {
+    for (i, x) in orbit.iter().enumerate() {
+        if x.norm() > F::from_f64(4.0) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn check_divergence_delta(ref_orbit: &[Complex<f64>], delta: Complex<f64>) -> Option<usize> {
+    // ref_orbit is [x_0, x_1, ...]
+    // delta is delta_0
+    // delta_{n+1} = 2 x_n delta_n + delta_n^2 + delta_0
+
+    let delta_0 = delta;
+    let mut delta = delta;
+    for i in 0..ref_orbit.len() {
+        let cur_estimate = ref_orbit[i] + delta;
+        if cur_estimate.norm() > 4.0 {
+            return Some(i);
+        }
+        delta = 2.0 * ref_orbit[i] * delta + delta * delta + delta_0;
+    }
+    None
 }
 
 fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-fn render_pixel<F: Float>(val: F) -> u32 {
-    if val == F::from_f64(0.0) {
-        0
-    } else {
-        // let h = apply_sharpness(val, 30.0) / 6.0;
-        // let l = apply_sharpness(val, 20.0) * 0.6;
-        //
-        // let hsl = HSL {
-        //     h: h * 360.0,
-        //     s: 1.0,
-        //     l,
-        // };
+fn render_pixel(val: Option<usize>) -> u32 {
+    if let Some(val) = val {
+        // [0, 1)
+        let f = 1.0 - 1.0 / (val as f64 / 100.0 + 1.0);
 
         let hsl = HSL {
-            h: (val * F::from_f64(360.0)).into_f64(),
-            s: 1.0,
-            l: 0.5,
+            // h: val.get() as f64 % 360.0,
+            // s: 0.7,
+            // // l: 0.5,
+            // l: (val.get() as f64 / 10.0).sin() * 0.1 + 0.5,
+            h: (val as f64 / 10.0).sin() * 180.0,
+            s: 0.7,
+            // l: 0.5,
+            l: (val as f64 / (10.0 * std::f64::consts::E)).sin() * 0.4 + 0.5,
         };
 
         let (r, g, b) = hsl.to_rgb();
-
         rgb_to_u32(r, g, b)
+    } else {
+        0
     }
 }
 
@@ -115,7 +162,7 @@ fn select_cols(
     width: usize,
     source_col: usize,
     destination_col: usize,
-) -> (Col, ColMut) {
+) -> (Col<'_>, ColMut<'_>) {
     assert_ne!(source_col, destination_col);
     assert!(source_col < width);
     assert!(destination_col < width);
@@ -225,28 +272,77 @@ struct BufView(*mut u32);
 unsafe impl Send for BufView {}
 unsafe impl Sync for BufView {}
 
-fn render<F: Float>(
+fn render(
     buf: &mut [u32],
     w: usize,
     h: usize,
     // the coordinate of the top-left corner (x, y)
-    origin: (F, F),
-    view: F,
+    origin: (BigFloat, BigFloat),
+    view: f64,
 ) {
     let (x_min, y_min) = origin;
-    let x_range = F::from_usize(w) * view;
-    let y_range = F::from_usize(h) * view;
+    let x_range = w as f64 * view;
+    let y_range = h as f64 * view;
 
     let buf_view = BufView(buf.as_mut_ptr());
 
+    let mut ref_orbit = calculate_orbit(
+        Complex::new(BigFloat::from(x_min), BigFloat::from(y_min)),
+        ITERATIONS,
+    );
+
+    let mut delta_corr_x = BigFloat::zero();
+    let mut delta_corr_y = BigFloat::zero();
+
     let pbar = &ProgressBar::new(h as u64);
-    (0..h).into_par_iter().for_each(move |r| {
+    // (0..h).into_par_iter().for_each(move |r| {
+    (0..h).into_iter().for_each(move |r| {
         let buf_view = buf_view;
 
         for c in 0..w {
-            let x = F::from_usize(c) / F::from_usize(w) * x_range + x_min;
-            let y = F::from_usize(r) / F::from_usize(h) * y_range + y_min;
-            let val = calculate(Complex::new(x, y));
+            let delta_x = c as f64 / w as f64 * x_range;
+            let delta_y = r as f64 / h as f64 * y_range;
+
+            // let val = check_divergence_delta(&ref_orbit, Complex::new(delta_x, delta_y));
+
+            // let orb = calculate_orbit(
+            //     Complex::new(
+            //         // x_min + BigFloat::from(delta_x),
+            //         // y_min + BigFloat::from(delta_y),
+            //         x_min.into_f64() + delta_x,
+            //         y_min.into_f64() + delta_y,
+            //     ),
+            //     ITERATIONS,
+            // );
+
+            // let og_orb = calculate_orbit(
+            //     Complex::new(x_min.into_f64() + delta_x, y_min.into_f64() + delta_y),
+            //     ITERATIONS,
+            // );
+
+            let orb = if let Ok((_, orb)) = calculate_delta_orbit(
+                &ref_orbit,
+                Complex::new(
+                    BigFloat::from(delta_x) - delta_corr_x,
+                    BigFloat::from(delta_y) - delta_corr_y,
+                ),
+            ) {
+                orb
+            } else {
+                println!("recalculating reference");
+                ref_orbit = calculate_orbit(
+                    Complex::new(
+                        x_min + BigFloat::from(delta_x),
+                        y_min + BigFloat::from(delta_y),
+                    ),
+                    ITERATIONS,
+                );
+                delta_corr_x = BigFloat::from(delta_x);
+                delta_corr_y = BigFloat::from(delta_y);
+                ref_orbit.clone()
+            };
+
+            let val = check_orbit(&orb);
 
             // SAFETY: all writes are disjoint
             unsafe {
@@ -261,25 +357,38 @@ fn render<F: Float>(
     pbar.finish();
 }
 
-enum RenderPrecision {
-    F16,
-    F32,
-    F64,
-    F128,
-    F256,
-    BF,
+fn pt(c: &Complex<BigFloat>) -> String {
+    format!("({}, {})", c.re().into_f64(), c.im().into_f64())
 }
 
-impl Display for RenderPrecision {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RenderPrecision::F16 => writeln!(f, "f16"),
-            RenderPrecision::F32 => writeln!(f, "f32"),
-            RenderPrecision::F64 => writeln!(f, "f64"),
-            RenderPrecision::F128 => writeln!(f, "f128"),
-            RenderPrecision::F256 => writeln!(f, "f256"),
-            RenderPrecision::BF => writeln!(f, "bf"),
+fn main_() {
+    let X = Complex::new(
+        BigFloat::from(-0.6337777492436207),
+        BigFloat::from(-0.9334837812869803),
+    );
+    let Y = Complex::new(
+        BigFloat::from(-0.2016548049962961),
+        BigFloat::from(-0.6742100147385854),
+    );
+
+    let D = Complex::new(Y.re() - X.re(), Y.im() - X.im());
+
+    println!("D: {:?}\n\n", D);
+
+    let o1 = calculate_orbit(X, 100);
+    let o2 = calculate_orbit(Y, 100);
+    if let Ok((deltas, o2_x)) = calculate_delta_orbit(&o1, D) {
+        assert_eq!(o1.len(), o2_x.len());
+
+        for (((a, b), d), x) in o2.iter().zip(&o2_x).zip(&deltas).zip(&o1) {
+            println!("X_n  {}", pt(x));
+            println!("Y_n  {}", pt(a));
+            println!("Y_n' {}", pt(b));
+            println!("D_n  {}", pt(d));
+            println!();
         }
+    } else {
+        println!("error")
     }
 }
 
@@ -293,15 +402,14 @@ fn main() {
 
     window.set_target_fps(60);
 
-    let mut origin_x = -1.0;
-    let mut origin_y = -1.0;
+    let mut origin_x = BigFloat::from(-1.0);
+    let mut origin_y = BigFloat::from(-1.0);
     // displayed range / pixel size (zooming in means reducing view)
     let mut view = 1.0 / 500.0;
 
     let mut cached = None;
 
     let mut first_time = true;
-    let mut render_precision = RenderPrecision::F64;
 
     while window.is_open() {
         let mut mouse01 = None;
@@ -318,35 +426,24 @@ fn main() {
 
                 view /= multiplier;
 
-                let pos_x = mouse_x as f64 * view + origin_x;
-                let pos_y = mouse_y as f64 * view + origin_y;
+                let pos_x = BigFloat::from(mouse_x as f64 * view) + origin_x;
+                let pos_y = BigFloat::from(mouse_y as f64 * view) + origin_y;
 
-                origin_x = pos_x + (origin_x - pos_x) / multiplier;
-                origin_y = pos_y + (origin_y - pos_y) / multiplier;
+                origin_x = pos_x + (origin_x - pos_x) / BigFloat::from(multiplier);
+                origin_y = pos_y + (origin_y - pos_y) / BigFloat::from(multiplier);
             }
         }
 
         let cache_key = (origin_x, origin_y, view);
         if window.is_key_pressed(Key::Space, KeyRepeat::No) {
-            match render_precision {
-                RenderPrecision::F16 => render::<f16>(&mut buffer, w, h, (origin_x as f16, origin_y as f16), view as f16),
-                RenderPrecision::F32 => render::<f32>(&mut buffer, w, h, (origin_x as f32, origin_y as f32), view as f32),
-                RenderPrecision::F64 => render::<f64>(&mut buffer, w, h, (origin_x, origin_y), view),
-                RenderPrecision::F128 => render::<f128>(&mut buffer, w, h, (origin_x as f128, origin_y as f128), view as f128),
-                RenderPrecision::F256 => render::<f256>(&mut buffer, w, h, (origin_x.into(), origin_y.into()), view.into()),
-                RenderPrecision::BF => render::<BigFloat>(&mut buffer, w, h, (origin_x.into(), origin_y.into()), view.into()),
-            }
+            render(
+                &mut buffer,
+                w,
+                h,
+                (origin_x.into(), origin_y.into()),
+                view.into(),
+            );
             cached = Some(cache_key);
-        } else if window.is_key_pressed(Key::Escape, KeyRepeat::No) {
-            render_precision = match render_precision {
-                RenderPrecision::F16 => RenderPrecision::F32,
-                RenderPrecision::F32 => RenderPrecision::F64,
-                RenderPrecision::F64 => RenderPrecision::F128,
-                RenderPrecision::F128 => RenderPrecision::F256,
-                RenderPrecision::F256 => RenderPrecision::BF,
-                RenderPrecision::BF => RenderPrecision::F16,
-            };
-            println!("render precision: {render_precision}");
         } else {
             if cached != Some(cache_key) {
                 if first_time {
