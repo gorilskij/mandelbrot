@@ -20,7 +20,7 @@ pub enum Pixels {}
 pub enum Relative {}
 pub type Point<U> = Point2D<f64, U>;
 pub type Origin = Point2D<BigFloat, Units>;
-pub type View = Scale<BigFloat, Pixels, Units>;
+pub type View = Scale<f64, Pixels, Units>;
 
 #[derive(Copy, Clone, PartialEq)]
 pub struct CoordinatesBox {
@@ -184,8 +184,10 @@ pub fn sample_zoomed(
 
     // src_origin and dest_origin are both absolute
     // calculate dest_origin in the [0, 1] reference frame given by src
+    // let src_view_bf = Scale::<_, Pixels, Units>::new(BigFloat::from(src_view.0));
+    // TODO: check numerical properties at high zoom
     let dest_origin_rel_src = {
-        let p = ((dest_origin - src_origin) / src_view).to_point();
+        let p = ((dest_origin - src_origin).to_f64() / src_view).to_point();
         Point::<Relative>::new(p.x / fwidth, p.y / fheight)
     };
 
@@ -281,17 +283,72 @@ fn do_one_pixel(
     origin: Origin,
     iterations: usize,
     buf_view: BufView,
+    ref_orbit: &RwLock<RefOrbit>,
 ) -> Option<NonZeroUsize> {
     let c_typed = Length::<_, Pixels>::new(c as f64);
     let r_typed = Length::<_, Pixels>::new(r as f64);
 
-    let val = calculate(
-        Complex::new(
-            (c_typed * view + origin.x()).0,
-            (r_typed * view + origin.y()).0,
-        ),
-        iterations,
-    );
+    let delta_x = c_typed * view;
+    let delta_y = r_typed * view;
+    // let delta_x = c as f64 / w as f64 * x_range;
+    // let delta_y = r as f64 / h as f64 * y_range;
+
+    let val;
+
+    // if use_deltas {
+    let lock = ref_orbit.read();
+    val = if let Ok(val) = check_divergence_delta(
+        &lock.orbit,
+        &lock.orbit_f64,
+        Complex {
+            re: (delta_x - lock.delta_corr_x).0,
+            im: (delta_y - lock.delta_corr_y).0,
+        },
+    ) {
+        val
+    } else {
+        drop(lock); // the next line is not enough by itself to drop the read lock
+        let mut lock = ref_orbit.write();
+
+        let delta_x_bf = Length::<_, Units>::new(BigFloat::from(delta_x.get()));
+        let delta_y_bf = Length::<_, Units>::new(BigFloat::from(delta_y.get()));
+
+        let new_orbit = calculate_orbit(
+            Complex {
+                re: (origin.x() + delta_x_bf).0,
+                im: (origin.y() + delta_y_bf).0,
+            },
+            iterations,
+        )
+        .into_boxed_slice();
+
+        let val = check_orbit(&new_orbit);
+
+        lock.orbit_f64 = new_orbit
+            .iter()
+            .map(|c| Complex::new(c.re.to_f64(), c.im.to_f64()))
+            .collect();
+        lock.orbit = new_orbit;
+
+        lock.delta_corr_x = delta_x;
+        lock.delta_corr_y = delta_y;
+
+        val
+    };
+    // } else {
+    //     val = check_orbit(&calculate_orbit(
+    //         Complex::new(x_min.to_f64() + delta_x, y_min.to_f64() + delta_y),
+    //         ITERATIONS,
+    //     ))
+    // }
+
+    // let val = calculate(
+    //     Complex::new(
+    //         (c_typed * view + origin.x()).0,
+    //         (r_typed * view + origin.y()).0,
+    //     ),
+    //     iterations,
+    // );
 
     // SAFETY: all writes are disjoint
     unsafe {
@@ -305,8 +362,8 @@ fn do_one_pixel(
 }
 
 struct RefOrbit {
-    delta_corr_x: f64,
-    delta_corr_y: f64,
+    delta_corr_x: Length<f64, Units>,
+    delta_corr_y: Length<f64, Units>,
     orbit: Box<[Complex<BigFloat>]>,
     orbit_f64: Box<[Complex<f64>]>,
 }
@@ -325,7 +382,7 @@ pub fn render(
 
     let buf_view = BufView(buf.as_mut_ptr());
 
-    let ref_orbit = {
+    let ref_orbit = &{
         let orbit = calculate_orbit(
             Complex {
                 re: coords.origin.x,
@@ -345,8 +402,8 @@ pub fn render(
             .into_boxed_slice();
 
         RwLock::new(RefOrbit {
-            delta_corr_x: 0.0,
-            delta_corr_y: 0.0,
+            delta_corr_x: Length::new(0.0),
+            delta_corr_y: Length::new(0.0),
             orbit,
             orbit_f64,
         })
@@ -376,7 +433,7 @@ pub fn render(
                     let buf_view = buf_view;
 
                     iproduct!(y_range, x_range).for_each(|(r, c)| {
-                        do_one_pixel(c, r, width, view, origin, iterations, buf_view);
+                        do_one_pixel(c, r, width, view, origin, iterations, buf_view, ref_orbit);
                     });
 
                     // TODO: reimplement

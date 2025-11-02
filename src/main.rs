@@ -2,9 +2,10 @@ mod drawing;
 mod rendering;
 
 use crate::drawing::Drawer;
-use euclid::Point2D;
+use euclid::{Point2D, Scale};
 use log::{info, trace};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use num_bigfloat::BigFloat;
 use rendering::*;
 
 fn main() {
@@ -21,7 +22,7 @@ fn main() {
 
     let mut coords = CoordinatesBox {
         // these (origin, view) are always in sync with (zoomed.origin, zoomed.view)
-        origin: Point::new(-2.5, -1.0),
+        origin: Point2D::new(BigFloat::from(-2.5), BigFloat::from(-1.0)),
         // range (1) / pixel
         view: View::new(1.0 / 300.0),
     };
@@ -30,7 +31,7 @@ fn main() {
 
     let mut drawer = Drawer::new(width, height, coords, iterations);
 
-    let mut dragging = None::<Point2D<f64, Pixels>>;
+    let mut dragging = None::<Point2D<BigFloat, Pixels>>;
 
     while window.is_open() {
         let mut zoomed = false;
@@ -39,12 +40,12 @@ fn main() {
         // mouse position in pixels with the top-left corner of the window as the origin
         let cursor_rel = window
             .get_mouse_pos(MouseMode::Discard)
-            .map(|(x, y)| Point::<Pixels>::new(x as f64, y as f64));
+            .map(|(x, y)| Point2D::<_, Pixels>::new(BigFloat::from(x), BigFloat::from(y)));
 
         if let Some(cursor_rel) = cursor_rel {
-            let left_mouse_down = window.get_mouse_down(MouseButton::Left);
+            let view_bf = Scale::<_, Pixels, Units>::new(BigFloat::from(coords.view.get()));
 
-            if left_mouse_down {
+            if window.get_mouse_down(MouseButton::Left) {
                 if dragging.is_none() {
                     trace!("start dragging");
                 }
@@ -52,8 +53,8 @@ fn main() {
                 if let Some(last) = dragging {
                     dragged = true;
 
-                    let drag: Point2D<f64, Pixels> = (cursor_rel - last).to_point();
-                    coords.origin -= (drag * coords.view).to_vector();
+                    let drag: Point2D<_, Pixels> = (cursor_rel - last).to_point();
+                    coords.origin -= (drag * view_bf).to_vector();
                 }
                 dragging = Some(cursor_rel);
             } else {
@@ -69,17 +70,19 @@ fn main() {
                 if let Some((_, scroll_y)) = window.get_scroll_wheel() {
                     zoomed = true;
 
-                    let cursor_abs = coords.origin + (cursor_rel * coords.view).to_vector();
+                    let cursor_abs = coords.origin + (cursor_rel * view_bf).to_vector();
                     let multiplier = 1.0 + (scroll_y as f64 / 100.0).clamp(-0.2, 0.2);
 
-                    coords.origin = cursor_abs + (coords.origin - cursor_abs) / multiplier;
+                    coords.origin =
+                        cursor_abs + (coords.origin - cursor_abs) / BigFloat::from(multiplier);
                     coords.view = View::new(coords.view.0 / multiplier);
                 }
             }
         }
 
         // cast to usize
-        let cursor_rel = cursor_rel.map(|p| Point2D::<_, Pixels>::new(p.x as usize, p.y as usize));
+        let cursor_rel = cursor_rel
+            .map(|p| Point2D::<_, Pixels>::new(p.x.to_f64() as usize, p.y.to_f64() as usize));
 
         if dragged || zoomed {
             trace!("send update to drawer");
