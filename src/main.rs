@@ -2,8 +2,6 @@
 
 mod complex;
 
-use std::sync::Mutex;
-
 use complex::{Complex, Float};
 use hsl::HSL;
 use indicatif::ProgressBar;
