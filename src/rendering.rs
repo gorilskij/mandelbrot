@@ -107,15 +107,28 @@ fn val_to_color(val: Option<NonZeroUsize>) -> u32 {
         // [0, 1)
         // let f = 1.0 - 1.0 / (val.get() as f64 / 100.0 + 1.0);
 
+        // let hsl = HSL {
+        //     // h: val.get() as f64 % 360.0,
+        //     // s: 0.7,
+        //     // // l: 0.5,
+        //     // l: (val.get() as f64 / 10.0).sin() * 0.1 + 0.5,
+        //     h: (val.get() as f64 / 10.0).sin() * 180.0,
+        //     s: 0.7,
+        //     // l: 0.5,
+        //     l: ((val.get() as f64 / (10.0 * std::f64::consts::E)).sin() * 0.3 + 0.4),
+        // };
+
+        // really good color scheme
+        // let hsl = HSL {
+        //     h: (val.get() as f64 / 400.0).sin() * 180.0,
+        //     s: 0.7,
+        //     l: ((val.get() as f64 / 40.0).sin() * 0.3 + 0.4),
+        // };
+
         let hsl = HSL {
-            // h: val.get() as f64 % 360.0,
-            // s: 0.7,
-            // // l: 0.5,
-            // l: (val.get() as f64 / 10.0).sin() * 0.1 + 0.5,
-            h: (val.get() as f64 / 10.0).sin() * 180.0,
+            h: (val.get() as f64 / 1200.0).sin() * 180.0,
             s: 0.7,
-            // l: 0.5,
-            l: ((val.get() as f64 / (10.0 * std::f64::consts::E)).sin() * 0.3 + 0.4),
+            l: ((val.get() as f64 / 40.0).sin() * 0.3 + 0.4),
         };
 
         let (r, g, b) = hsl.to_rgb();
