@@ -2,11 +2,14 @@
 
 mod complex;
 
-use complex::{Complex, Float, Zero};
+use std::sync::Mutex;
+
+use complex::{Complex, Float};
 use hsl::HSL;
 use indicatif::ProgressBar;
 use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
 use num_bigfloat::BigFloat;
+use parking_lot::RwLock;
 use rand::{Rng, rng};
 use rayon::prelude::*;
 
@@ -250,6 +253,13 @@ struct BufView(*mut u32);
 unsafe impl Send for BufView {}
 unsafe impl Sync for BufView {}
 
+struct RefOrbit {
+    delta_corr_x: f64,
+    delta_corr_y: f64,
+    ref_orbit: Box<[Complex<BigFloat>]>,
+    ref_orbit_f64: Box<[Complex<f64>]>,
+}
+
 fn render(
     buf: &mut [u32],
     w: usize,
@@ -266,30 +276,41 @@ fn render(
     let buf_view = BufView(buf.as_mut_ptr());
 
     let rng = &mut rng();
-    let mut delta_corr_x = (rng.random::<f64>().abs() % 1.0) * x_range;
-    let mut delta_corr_y = (rng.random::<f64>().abs() % 1.0) * y_range;
-    println!(
-        "ref: ({}, {})",
-        x_min.to_f64() + delta_corr_x,
-        y_min.to_f64() + delta_corr_y
-    );
 
-    let mut ref_orbit = calculate_orbit(
-        Complex::new(
-            x_min + BigFloat::from(delta_corr_x),
-            y_min + BigFloat::from(delta_corr_y),
-        ),
-        ITERATIONS,
-    );
-    let mut ref_orbit_f64 = Vec::from_iter(
-        ref_orbit
-            .iter()
-            .map(|x| Complex::new(x.re().into_f64(), x.im().into_f64())),
-    );
+    // TODO: choose type of Mutex
+    let ref_orbit = {
+        let delta_corr_x = (rng.random::<f64>().abs() % 1.0) * x_range;
+        let delta_corr_y = (rng.random::<f64>().abs() % 1.0) * y_range;
+        println!(
+            "ref: ({}, {})",
+            x_min.to_f64() + delta_corr_x,
+            y_min.to_f64() + delta_corr_y
+        );
+
+        let ref_orbit = calculate_orbit(
+            Complex::new(
+                x_min + BigFloat::from(delta_corr_x),
+                y_min + BigFloat::from(delta_corr_y),
+            ),
+            ITERATIONS,
+        );
+        let ref_orbit_f64 = Vec::from_iter(
+            ref_orbit
+                .iter()
+                .map(|x| Complex::new(x.re().into_f64(), x.im().into_f64())),
+        );
+
+        RwLock::new(RefOrbit {
+            delta_corr_x,
+            delta_corr_y,
+            ref_orbit: ref_orbit.into_boxed_slice(),
+            ref_orbit_f64: ref_orbit_f64.into_boxed_slice(),
+        })
+    };
 
     let pbar = &ProgressBar::new(h as u64);
-    // (0..h).into_par_iter().for_each(move |r| {
-    (0..h).into_iter().for_each(move |r| {
+    (0..h).into_par_iter().for_each(move |r| {
+        // (0..h).into_iter().for_each(move |r| {
         let buf_view = buf_view;
 
         for c in 0..w {
@@ -299,28 +320,38 @@ fn render(
             let val;
 
             if use_deltas {
+                let lock = ref_orbit.read();
                 val = if let Ok(val) = check_divergence_delta(
-                    &ref_orbit,
-                    &ref_orbit_f64,
-                    Complex::new(delta_x - delta_corr_x, delta_y - delta_corr_y),
+                    &lock.ref_orbit,
+                    &lock.ref_orbit_f64,
+                    Complex::new(delta_x - lock.delta_corr_x, delta_y - lock.delta_corr_y),
                 ) {
                     val
                 } else {
-                    // println!("recalculating reference");
-                    ref_orbit = calculate_orbit(
+                    drop(lock); // the following line is not enough by itself to drop the read lock
+                    let mut lock = ref_orbit.write();
+
+                    let new_ref_orbit = calculate_orbit(
                         Complex::new(
                             x_min + BigFloat::from(delta_x),
                             y_min + BigFloat::from(delta_y),
                         ),
                         ITERATIONS,
-                    );
-                    ref_orbit_f64 = ref_orbit
+                    )
+                    .into_boxed_slice();
+
+                    let val = check_orbit(&new_ref_orbit);
+
+                    lock.ref_orbit_f64 = new_ref_orbit
                         .iter()
                         .map(|x| Complex::new(x.re().into_f64(), x.im().into_f64()))
                         .collect();
-                    delta_corr_x = delta_x;
-                    delta_corr_y = delta_y;
-                    check_orbit(&ref_orbit)
+                    lock.ref_orbit = new_ref_orbit;
+
+                    lock.delta_corr_x = delta_x;
+                    lock.delta_corr_y = delta_y;
+
+                    val
                 };
             } else {
                 val = check_orbit(&calculate_orbit(
