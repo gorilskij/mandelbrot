@@ -1,5 +1,4 @@
 use crate::drawing::maybe_pixel::MaybePixel;
-use crossbeam_channel;
 use euclid::{Length, Point2D, Scale};
 use hsl::HSL;
 use indicatif::ProgressBar;
@@ -46,18 +45,6 @@ where
     }
 }
 
-// fn calculate(c: Complex<f64>, iterations: usize) -> Option<NonZeroUsize> {
-//     let mut z: Complex<f64> = Complex::ZERO;
-//     for i in 1..iterations + 1 {
-//         z = z * z + c;
-//         if z.norm() > 4.0 {
-//             // SAFETY: i starts iterating at 1, it is never 0
-//             unsafe { return Some(NonZeroUsize::new_unchecked(i)) };
-//         }
-//     }
-//     None
-// }
-
 fn calculate_orbit<F: Float>(x_0: Complex<F>, iterations: usize) -> Vec<Complex<F>> {
     let mut out = Vec::with_capacity(iterations + 1);
     let mut x_n = x_0;
@@ -86,7 +73,6 @@ fn check_orbit<F: Float>(orbit: &[Complex<F>]) -> Option<NonZeroUsize> {
 }
 
 fn check_divergence_delta(
-    ref_orbit: &[Complex<BigFloat>],
     ref_orbit_f64: &[Complex<f64>],
     delta: Complex<f64>,
 ) -> Result<Option<NonZeroUsize>, ()> {
@@ -96,18 +82,18 @@ fn check_divergence_delta(
 
     let delta_0 = delta;
     let mut delta = delta;
-    for i in 0..ref_orbit.len() {
-        if is_bad_value(ref_orbit_f64[i]) {
+    for (i, &c) in ref_orbit_f64.iter().enumerate() {
+        if is_bad_value(c) {
             return Err(());
         }
 
-        let x = ref_orbit_f64[i] + delta;
+        let x = c + delta;
         if x.norm() > 4.0 {
             // this is always Some(...), i + 1 can't be 0
             return Ok(NonZeroUsize::new(i + 1));
         }
 
-        delta = ref_orbit_f64[i] * 2.0 * delta + delta * delta + delta_0;
+        delta = c * 2.0 * delta + delta * delta + delta_0;
     }
     Ok(None)
 }
@@ -116,7 +102,7 @@ fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-fn render_pixel(val: Option<NonZeroUsize>) -> u32 {
+fn val_to_color(val: Option<NonZeroUsize>) -> u32 {
     if let Some(val) = val {
         // [0, 1)
         // let f = 1.0 - 1.0 / (val.get() as f64 / 100.0 + 1.0);
@@ -267,15 +253,20 @@ fn chunks_2d(
         .collect();
 
     chunks.sort_unstable_by_key(|(range_x, range_y)| {
-        let x_diff = range_x.start.abs_diff(center.x as usize);
-        let y_diff = range_y.start.abs_diff(center.y as usize);
+        let x_diff = range_x.start.abs_diff(center.x);
+        let y_diff = range_y.start.abs_diff(center.y);
         ((x_diff * x_diff) as f64 + (y_diff * y_diff) as f64).sqrt() as usize
     });
     chunks
 }
 
+// calculate divergence time from the delta of a reference orbit, if the
+// reference orbit diverges too far before the orbit being calculated
+// (making it impossible to compute usable delta values), set the current
+// point as the new reference point and replace the reference orbit with
+// the current point's orbit (affects all future delta calculations)
 #[inline]
-fn do_one_pixel(
+fn render_pixel(
     c: usize,
     r: usize,
     width: usize,
@@ -290,24 +281,22 @@ fn do_one_pixel(
 
     let delta_x = c_typed * view;
     let delta_y = r_typed * view;
-    // let delta_x = c as f64 / w as f64 * x_range;
-    // let delta_y = r as f64 / h as f64 * y_range;
 
-    let val;
+    let val = 'val: {
+        // this block is necessary to properly drop the read lock
+        {
+            let lock = ref_orbit.read();
+            if let Ok(val) = check_divergence_delta(
+                &lock.orbit_f64,
+                Complex {
+                    re: (delta_x - lock.delta_corr_x).0,
+                    im: (delta_y - lock.delta_corr_y).0,
+                },
+            ) {
+                break 'val val;
+            }
+        }
 
-    // if use_deltas {
-    let lock = ref_orbit.read();
-    val = if let Ok(val) = check_divergence_delta(
-        &lock.orbit,
-        &lock.orbit_f64,
-        Complex {
-            re: (delta_x - lock.delta_corr_x).0,
-            im: (delta_y - lock.delta_corr_y).0,
-        },
-    ) {
-        val
-    } else {
-        drop(lock); // the next line is not enough by itself to drop the read lock
         let mut lock = ref_orbit.write();
 
         let delta_x_bf = Length::<_, Units>::new(BigFloat::from(delta_x.get()));
@@ -335,27 +324,13 @@ fn do_one_pixel(
 
         val
     };
-    // } else {
-    //     val = check_orbit(&calculate_orbit(
-    //         Complex::new(x_min.to_f64() + delta_x, y_min.to_f64() + delta_y),
-    //         ITERATIONS,
-    //     ))
-    // }
-
-    // let val = calculate(
-    //     Complex::new(
-    //         (c_typed * view + origin.x()).0,
-    //         (r_typed * view + origin.y()).0,
-    //     ),
-    //     iterations,
-    // );
 
     // SAFETY: all writes are disjoint
     unsafe {
         buf_view
             .0
             .add(r * width + c)
-            .write(render_pixel(val).into());
+            .write(val_to_color(val).into());
     }
 
     val
@@ -446,7 +421,7 @@ pub fn render(
                         .chain(y_inner_range.clone().map(|r| (x_range.end - 1, r))); // right edge excluding top and bottom pixel
 
                     let all_black = outer_perimeter.fold(true, |all_black, (c, r)| {
-                        let val = do_one_pixel(
+                        let val = render_pixel(
                             c, r, width, view, origin, iterations, buf_view, ref_orbit,
                         );
                         all_black && val.is_none()
@@ -461,7 +436,7 @@ pub fn render(
                         });
                     } else {
                         iproduct!(y_inner_range, x_inner_range).for_each(|(r, c)| {
-                            do_one_pixel(
+                            render_pixel(
                                 c, r, width, view, origin, iterations, buf_view, ref_orbit,
                             );
                         });

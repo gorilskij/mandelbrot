@@ -61,7 +61,7 @@ pub mod render_buffer {
                     return buf;
                 }
 
-                let _ = done;
+                drop(done);
                 thread::yield_now();
                 thread::sleep(Duration::from_millis(200));
             }
@@ -126,7 +126,7 @@ pub fn spawn(width: usize, height: usize) -> Handle {
                 let center = cursor_rel.unwrap_or(Point2D::<_, Pixels>::new(width / 2, height / 2));
 
                 render(
-                    &mut *buf_lock,
+                    &mut buf_lock,
                     width,
                     height,
                     center,

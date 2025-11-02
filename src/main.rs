@@ -92,12 +92,10 @@ fn main() {
             iterations *= 2;
             info!("iterations: {iterations}");
             drawer.update(coords, iterations, cursor_rel);
-        } else if window.is_key_pressed(Key::Down, KeyRepeat::No) {
-            if iterations > 1 {
-                iterations /= 2;
-                info!("iterations: {iterations}");
-                drawer.update(coords, iterations, cursor_rel);
-            }
+        } else if window.is_key_pressed(Key::Down, KeyRepeat::No) && iterations > 1 {
+            iterations /= 2;
+            info!("iterations: {iterations}");
+            drawer.update(coords, iterations, cursor_rel);
         }
 
         drawer.update_display_buf();
