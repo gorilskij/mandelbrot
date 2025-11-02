@@ -4,9 +4,11 @@ use euclid::{Length, Point2D, Scale};
 use hsl::HSL;
 use indicatif::ProgressBar;
 use itertools::iproduct;
-use num::Complex;
+use num::{Complex, Float, ToPrimitive};
+use num_bigfloat::BigFloat;
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
+use parking_lot::RwLock;
 use rayon::ThreadPool;
 use std::cmp::min;
 use std::num::NonZeroUsize;
@@ -17,8 +19,8 @@ pub enum Units {}
 pub enum Pixels {}
 pub enum Relative {}
 pub type Point<U> = Point2D<f64, U>;
-pub type Origin = Point<Units>;
-pub type View = Scale<f64, Pixels, Units>;
+pub type Origin = Point2D<BigFloat, Units>;
+pub type View = Scale<BigFloat, Pixels, Units>;
 
 #[derive(Copy, Clone, PartialEq)]
 pub struct CoordinatesBox {
@@ -44,16 +46,70 @@ where
     }
 }
 
-fn calculate(c: Complex<f64>, iterations: usize) -> Option<NonZeroUsize> {
-    let mut z: Complex<f64> = Complex::ZERO;
-    for i in 1..iterations + 1 {
-        z = z * z + c;
-        if z.norm() > 4.0 {
-            // SAFETY: i starts iterating at 1, it is never 0
-            unsafe { return Some(NonZeroUsize::new_unchecked(i)) };
+// fn calculate(c: Complex<f64>, iterations: usize) -> Option<NonZeroUsize> {
+//     let mut z: Complex<f64> = Complex::ZERO;
+//     for i in 1..iterations + 1 {
+//         z = z * z + c;
+//         if z.norm() > 4.0 {
+//             // SAFETY: i starts iterating at 1, it is never 0
+//             unsafe { return Some(NonZeroUsize::new_unchecked(i)) };
+//         }
+//     }
+//     None
+// }
+
+fn calculate_orbit<F: Float>(x_0: Complex<F>, iterations: usize) -> Vec<Complex<F>> {
+    let mut out = Vec::with_capacity(iterations + 1);
+    let mut x_n = x_0;
+    out.push(x_n);
+    for _ in 0..iterations {
+        x_n = x_n * x_n + x_0;
+        out.push(x_n);
+    }
+    out
+}
+
+fn is_bad_value(v: Complex<f64>) -> bool {
+    // implicitly also checks that neither is NaN
+    !(v.re.abs() <= 1000.0 && v.im.abs() <= 1000.0)
+}
+
+fn check_orbit<F: Float>(orbit: &[Complex<F>]) -> Option<NonZeroUsize> {
+    let four = F::from(4.0).unwrap();
+    for (i, x) in orbit.iter().enumerate() {
+        if x.norm() > four {
+            // this is always Some(...), i + 1 can't be 0
+            return NonZeroUsize::new(i + 1);
         }
     }
     None
+}
+
+fn check_divergence_delta(
+    ref_orbit: &[Complex<BigFloat>],
+    ref_orbit_f64: &[Complex<f64>],
+    delta: Complex<f64>,
+) -> Result<Option<NonZeroUsize>, ()> {
+    // ref_orbit is [x_0, x_1, ...]
+    // delta is delta_0
+    // delta_{n+1} = 2 x_n delta_n + delta_n^2 + delta_0
+
+    let delta_0 = delta;
+    let mut delta = delta;
+    for i in 0..ref_orbit.len() {
+        if is_bad_value(ref_orbit_f64[i]) {
+            return Err(());
+        }
+
+        let x = ref_orbit_f64[i] + delta;
+        if x.norm() > 4.0 {
+            // this is always Some(...), i + 1 can't be 0
+            return Ok(NonZeroUsize::new(i + 1));
+        }
+
+        delta = ref_orbit_f64[i] * 2.0 * delta + delta * delta + delta_0;
+    }
+    Ok(None)
 }
 
 fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
@@ -248,6 +304,13 @@ fn do_one_pixel(
     val
 }
 
+struct RefOrbit {
+    delta_corr_x: f64,
+    delta_corr_y: f64,
+    orbit: Box<[Complex<BigFloat>]>,
+    orbit_f64: Box<[Complex<f64>]>,
+}
+
 pub fn render(
     buf: &mut [MaybePixel],
     width: usize,
@@ -261,6 +324,33 @@ pub fn render(
     let CoordinatesBox { origin, view } = coords;
 
     let buf_view = BufView(buf.as_mut_ptr());
+
+    let ref_orbit = {
+        let orbit = calculate_orbit(
+            Complex {
+                re: coords.origin.x,
+                im: coords.origin.y,
+            },
+            iterations,
+        )
+        .into_boxed_slice();
+
+        let orbit_f64 = orbit
+            .iter()
+            .map(|c| Complex {
+                re: c.re.to_f64(),
+                im: c.im.to_f64(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        RwLock::new(RefOrbit {
+            delta_corr_x: 0.0,
+            delta_corr_y: 0.0,
+            orbit,
+            orbit_f64,
+        })
+    };
 
     let side = 20;
     let chunks = chunks_2d(width, height, center, side);
@@ -285,36 +375,41 @@ pub fn render(
 
                     let buf_view = buf_view;
 
+                    iproduct!(y_range, x_range).for_each(|(r, c)| {
+                        do_one_pixel(c, r, width, view, origin, iterations, buf_view);
+                    });
+
+                    // TODO: reimplement
                     // do the outline first, if all cells are black (don't diverge), then
                     // assume the whole block is black
 
-                    let x_inner_range = x_range.start + 1..x_range.end - 1;
-                    let y_inner_range = y_range.start + 1..y_range.end - 1;
+                    // let x_inner_range = x_range.start + 1..x_range.end - 1;
+                    // let y_inner_range = y_range.start + 1..y_range.end - 1;
 
-                    let outer_perimeter = x_range
-                        .clone()
-                        .map(|c| (c, y_range.start)) // top edge
-                        .chain(x_range.clone().map(|c| (c, y_range.end - 1))) // bottom edge
-                        .chain(y_inner_range.clone().map(|r| (x_range.start, r))) // left edge excluding top and bottom pixel
-                        .chain(y_inner_range.clone().map(|r| (x_range.end - 1, r))); // right edge excluding top and bottom pixel
+                    // let outer_perimeter = x_range
+                    //     .clone()
+                    //     .map(|c| (c, y_range.start)) // top edge
+                    //     .chain(x_range.clone().map(|c| (c, y_range.end - 1))) // bottom edge
+                    //     .chain(y_inner_range.clone().map(|r| (x_range.start, r))) // left edge excluding top and bottom pixel
+                    //     .chain(y_inner_range.clone().map(|r| (x_range.end - 1, r))); // right edge excluding top and bottom pixel
 
-                    let all_black = outer_perimeter.fold(true, |all_black, (c, r)| {
-                        let val = do_one_pixel(c, r, width, view, origin, iterations, buf_view);
-                        all_black && val.is_none()
-                    });
+                    // let all_black = outer_perimeter.fold(true, |all_black, (c, r)| {
+                    //     let val = do_one_pixel(c, r, width, view, origin, iterations, buf_view);
+                    //     all_black && val.is_none()
+                    // });
 
-                    if all_black {
-                        iproduct!(y_inner_range, x_inner_range).for_each(|(r, c)| {
-                            // SAFETY: all writes are disjoint
-                            unsafe {
-                                buf_view.0.add(r * width + c).write(0.into());
-                            }
-                        });
-                    } else {
-                        iproduct!(y_inner_range, x_inner_range).for_each(|(r, c)| {
-                            do_one_pixel(c, r, width, view, origin, iterations, buf_view);
-                        });
-                    }
+                    // if all_black {
+                    //     iproduct!(y_inner_range, x_inner_range).for_each(|(r, c)| {
+                    //         // SAFETY: all writes are disjoint
+                    //         unsafe {
+                    //             buf_view.0.add(r * width + c).write(0.into());
+                    //         }
+                    //     });
+                    // } else {
+                    //     iproduct!(y_inner_range, x_inner_range).for_each(|(r, c)| {
+                    //         do_one_pixel(c, r, width, view, origin, iterations, buf_view);
+                    //     });
+                    // }
 
                     pbar.inc(1);
                 }
