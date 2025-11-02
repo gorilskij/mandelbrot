@@ -3,6 +3,7 @@
 pub struct MaybePixel(u32);
 
 // incompatible with transparency
+// if the flag bit is set, this is a None, otherwise it's a Some(color)
 impl MaybePixel {
     const FLAG_BIT: u32 = 1 << 31;
 

@@ -3,6 +3,7 @@ use crossbeam_channel;
 use euclid::{Length, Point2D, Scale};
 use hsl::HSL;
 use indicatif::ProgressBar;
+use itertools::iproduct;
 use num::Complex;
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
@@ -55,17 +56,6 @@ fn calculate(c: Complex<f64>, iterations: usize) -> Option<NonZeroUsize> {
     None
 }
 
-fn apply_sharpness(val: f64, sharpness: f64) -> f64 {
-    assert!((0.0..=1.0).contains(&val));
-    assert!(sharpness >= 2.0);
-    if val < 1.0 / sharpness {
-        sharpness * val
-    } else {
-        -1.0 / (1.0 - 1.0 / sharpness) * (val - 1.0)
-        // 1.0
-    }
-}
-
 fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
@@ -73,7 +63,7 @@ fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
 fn render_pixel(val: Option<NonZeroUsize>) -> u32 {
     if let Some(val) = val {
         // [0, 1)
-        let f = 1.0 - 1.0 / (val.get() as f64 / 100.0 + 1.0);
+        // let f = 1.0 - 1.0 / (val.get() as f64 / 100.0 + 1.0);
 
         let hsl = HSL {
             // h: val.get() as f64 % 360.0,
@@ -83,7 +73,7 @@ fn render_pixel(val: Option<NonZeroUsize>) -> u32 {
             h: (val.get() as f64 / 10.0).sin() * 180.0,
             s: 0.7,
             // l: 0.5,
-            l: (val.get() as f64 / (10.0 * std::f64::consts::E)).sin() * 0.4 + 0.5,
+            l: ((val.get() as f64 / (10.0 * std::f64::consts::E)).sin() * 0.3 + 0.4),
         };
 
         let (r, g, b) = hsl.to_rgb();
@@ -226,6 +216,37 @@ fn chunks_2d(
     chunks
 }
 
+fn do_one_pixel(
+    c: usize,
+    r: usize,
+    width: usize,
+    view: View,
+    origin: Origin,
+    iterations: usize,
+    buf_view: BufView,
+) -> Option<NonZeroUsize> {
+    let c_typed = Length::<_, Pixels>::new(c as f64);
+    let r_typed = Length::<_, Pixels>::new(r as f64);
+
+    let val = calculate(
+        Complex::new(
+            (c_typed * view + origin.x()).0,
+            (r_typed * view + origin.y()).0,
+        ),
+        iterations,
+    );
+
+    // SAFETY: all writes are disjoint
+    unsafe {
+        buf_view
+            .0
+            .add(r * width + c)
+            .write(render_pixel(val).into());
+    }
+
+    val
+}
+
 pub fn render(
     buf: &mut [MaybePixel],
     width: usize,
@@ -263,28 +284,37 @@ pub fn render(
 
                     let buf_view = buf_view;
 
-                    for r in y_range {
-                        for c in x_range.clone() {
-                            let c_typed = Length::<_, Pixels>::new(c as f64);
-                            let r_typed = Length::<_, Pixels>::new(r as f64);
+                    // do the outline first, if all cells are black (don't diverge), then
+                    // assume the whole block is black
 
-                            let val = calculate(
-                                Complex::new(
-                                    (c_typed * view + origin.x()).0,
-                                    (r_typed * view + origin.y()).0,
-                                ),
-                                iterations,
-                            );
+                    let x_inner_range = x_range.start + 1..x_range.end - 1;
+                    let y_inner_range = y_range.start + 1..y_range.end - 1;
 
+                    let outer_perimeter = x_range
+                        .clone()
+                        .map(|c| (c, y_range.start)) // top edge
+                        .chain(x_range.clone().map(|c| (c, y_range.end - 1))) // bottom edge
+                        .chain(y_inner_range.clone().map(|r| (x_range.start, r))) // left edge excluding top and bottom pixel
+                        .chain(y_inner_range.clone().map(|r| (x_range.end - 1, r))); // right edge excluding top and bottom pixel
+
+                    let all_black = outer_perimeter.fold(true, |all_black, (c, r)| {
+                        let val = do_one_pixel(c, r, width, view, origin, iterations, buf_view);
+                        all_black && val.is_none()
+                    });
+
+                    if all_black {
+                        iproduct!(y_inner_range, x_inner_range).for_each(|(r, c)| {
                             // SAFETY: all writes are disjoint
                             unsafe {
-                                buf_view
-                                    .0
-                                    .add(r * width + c)
-                                    .write(render_pixel(val).into());
+                                buf_view.0.add(r * width + c).write(0.into());
                             }
-                        }
+                        });
+                    } else {
+                        iproduct!(y_inner_range, x_inner_range).for_each(|(r, c)| {
+                            do_one_pixel(c, r, width, view, origin, iterations, buf_view);
+                        });
                     }
+
                     pbar.inc(1);
                 }
             });
