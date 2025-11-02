@@ -2,6 +2,8 @@
 
 mod complex;
 
+use std::num::NonZeroUsize;
+
 use complex::Complex;
 use hsl::HSL;
 use indicatif::ProgressBar;
@@ -30,11 +32,12 @@ fn is_bad_value(v: Complex<f64>) -> bool {
     !(v.re().abs() <= 1000.0 && v.im().abs() <= 1000.0)
 }
 
-fn check_orbit<F: Float>(orbit: &[Complex<F>]) -> Option<usize> {
+fn check_orbit<F: Float>(orbit: &[Complex<F>]) -> Option<NonZeroUsize> {
     let four = F::from(4.0).unwrap();
     for (i, x) in orbit.iter().enumerate() {
         if x.norm() > four {
-            return Some(i);
+            // this is always Some(...), i + 1 can't be 0
+            return NonZeroUsize::new(i + 1);
         }
     }
     None
@@ -44,7 +47,7 @@ fn check_divergence_delta(
     ref_orbit: &[Complex<BigFloat>],
     ref_orbit_f64: &[Complex<f64>],
     delta: Complex<f64>,
-) -> Result<Option<usize>, ()> {
+) -> Result<Option<NonZeroUsize>, ()> {
     // ref_orbit is [x_0, x_1, ...]
     // delta is delta_0
     // delta_{n+1} = 2 x_n delta_n + delta_n^2 + delta_0
@@ -58,7 +61,8 @@ fn check_divergence_delta(
 
         let x = ref_orbit_f64[i] + delta;
         if x.norm() > 4.0 {
-            return Ok(Some(i));
+            // this is always Some(...), i + 1 can't be 0
+            return Ok(NonZeroUsize::new(i + 1));
         }
 
         delta = ref_orbit_f64[i] * 2.0 * delta + delta * delta + delta_0;
@@ -70,10 +74,11 @@ fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-fn render_pixel(val: Option<usize>) -> u32 {
+fn render_pixel(val: Option<NonZeroUsize>) -> u32 {
+    let val = val.map(|v| v.get());
     if let Some(val) = val {
         // [0, 1)
-        let f = 1.0 - 1.0 / (val as f64 / 100.0 + 1.0);
+        // let f = 1.0 - 1.0 / (val as f64 / 100.0 + 1.0);
 
         let hsl = HSL {
             // h: val.get() as f64 % 360.0,
