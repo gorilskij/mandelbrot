@@ -7,6 +7,7 @@ use hsl::HSL;
 use indicatif::ProgressBar;
 use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
 use num_bigfloat::BigFloat;
+use rand::{Rng, rng};
 use rayon::prelude::*;
 
 use crate::complex::IntoF64;
@@ -54,10 +55,8 @@ fn check_divergence_delta(
             return Err(());
         }
 
-        // let val =
-        // ref_orbit[i] + Complex::new(BigFloat::from(delta.re()), BigFloat::from(delta.im()));
         let x = ref_orbit_f64[i] + delta;
-        if (x.re() > 2.0 || x.im() > 2.0) && x.norm() > 4.0 {
+        if x.norm() > 4.0 {
             return Ok(Some(i));
         }
 
@@ -266,8 +265,20 @@ fn render(
 
     let buf_view = BufView(buf.as_mut_ptr());
 
+    let rng = &mut rng();
+    let mut delta_corr_x = (rng.random::<f64>().abs() % 1.0) * x_range;
+    let mut delta_corr_y = (rng.random::<f64>().abs() % 1.0) * y_range;
+    println!(
+        "ref: ({}, {})",
+        x_min.to_f64() + delta_corr_x,
+        y_min.to_f64() + delta_corr_y
+    );
+
     let mut ref_orbit = calculate_orbit(
-        Complex::new(BigFloat::from(x_min), BigFloat::from(y_min)),
+        Complex::new(
+            x_min + BigFloat::from(delta_corr_x),
+            y_min + BigFloat::from(delta_corr_y),
+        ),
         ITERATIONS,
     );
     let mut ref_orbit_f64 = Vec::from_iter(
@@ -275,9 +286,6 @@ fn render(
             .iter()
             .map(|x| Complex::new(x.re().into_f64(), x.im().into_f64())),
     );
-
-    let mut delta_corr_x = 0.0;
-    let mut delta_corr_y = 0.0;
 
     let pbar = &ProgressBar::new(h as u64);
     // (0..h).into_par_iter().for_each(move |r| {
@@ -298,7 +306,7 @@ fn render(
                 ) {
                     val
                 } else {
-                    println!("recalculating reference");
+                    // println!("recalculating reference");
                     ref_orbit = calculate_orbit(
                         Complex::new(
                             x_min + BigFloat::from(delta_x),
