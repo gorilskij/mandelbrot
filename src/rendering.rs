@@ -4,7 +4,7 @@ use euclid::{Length, Point2D, Scale};
 use hsl::HSL;
 use indicatif::ProgressBar;
 use itertools::iproduct;
-use num::{Complex, Float, ToPrimitive};
+use num::{Complex, Float};
 use num_bigfloat::BigFloat;
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
@@ -432,41 +432,40 @@ pub fn render(
 
                     let buf_view = buf_view;
 
-                    iproduct!(y_range, x_range).for_each(|(r, c)| {
-                        do_one_pixel(c, r, width, view, origin, iterations, buf_view, ref_orbit);
-                    });
-
-                    // TODO: reimplement
                     // do the outline first, if all cells are black (don't diverge), then
                     // assume the whole block is black
 
-                    // let x_inner_range = x_range.start + 1..x_range.end - 1;
-                    // let y_inner_range = y_range.start + 1..y_range.end - 1;
+                    let x_inner_range = x_range.start + 1..x_range.end - 1;
+                    let y_inner_range = y_range.start + 1..y_range.end - 1;
 
-                    // let outer_perimeter = x_range
-                    //     .clone()
-                    //     .map(|c| (c, y_range.start)) // top edge
-                    //     .chain(x_range.clone().map(|c| (c, y_range.end - 1))) // bottom edge
-                    //     .chain(y_inner_range.clone().map(|r| (x_range.start, r))) // left edge excluding top and bottom pixel
-                    //     .chain(y_inner_range.clone().map(|r| (x_range.end - 1, r))); // right edge excluding top and bottom pixel
+                    let outer_perimeter = x_range
+                        .clone()
+                        .map(|c| (c, y_range.start)) // top edge
+                        .chain(x_range.clone().map(|c| (c, y_range.end - 1))) // bottom edge
+                        .chain(y_inner_range.clone().map(|r| (x_range.start, r))) // left edge excluding top and bottom pixel
+                        .chain(y_inner_range.clone().map(|r| (x_range.end - 1, r))); // right edge excluding top and bottom pixel
 
-                    // let all_black = outer_perimeter.fold(true, |all_black, (c, r)| {
-                    //     let val = do_one_pixel(c, r, width, view, origin, iterations, buf_view);
-                    //     all_black && val.is_none()
-                    // });
+                    let all_black = outer_perimeter.fold(true, |all_black, (c, r)| {
+                        let val = do_one_pixel(
+                            c, r, width, view, origin, iterations, buf_view, ref_orbit,
+                        );
+                        all_black && val.is_none()
+                    });
 
-                    // if all_black {
-                    //     iproduct!(y_inner_range, x_inner_range).for_each(|(r, c)| {
-                    //         // SAFETY: all writes are disjoint
-                    //         unsafe {
-                    //             buf_view.0.add(r * width + c).write(0.into());
-                    //         }
-                    //     });
-                    // } else {
-                    //     iproduct!(y_inner_range, x_inner_range).for_each(|(r, c)| {
-                    //         do_one_pixel(c, r, width, view, origin, iterations, buf_view);
-                    //     });
-                    // }
+                    if all_black {
+                        iproduct!(y_inner_range, x_inner_range).for_each(|(r, c)| {
+                            // SAFETY: all writes are disjoint
+                            unsafe {
+                                buf_view.0.add(r * width + c).write(0.into());
+                            }
+                        });
+                    } else {
+                        iproduct!(y_inner_range, x_inner_range).for_each(|(r, c)| {
+                            do_one_pixel(
+                                c, r, width, view, origin, iterations, buf_view, ref_orbit,
+                            );
+                        });
+                    }
 
                     pbar.inc(1);
                 }
