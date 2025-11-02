@@ -343,8 +343,8 @@ fn render(
 }
 
 fn main() {
-    let w = 1000;
-    let h = 600;
+    let w = 1500;
+    let h = 1000;
 
     let mut buffer: Vec<u32> = vec![0; w * h];
 
