@@ -2,16 +2,15 @@
 
 mod complex;
 
-use complex::{Complex, Float};
+use complex::Complex;
 use hsl::HSL;
 use indicatif::ProgressBar;
 use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
 use num_bigfloat::BigFloat;
+use num_traits::Float;
 use parking_lot::RwLock;
 use rand::{Rng, rng};
 use rayon::prelude::*;
-
-use crate::complex::IntoF64;
 
 const ITERATIONS: usize = 1000;
 
@@ -32,8 +31,9 @@ fn is_bad_value(v: Complex<f64>) -> bool {
 }
 
 fn check_orbit<F: Float>(orbit: &[Complex<F>]) -> Option<usize> {
+    let four = F::from(4.0).unwrap();
     for (i, x) in orbit.iter().enumerate() {
-        if x.norm() > F::from_f64(4.0) {
+        if x.norm() > four {
             return Some(i);
         }
     }
@@ -295,7 +295,7 @@ fn render(
         let ref_orbit_f64 = Vec::from_iter(
             ref_orbit
                 .iter()
-                .map(|x| Complex::new(x.re().into_f64(), x.im().into_f64())),
+                .map(|x| Complex::new(x.re().to_f64(), x.im().to_f64())),
         );
 
         RwLock::new(RefOrbit {
@@ -342,7 +342,7 @@ fn render(
 
                     lock.ref_orbit_f64 = new_ref_orbit
                         .iter()
-                        .map(|x| Complex::new(x.re().into_f64(), x.im().into_f64()))
+                        .map(|x| Complex::new(x.re().to_f64(), x.im().to_f64()))
                         .collect();
                     lock.ref_orbit = new_ref_orbit;
 
@@ -353,18 +353,10 @@ fn render(
                 };
             } else {
                 val = check_orbit(&calculate_orbit(
-                    Complex::new(x_min.into_f64() + delta_x, y_min.into_f64() + delta_y),
+                    Complex::new(x_min.to_f64() + delta_x, y_min.to_f64() + delta_y),
                     ITERATIONS,
                 ))
             }
-
-            // let val = check_orbit(&calculate_orbit(
-            //     Complex::new(
-            //         x_min + BigFloat::from(delta_x),
-            //         y_min + BigFloat::from(delta_y),
-            //     ),
-            //     ITERATIONS,
-            // ));
 
             // SAFETY: all writes are disjoint
             unsafe {
