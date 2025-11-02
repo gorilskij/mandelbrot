@@ -216,6 +216,7 @@ fn chunks_2d(
     chunks
 }
 
+#[inline]
 fn do_one_pixel(
     c: usize,
     r: usize,
