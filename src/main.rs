@@ -4,7 +4,10 @@ mod drawing;
 mod rendering;
 mod support;
 
-use crate::{drawing::Drawer, support::Point};
+use crate::{
+    drawing::Drawer,
+    support::{Length, Point},
+};
 use dashu::float::FBig;
 use log::{info, trace};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
@@ -91,6 +94,9 @@ fn main() {
                     coords.origin =
                         &cursor_abs + &(&(&coords.origin - &cursor_abs) / &multiplier.to_fbig());
                     coords.view = View::new(coords.view.inner / multiplier);
+
+                    let width = Length::<_, Pixels>::new(width as f64) * coords.view;
+                    info!("zoom level: 10^{}", -width.inner.log10());
                 }
             }
         }
