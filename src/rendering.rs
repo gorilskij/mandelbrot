@@ -1,79 +1,191 @@
 use crate::drawing::maybe_pixel::MaybePixel;
-use crossbeam_channel;
-use euclid::{Length, Point2D, Scale};
+use crate::support::{Length, Point, Scale, ToFBig};
+use cpu_time::ProcessTime;
+use dashu::float::FBig;
 use hsl::HSL;
 use indicatif::ProgressBar;
-use itertools::iproduct;
-use num::Complex;
+use itertools::{Itertools, iproduct};
+use num::{Complex, Zero};
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
+use parking_lot::RwLock;
+use rand::{Rng, rng};
 use rayon::ThreadPool;
+use std::assert_matches::assert_matches;
 use std::cmp::min;
 use std::num::NonZeroUsize;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use waker_interrupter::MultiInterrupter;
 
+#[derive(Copy, Clone)]
 pub enum Units {}
+#[derive(Copy, Clone)]
 pub enum Pixels {}
+#[derive(Copy, Clone)]
 pub enum Relative {}
-pub type Point<U> = Point2D<f64, U>;
-pub type Origin = Point<Units>;
+pub type Origin = Point<FBig, Units>;
 pub type View = Scale<f64, Pixels, Units>;
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Clone)]
 pub struct CoordinatesBox {
     pub origin: Origin,
     pub view: View,
 }
 
-trait TypedXY<T, U> {
-    fn x(&self) -> Length<T, U>;
-    fn y(&self) -> Length<T, U>;
+// trait TypedXY<T, U> {
+//     fn x(&self) -> Length<T, U>;
+//     fn y(&self) -> Length<T, U>;
+// }
+
+// impl<T, U> TypedXY<T, U> for Point2D<T, U>
+// where
+//     T: Copy,
+// {
+//     fn x(&self) -> Length<T, U> {
+//         Length::new(self.x)
+//     }
+
+//     fn y(&self) -> Length<T, U> {
+//         Length::new(self.y)
+//     }
+// }
+
+fn is_bad_value(v: &Complex<FBig>) -> bool {
+    // implicitly also checks that neither is NaN
+    let k = 1000.0.to_fbig();
+    !(-&k <= v.re && v.re <= k && -&k <= v.im && v.im <= k)
 }
 
-impl<T, U> TypedXY<T, U> for Point2D<T, U>
-where
-    T: Copy,
-{
-    fn x(&self) -> Length<T, U> {
-        Length::new(self.x)
-    }
-
-    fn y(&self) -> Length<T, U> {
-        Length::new(self.y)
-    }
+struct Orbit<F> {
+    is_full: bool,
+    orbit: Box<[Complex<F>]>,
 }
 
-fn calculate(c: Complex<f64>, iterations: usize) -> Option<NonZeroUsize> {
-    let mut z: Complex<f64> = Complex::ZERO;
-    for i in 1..iterations + 1 {
-        z = z * z + c;
-        if z.norm() > 4.0 {
-            // SAFETY: i starts iterating at 1, it is never 0
-            unsafe { return Some(NonZeroUsize::new_unchecked(i)) };
+fn calculate_orbit(x_0: Complex<FBig>, iterations: usize) -> (Orbit<FBig>, Orbit<f64>) {
+    let mut out = Vec::with_capacity(iterations + 1);
+    let mut x_n = x_0.clone();
+    out.push(x_n.clone());
+    let mut is_full = true;
+    for _ in 0..iterations {
+        x_n = &x_n * &x_n + &x_0;
+        if is_bad_value(&x_n) {
+            is_full = false;
+            break;
+        }
+        out.push(x_n.clone());
+    }
+    let out = out.into_boxed_slice();
+    let out_f64 = out
+        .iter()
+        .map(|c| Complex {
+            re: c.re.to_f64().value(),
+            im: c.im.to_f64().value(),
+        })
+        .collect_vec()
+        .into_boxed_slice();
+    (
+        Orbit {
+            is_full,
+            orbit: out,
+        },
+        Orbit {
+            is_full,
+            orbit: out_f64,
+        },
+    )
+}
+
+fn check_orbit(orbit: &Orbit<f64>) -> Result<Option<NonZeroUsize>, ()> {
+    for (i, x) in orbit.orbit.iter().enumerate() {
+        if x.norm() > 4.0 {
+            // this is always Some(...), i + 1 can't be 0
+            return Ok(NonZeroUsize::new(i + 1));
         }
     }
-    None
+    if orbit.is_full { Ok(None) } else { Err(()) }
 }
+
+fn check_divergence_delta(
+    ref_orbit_f64: &Orbit<f64>,
+    delta: Complex<f64>,
+) -> Result<Option<NonZeroUsize>, ()> {
+    // ref_orbit is [x_0, x_1, ...]
+    // delta is delta_0
+    // delta_{n+1} = 2 x_n delta_n + delta_n^2 + delta_0
+
+    let delta_0 = delta;
+    let mut delta = delta;
+    for (i, &c) in ref_orbit_f64.orbit.iter().enumerate() {
+        let x = c + delta;
+        if x.norm() > 4.0 {
+            // this is always Some(...), i + 1 can't be 0
+            return Ok(NonZeroUsize::new(i + 1));
+        }
+
+        delta = c * 2.0 * delta + delta * delta + delta_0;
+    }
+
+    if ref_orbit_f64.is_full {
+        Ok(None)
+    } else {
+        Err(())
+    }
+}
+
+// fn __get_divergence_delta(ref_orbit_f64: &Orbit<f64>, delta: Complex<f64>) -> Vec<Complex<f64>> {
+//     // ref_orbit is [x_0, x_1, ...]
+//     // delta is delta_0
+//     // delta_{n+1} = 2 x_n delta_n + delta_n^2 + delta_0
+
+//     let delta_0 = delta;
+//     let mut delta = delta;
+//     let mut out = vec![];
+//     for (i, &c) in ref_orbit_f64.orbit.iter().enumerate() {
+//         let x = c + delta;
+//         out.push(x);
+//         if x.norm() > 4.0 {
+//             // this is always Some(...), i + 1 can't be 0
+//             return out;
+//         }
+
+//         delta = c * 2.0 * delta + delta * delta + delta_0;
+//     }
+
+//     out
+// }
 
 fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-fn render_pixel(val: Option<NonZeroUsize>) -> u32 {
+fn val_to_color(val: Option<NonZeroUsize>) -> u32 {
     if let Some(val) = val {
         // [0, 1)
         // let f = 1.0 - 1.0 / (val.get() as f64 / 100.0 + 1.0);
 
+        // let hsl = HSL {
+        //     // h: val.get() as f64 % 360.0,
+        //     // s: 0.7,
+        //     // // l: 0.5,
+        //     // l: (val.get() as f64 / 10.0).sin() * 0.1 + 0.5,
+        //     h: (val.get() as f64 / 10.0).sin() * 180.0,
+        //     s: 0.7,
+        //     // l: 0.5,
+        //     l: ((val.get() as f64 / (10.0 * std::f64::consts::E)).sin() * 0.3 + 0.4),
+        // };
+
+        // really good color scheme
+        // let hsl = HSL {
+        //     h: (val.get() as f64 / 400.0).sin() * 180.0,
+        //     s: 0.7,
+        //     l: ((val.get() as f64 / 40.0).sin() * 0.3 + 0.4),
+        // };
+
         let hsl = HSL {
-            // h: val.get() as f64 % 360.0,
-            // s: 0.7,
-            // // l: 0.5,
-            // l: (val.get() as f64 / 10.0).sin() * 0.1 + 0.5,
-            h: (val.get() as f64 / 10.0).sin() * 180.0,
+            h: (val.get() as f64 / 1200.0).sin() * 180.0,
             s: 0.7,
-            // l: 0.5,
-            l: ((val.get() as f64 / (10.0 * std::f64::consts::E)).sin() * 0.3 + 0.4),
+            l: ((val.get() as f64 / 40.0).sin() * 0.3 + 0.4),
         };
 
         let (r, g, b) = hsl.to_rgb();
@@ -111,8 +223,8 @@ pub fn sample_zoomed(
     width: usize,
     height: usize,
     //
-    src_coords: CoordinatesBox,
-    dest_coords: CoordinatesBox,
+    src_coords: &CoordinatesBox,
+    dest_coords: &CoordinatesBox,
 ) {
     let fwidth = width as f64;
     let fheight = height as f64;
@@ -128,23 +240,24 @@ pub fn sample_zoomed(
 
     // src_origin and dest_origin are both absolute
     // calculate dest_origin in the [0, 1] reference frame given by src
+    // let src_view_bf = Scale::<_, Pixels, Units>::new(BigFloat::from(src_view.0));
+    // TODO: check numerical properties at high zoom
     let dest_origin_rel_src = {
-        let p = ((dest_origin - src_origin) / src_view).to_point();
-        Point::<Relative>::new(p.x / fwidth, p.y / fheight)
+        let p = &(dest_origin - src_origin).cast(|f| f.to_f64().value()) / src_view;
+        Point::<_, Relative>::new(p.x / fwidth, p.y / fheight)
     };
 
     for dest_row in 0..height {
         for dest_col in 0..width {
             // [0, 1] coordinates relative to the reference frame given by dest
             let point_rel_dest =
-                Point::<Relative>::new(dest_col as f64 / fwidth, dest_row as f64 / fheight);
+                Point::<_, Relative>::new(dest_col as f64 / fwidth, dest_row as f64 / fheight);
 
             // calculate [0, 1] coordinates in the reference frame given by src
-            let point_rel_src = (dest_origin_rel_src
-                + point_rel_dest.to_vector() * (dest_view.0 / src_view.0))
+            let point_rel_src = (dest_origin_rel_src + point_rel_dest * (*dest_view / *src_view))
                 .clamp(
-                    Point::zero(),
-                    Point::new((fwidth - 1.0) / fwidth, (fheight - 1.0) / fheight),
+                    &Point::zero(),
+                    &Point::new((fwidth - 1.0) / fwidth, (fheight - 1.0) / fheight),
                 );
 
             let tl = (
@@ -193,7 +306,7 @@ unsafe impl Sync for BufView {}
 fn chunks_2d(
     width: usize,
     height: usize,
-    center: Point2D<usize, Pixels>,
+    center: Point<usize, Pixels>,
     side: usize,
 ) -> Vec<(Range<usize>, Range<usize>)> {
     let mut chunks: Vec<_> = (0..width)
@@ -209,58 +322,166 @@ fn chunks_2d(
         .collect();
 
     chunks.sort_unstable_by_key(|(range_x, range_y)| {
-        let x_diff = range_x.start.abs_diff(center.x as usize);
-        let y_diff = range_y.start.abs_diff(center.y as usize);
+        let x_diff = range_x.start.abs_diff(center.x);
+        let y_diff = range_y.start.abs_diff(center.y);
         ((x_diff * x_diff) as f64 + (y_diff * y_diff) as f64).sqrt() as usize
     });
     chunks
 }
 
+// calculate divergence time from the delta of a reference orbit, if the
+// reference orbit diverges too far before the orbit being calculated
+// (making it impossible to compute usable delta values), set the current
+// point as the new reference point and replace the reference orbit with
+// the current point's orbit (affects all future delta calculations)
 #[inline]
-fn do_one_pixel(
+fn render_pixel(
     c: usize,
     r: usize,
     width: usize,
     view: View,
-    origin: Origin,
+    origin: &Origin,
     iterations: usize,
     buf_view: BufView,
+    ref_orbit: &RwLock<RefOrbit>,
+    writer_active: &AtomicBool,
 ) -> Option<NonZeroUsize> {
     let c_typed = Length::<_, Pixels>::new(c as f64);
     let r_typed = Length::<_, Pixels>::new(r as f64);
 
-    let val = calculate(
-        Complex::new(
-            (c_typed * view + origin.x()).0,
-            (r_typed * view + origin.y()).0,
-        ),
-        iterations,
-    );
+    let delta = Complex {
+        re: (c_typed * view).inner,
+        im: (r_typed * view).inner,
+    };
+
+    let val = loop {
+        // this block is necessary to properly drop the read lock
+        // let __len;
+        {
+            let lock = ref_orbit.read();
+            // __len = lock.orbit.orbit.len();
+            if let Ok(val) = check_divergence_delta(&lock.orbit_f64, delta - lock.delta_corr) {
+                break val;
+            } else {
+                assert_matches!(
+                    check_divergence_delta(&lock.orbit_f64, delta - lock.delta_corr),
+                    Err(_)
+                );
+            }
+        }
+
+        if writer_active
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            // the next iteration will naturally block until the writer is done
+            continue;
+        }
+        let mut lock = ref_orbit.write();
+
+        // let len__ = lock.orbit.orbit.len();
+        // println!(
+        //     "{} =? {} {}",
+        //     __len,
+        //     len__,
+        //     if __len == len__ { "" } else { "ERROR" }
+        // );
+
+        let recalc_id = rng().random::<u8>();
+        println!("({recalc_id}) recalculating reference orbit");
+
+        let delta_bf = Complex {
+            re: delta.re.to_fbig(),
+            im: delta.im.to_fbig(),
+        };
+
+        let start = ProcessTime::now();
+        let (new_orbit, new_orbit_f64) = calculate_orbit(
+            Complex {
+                re: origin.x.clone(),
+                im: origin.y.clone(),
+            } + delta_bf,
+            iterations,
+        );
+        println!("({recalc_id}) done {:?}", start.elapsed());
+
+        // guaranteed to be Ok(_)
+        let val = check_orbit(&new_orbit_f64).unwrap();
+
+        println!("{} -> {}", lock.orbit.orbit.len(), new_orbit.orbit.len());
+        // if new_orbit_f64.orbit.len() < lock.orbit_f64.orbit.len() {
+        //     println!("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$");
+        // }
+        // assert_matches!(
+        //     check_divergence_delta(&lock.orbit_f64, delta - lock.delta_corr),
+        //     Err(_)
+        // );
+        // assert_matches!(check_divergence_delta(&new_orbit_f64, Complex::ZERO), Ok(_));
+        // if new_orbit_f64.orbit.len() < lock.orbit_f64.orbit.len() {
+        //     let delta_orb = __get_divergence_delta(&lock.orbit_f64, delta - lock.delta_corr);
+        //     for (a, b) in delta_orb.iter().zip(&new_orbit_f64.orbit) {
+        //         println!(">>   {a:>20?} {b:>20?})");
+        //     }
+        // }
+
+        lock.orbit = new_orbit;
+        lock.orbit_f64 = new_orbit_f64;
+
+        lock.delta_corr = delta;
+
+        drop(lock);
+        writer_active.store(false, Ordering::Release);
+
+        break val;
+    };
 
     // SAFETY: all writes are disjoint
     unsafe {
         buf_view
             .0
             .add(r * width + c)
-            .write(render_pixel(val).into());
+            .write(val_to_color(val).into());
     }
 
     val
+}
+
+struct RefOrbit {
+    delta_corr: Complex<f64>,
+    orbit: Orbit<FBig>,
+    orbit_f64: Orbit<f64>,
 }
 
 pub fn render(
     buf: &mut [MaybePixel],
     width: usize,
     height: usize,
-    center: Point2D<usize, Pixels>,
+    center: Point<usize, Pixels>,
     coords: CoordinatesBox,
     iterations: usize,
     int: MultiInterrupter,
     tp: &ThreadPool,
 ) {
-    let CoordinatesBox { origin, view } = coords;
+    let CoordinatesBox { ref origin, view } = coords;
 
     let buf_view = BufView(buf.as_mut_ptr());
+
+    let ref_orbit = &{
+        let (orbit, orbit_f64) = calculate_orbit(
+            Complex {
+                re: origin.x.clone(),
+                im: origin.y.clone(),
+            },
+            iterations,
+        );
+
+        RwLock::new(RefOrbit {
+            delta_corr: Complex::ZERO,
+            orbit,
+            orbit_f64,
+        })
+    };
+    let writer_active = &AtomicBool::new(false);
 
     let side = 20;
     let chunks = chunks_2d(width, height, center, side);
@@ -299,7 +520,17 @@ pub fn render(
                         .chain(y_inner_range.clone().map(|r| (x_range.end - 1, r))); // right edge excluding top and bottom pixel
 
                     let all_black = outer_perimeter.fold(true, |all_black, (c, r)| {
-                        let val = do_one_pixel(c, r, width, view, origin, iterations, buf_view);
+                        let val = render_pixel(
+                            c,
+                            r,
+                            width,
+                            view,
+                            origin,
+                            iterations,
+                            buf_view,
+                            ref_orbit,
+                            writer_active,
+                        );
                         all_black && val.is_none()
                     });
 
@@ -312,7 +543,17 @@ pub fn render(
                         });
                     } else {
                         iproduct!(y_inner_range, x_inner_range).for_each(|(r, c)| {
-                            do_one_pixel(c, r, width, view, origin, iterations, buf_view);
+                            render_pixel(
+                                c,
+                                r,
+                                width,
+                                view,
+                                origin,
+                                iterations,
+                                buf_view,
+                                ref_orbit,
+                                writer_active,
+                            );
                         });
                     }
 
