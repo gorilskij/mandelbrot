@@ -70,6 +70,16 @@ where
     }
 }
 
+impl<T: Zero, Unit> Zero for Point<T, Unit> {
+    fn zero() -> Self {
+        Self::new(T::zero(), T::zero())
+    }
+
+    fn is_zero(&self) -> bool {
+        self.x.is_zero() && self.y.is_zero()
+    }
+}
+
 impl<T, Unit> Add for Point<T, Unit>
 where
     T: Add,
@@ -85,16 +95,6 @@ where
     }
 }
 
-impl<T: Zero, Unit> Zero for Point<T, Unit> {
-    fn zero() -> Self {
-        Self::new(T::zero(), T::zero())
-    }
-
-    fn is_zero(&self) -> bool {
-        self.x.is_zero() && self.y.is_zero()
-    }
-}
-
 impl<'a, T: 'a, Unit> Add for &'a Point<T, Unit>
 where
     &'a T: Add,
@@ -105,6 +105,21 @@ where
         Point {
             x: &self.x + &rhs.x,
             y: &self.y + &rhs.y,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<T, Unit> Sub for Point<T, Unit>
+where
+    T: Sub,
+{
+    type Output = Point<<T as Sub>::Output, Unit>;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Point {
+            x: self.x - rhs.x,
+            y: self.y - rhs.y,
             _phantom: PhantomData,
         }
     }
@@ -167,6 +182,21 @@ where
     }
 }
 
+impl<T, FromUnit, ToUnit> Div<Scale<T, FromUnit, ToUnit>> for Point<T, ToUnit>
+where
+    T: Copy + Div,
+{
+    type Output = Point<<T as Div>::Output, FromUnit>;
+
+    fn div(self, rhs: Scale<T, FromUnit, ToUnit>) -> Self::Output {
+        Point {
+            x: self.x / rhs.inner,
+            y: self.y / rhs.inner,
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<'a, T: 'a, FromUnit, ToUnit> Div<&'a Scale<T, FromUnit, ToUnit>> for &'a Point<T, ToUnit>
 where
     &'a T: Div,
@@ -190,6 +220,17 @@ where
 
     fn mul(self, rhs: T) -> Self::Output {
         self * Length::new(rhs)
+    }
+}
+
+impl<T, Unit> Div<T> for Point<T, Unit>
+where
+    T: Copy + Div,
+{
+    type Output = Point<<T as Div>::Output, Unit>;
+
+    fn div(self, rhs: T) -> Self::Output {
+        self / Length::new(rhs)
     }
 }
 
