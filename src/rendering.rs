@@ -324,7 +324,7 @@ fn chunks_2d(
     chunks.sort_unstable_by_key(|(range_x, range_y)| {
         let x_diff = range_x.start.abs_diff(center.x);
         let y_diff = range_y.start.abs_diff(center.y);
-        ((x_diff * x_diff) as f64 + (y_diff * y_diff) as f64).sqrt() as usize
+        (x_diff as f64).hypot(y_diff as f64) as usize
     });
     chunks
 }
@@ -534,15 +534,22 @@ pub fn render(
                         all_black && val.is_none()
                     });
 
+                    let mut inner_pixels = iproduct!(x_inner_range, y_inner_range).collect_vec();
+                    inner_pixels.sort_unstable_by_key(|(c, r)| {
+                        let x_diff = c.abs_diff(center.x);
+                        let y_diff = r.abs_diff(center.y);
+                        (x_diff as f64).hypot(y_diff as f64) as usize
+                    });
+
                     if all_black {
-                        iproduct!(y_inner_range, x_inner_range).for_each(|(r, c)| {
+                        inner_pixels.into_iter().for_each(|(c, r)| {
                             // SAFETY: all writes are disjoint
                             unsafe {
                                 buf_view.0.add(r * width + c).write(0.into());
                             }
                         });
                     } else {
-                        iproduct!(y_inner_range, x_inner_range).for_each(|(r, c)| {
+                        inner_pixels.into_iter().for_each(|(c, r)| {
                             render_pixel(
                                 c,
                                 r,
