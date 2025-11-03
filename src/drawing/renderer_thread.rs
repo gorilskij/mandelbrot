@@ -1,8 +1,8 @@
 use crate::drawing::maybe_pixel::MaybePixel;
 use crate::drawing::renderer_thread::render_buffer::RenderBuffer;
 use crate::rendering::{CoordinatesBox, Pixels, render};
+use crate::support::Point;
 use delegate::delegate;
-use euclid::Point2D;
 use parking_lot::{Mutex, MutexGuard};
 use rayon::ThreadPoolBuilder;
 use std::sync::Arc;
@@ -75,18 +75,19 @@ pub mod render_buffer {
 
 pub struct Handle {
     handle: thread::JoinHandle<()>,
-    sender: wi::Sender<(CoordinatesBox, usize, Option<Point2D<usize, Pixels>>)>,
+    sender: wi::Sender<(CoordinatesBox, usize, Option<Point<usize, Pixels>>)>,
     buffer: RenderBuffer,
 }
 
 impl Handle {
     pub fn update(
         &self,
-        coords: CoordinatesBox,
+        coords: &CoordinatesBox,
         iterations: usize,
-        cursor_rel: Option<Point2D<usize, Pixels>>,
+        cursor_rel: Option<&Point<usize, Pixels>>,
     ) {
-        self.sender.send((coords, iterations, cursor_rel));
+        self.sender
+            .send((coords.clone(), iterations, cursor_rel.cloned()));
     }
 
     delegate! {
@@ -123,7 +124,7 @@ pub fn spawn(width: usize, height: usize) -> Handle {
                     pixel.set_none()
                 }
 
-                let center = cursor_rel.unwrap_or(Point2D::<_, Pixels>::new(width / 2, height / 2));
+                let center = cursor_rel.unwrap_or(Point::<_, Pixels>::new(width / 2, height / 2));
 
                 render(
                     &mut buf_lock,

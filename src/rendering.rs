@@ -1,11 +1,11 @@
 use crate::drawing::maybe_pixel::MaybePixel;
+use crate::support::{Length, Point, Scale, ToFBig};
 use cpu_time::ProcessTime;
-use euclid::{Length, Point2D, Scale};
+use dashu::float::FBig;
 use hsl::HSL;
 use indicatif::ProgressBar;
 use itertools::{Itertools, iproduct};
-use num::{Complex, Float};
-use num_bigfloat::BigFloat;
+use num::{Complex, Zero};
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
 use parking_lot::RwLock;
@@ -16,44 +16,45 @@ use std::cmp::min;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 use waker_interrupter::MultiInterrupter;
 
+#[derive(Copy, Clone)]
 pub enum Units {}
+#[derive(Copy, Clone)]
 pub enum Pixels {}
+#[derive(Copy, Clone)]
 pub enum Relative {}
-pub type Point<U> = Point2D<f64, U>;
-pub type Origin = Point2D<BigFloat, Units>;
+pub type Origin = Point<FBig, Units>;
 pub type View = Scale<f64, Pixels, Units>;
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Clone)]
 pub struct CoordinatesBox {
     pub origin: Origin,
     pub view: View,
 }
 
-trait TypedXY<T, U> {
-    fn x(&self) -> Length<T, U>;
-    fn y(&self) -> Length<T, U>;
-}
+// trait TypedXY<T, U> {
+//     fn x(&self) -> Length<T, U>;
+//     fn y(&self) -> Length<T, U>;
+// }
 
-impl<T, U> TypedXY<T, U> for Point2D<T, U>
-where
-    T: Copy,
-{
-    fn x(&self) -> Length<T, U> {
-        Length::new(self.x)
-    }
+// impl<T, U> TypedXY<T, U> for Point2D<T, U>
+// where
+//     T: Copy,
+// {
+//     fn x(&self) -> Length<T, U> {
+//         Length::new(self.x)
+//     }
 
-    fn y(&self) -> Length<T, U> {
-        Length::new(self.y)
-    }
-}
+//     fn y(&self) -> Length<T, U> {
+//         Length::new(self.y)
+//     }
+// }
 
-fn is_bad_value<F: Float>(v: Complex<F>) -> bool {
+fn is_bad_value(v: &Complex<FBig>) -> bool {
     // implicitly also checks that neither is NaN
-    let k = F::from(1000.0).unwrap();
-    !(v.re.abs() <= k && v.im.abs() <= k)
+    let k = 1000.0.to_fbig();
+    !(-&k <= v.re && v.re <= k && -&k <= v.im && v.im <= k)
 }
 
 struct Orbit<F> {
@@ -61,25 +62,25 @@ struct Orbit<F> {
     orbit: Box<[Complex<F>]>,
 }
 
-fn calculate_orbit<F: Float>(x_0: Complex<F>, iterations: usize) -> (Orbit<F>, Orbit<f64>) {
+fn calculate_orbit(x_0: Complex<FBig>, iterations: usize) -> (Orbit<FBig>, Orbit<f64>) {
     let mut out = Vec::with_capacity(iterations + 1);
-    let mut x_n = x_0;
-    out.push(x_n);
+    let mut x_n = x_0.clone();
+    out.push(x_n.clone());
     let mut is_full = true;
     for _ in 0..iterations {
-        x_n = x_n * x_n + x_0;
-        if is_bad_value(x_n) {
+        x_n = &x_n * &x_n + &x_0;
+        if is_bad_value(&x_n) {
             is_full = false;
             break;
         }
-        out.push(x_n);
+        out.push(x_n.clone());
     }
     let out = out.into_boxed_slice();
     let out_f64 = out
         .iter()
         .map(|c| Complex {
-            re: c.re.to_f64().unwrap(),
-            im: c.im.to_f64().unwrap(),
+            re: c.re.to_f64().value(),
+            im: c.im.to_f64().value(),
         })
         .collect_vec()
         .into_boxed_slice();
@@ -95,10 +96,9 @@ fn calculate_orbit<F: Float>(x_0: Complex<F>, iterations: usize) -> (Orbit<F>, O
     )
 }
 
-fn check_orbit<F: Float>(orbit: &Orbit<F>) -> Result<Option<NonZeroUsize>, ()> {
-    let four = F::from(4.0).unwrap();
+fn check_orbit(orbit: &Orbit<f64>) -> Result<Option<NonZeroUsize>, ()> {
     for (i, x) in orbit.orbit.iter().enumerate() {
-        if x.norm() > four {
+        if x.norm() > 4.0 {
             // this is always Some(...), i + 1 can't be 0
             return Ok(NonZeroUsize::new(i + 1));
         }
@@ -223,8 +223,8 @@ pub fn sample_zoomed(
     width: usize,
     height: usize,
     //
-    src_coords: CoordinatesBox,
-    dest_coords: CoordinatesBox,
+    src_coords: &CoordinatesBox,
+    dest_coords: &CoordinatesBox,
 ) {
     let fwidth = width as f64;
     let fheight = height as f64;
@@ -243,22 +243,21 @@ pub fn sample_zoomed(
     // let src_view_bf = Scale::<_, Pixels, Units>::new(BigFloat::from(src_view.0));
     // TODO: check numerical properties at high zoom
     let dest_origin_rel_src = {
-        let p = ((dest_origin - src_origin).to_f64() / src_view).to_point();
-        Point::<Relative>::new(p.x / fwidth, p.y / fheight)
+        let p = &(dest_origin - src_origin).cast(|f| f.to_f64().value()) / src_view;
+        Point::<_, Relative>::new(p.x / fwidth, p.y / fheight)
     };
 
     for dest_row in 0..height {
         for dest_col in 0..width {
             // [0, 1] coordinates relative to the reference frame given by dest
             let point_rel_dest =
-                Point::<Relative>::new(dest_col as f64 / fwidth, dest_row as f64 / fheight);
+                Point::<_, Relative>::new(dest_col as f64 / fwidth, dest_row as f64 / fheight);
 
             // calculate [0, 1] coordinates in the reference frame given by src
-            let point_rel_src = (dest_origin_rel_src
-                + point_rel_dest.to_vector() * (dest_view.0 / src_view.0))
+            let point_rel_src = (dest_origin_rel_src + point_rel_dest * (*dest_view / *src_view))
                 .clamp(
-                    Point::zero(),
-                    Point::new((fwidth - 1.0) / fwidth, (fheight - 1.0) / fheight),
+                    &Point::zero(),
+                    &Point::new((fwidth - 1.0) / fwidth, (fheight - 1.0) / fheight),
                 );
 
             let tl = (
@@ -307,7 +306,7 @@ unsafe impl Sync for BufView {}
 fn chunks_2d(
     width: usize,
     height: usize,
-    center: Point2D<usize, Pixels>,
+    center: Point<usize, Pixels>,
     side: usize,
 ) -> Vec<(Range<usize>, Range<usize>)> {
     let mut chunks: Vec<_> = (0..width)
@@ -341,7 +340,7 @@ fn render_pixel(
     r: usize,
     width: usize,
     view: View,
-    origin: Origin,
+    origin: &Origin,
     iterations: usize,
     buf_view: BufView,
     ref_orbit: &RwLock<RefOrbit>,
@@ -351,8 +350,8 @@ fn render_pixel(
     let r_typed = Length::<_, Pixels>::new(r as f64);
 
     let delta = Complex {
-        re: (c_typed * view).0,
-        im: (r_typed * view).0,
+        re: (c_typed * view).inner,
+        im: (r_typed * view).inner,
     };
 
     let val = loop {
@@ -371,8 +370,9 @@ fn render_pixel(
             }
         }
 
-        if let Err(_) =
-            writer_active.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        if writer_active
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
         {
             // the next iteration will naturally block until the writer is done
             continue;
@@ -391,22 +391,22 @@ fn render_pixel(
         println!("({recalc_id}) recalculating reference orbit");
 
         let delta_bf = Complex {
-            re: BigFloat::from(delta.re),
-            im: BigFloat::from(delta.im),
+            re: delta.re.to_fbig(),
+            im: delta.im.to_fbig(),
         };
 
         let start = ProcessTime::now();
         let (new_orbit, new_orbit_f64) = calculate_orbit(
             Complex {
-                re: origin.x,
-                im: origin.y,
+                re: origin.x.clone(),
+                im: origin.y.clone(),
             } + delta_bf,
             iterations,
         );
         println!("({recalc_id}) done {:?}", start.elapsed());
 
         // guaranteed to be Ok(_)
-        let val = check_orbit(&new_orbit).unwrap();
+        let val = check_orbit(&new_orbit_f64).unwrap();
 
         println!("{} -> {}", lock.orbit.orbit.len(), new_orbit.orbit.len());
         // if new_orbit_f64.orbit.len() < lock.orbit_f64.orbit.len() {
@@ -448,7 +448,7 @@ fn render_pixel(
 
 struct RefOrbit {
     delta_corr: Complex<f64>,
-    orbit: Orbit<BigFloat>,
+    orbit: Orbit<FBig>,
     orbit_f64: Orbit<f64>,
 }
 
@@ -456,21 +456,21 @@ pub fn render(
     buf: &mut [MaybePixel],
     width: usize,
     height: usize,
-    center: Point2D<usize, Pixels>,
+    center: Point<usize, Pixels>,
     coords: CoordinatesBox,
     iterations: usize,
     int: MultiInterrupter,
     tp: &ThreadPool,
 ) {
-    let CoordinatesBox { origin, view } = coords;
+    let CoordinatesBox { ref origin, view } = coords;
 
     let buf_view = BufView(buf.as_mut_ptr());
 
     let ref_orbit = &{
         let (orbit, orbit_f64) = calculate_orbit(
             Complex {
-                re: coords.origin.x,
-                im: coords.origin.y,
+                re: origin.x.clone(),
+                im: origin.y.clone(),
             },
             iterations,
         );

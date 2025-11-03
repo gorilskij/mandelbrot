@@ -2,13 +2,14 @@
 
 mod drawing;
 mod rendering;
+mod support;
 
-use crate::drawing::Drawer;
-use euclid::{Point2D, Scale};
+use crate::{drawing::Drawer, support::Point};
+use dashu::float::FBig;
 use log::{info, trace};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
-use num_bigfloat::BigFloat;
 use rendering::*;
+use support::ToFBig;
 
 fn main() {
     env_logger::init();
@@ -22,18 +23,22 @@ fn main() {
 
     window.set_target_fps(60);
 
+    let precision = 100;
     let mut coords = CoordinatesBox {
         // these (origin, view) are always in sync with (zoomed.origin, zoomed.view)
-        origin: Point2D::new(BigFloat::from(-2.5), BigFloat::from(-1.0)),
+        origin: Point::new(
+            -2.5.to_fbig_with_precision(precision),
+            -1.0.to_fbig_with_precision(precision),
+        ),
         // range (1) / pixel
         view: View::new(1.0 / 300.0),
     };
 
     let mut iterations = 2048;
 
-    let mut drawer = Drawer::new(width, height, coords, iterations);
+    let mut drawer = Drawer::new(width, height, coords.clone(), iterations);
 
-    let mut dragging = None::<Point2D<BigFloat, Pixels>>;
+    let mut dragging = None::<Point<FBig, Pixels>>;
 
     while window.is_open() {
         let mut zoomed = false;
@@ -42,10 +47,10 @@ fn main() {
         // mouse position in pixels with the top-left corner of the window as the origin
         let cursor_rel = window
             .get_mouse_pos(MouseMode::Discard)
-            .map(|(x, y)| Point2D::<_, Pixels>::new(BigFloat::from(x), BigFloat::from(y)));
+            .map(|(x, y)| Point::<_, Pixels>::new(x.to_fbig(), y.to_fbig()));
 
-        if let Some(cursor_rel) = cursor_rel {
-            let view_bf = Scale::<_, Pixels, Units>::new(BigFloat::from(coords.view.get()));
+        if let Some(cursor_rel) = &cursor_rel {
+            let view_fbig = coords.view.cast(move |f| f.to_fbig());
 
             if window.get_mouse_down(MouseButton::Left) {
                 if dragging.is_none() {
@@ -55,10 +60,14 @@ fn main() {
                 if let Some(last) = dragging {
                     dragged = true;
 
-                    let drag: Point2D<_, Pixels> = (cursor_rel - last).to_point();
-                    coords.origin -= (drag * view_bf).to_vector();
+                    let drag = cursor_rel - &last;
+                    coords.origin -= &(&drag * &view_fbig);
+                    // coords.origin = (
+                    // &coords.origin.0 - &drag_px.0 * &view_bf_px2un,
+                    // &coords.origin.1 - &drag_px.1 * &view_bf_px2un,
+                    // );
                 }
-                dragging = Some(cursor_rel);
+                dragging = Some(cursor_rel.clone());
             } else {
                 if dragging.is_some() {
                     trace!("stop dragging");
@@ -72,32 +81,39 @@ fn main() {
                 if let Some((_, scroll_y)) = window.get_scroll_wheel() {
                     zoomed = true;
 
-                    let cursor_abs = coords.origin + (cursor_rel * view_bf).to_vector();
+                    let cursor_abs = &coords.origin + &(cursor_rel * &view_fbig);
+                    trace!(
+                        "zoomed at {:?} (abs)",
+                        cursor_abs.cast(|f| f.to_f64().value())
+                    );
                     let multiplier = 1.0 + (scroll_y as f64 / 100.0).clamp(-0.2, 0.2);
 
                     coords.origin =
-                        cursor_abs + (coords.origin - cursor_abs) / BigFloat::from(multiplier);
-                    coords.view = View::new(coords.view.0 / multiplier);
+                        &cursor_abs + &(&(&coords.origin - &cursor_abs) / &multiplier.to_fbig());
+                    coords.view = View::new(coords.view.inner / multiplier);
                 }
             }
         }
 
         // cast to usize
-        let cursor_rel = cursor_rel
-            .map(|p| Point2D::<_, Pixels>::new(p.x.to_f64() as usize, p.y.to_f64() as usize));
+        let cursor_rel = cursor_rel.map(|p| p.cast(|f| f.to_f64().value() as usize));
+        // let cursor_rel_px = cursor_rel_px.map(|p| {
+        // Point::<_, Pixels>::new(p.0.to_f64().value() as usize, p.1.to_f64().value() as usize)
+        // });
 
-        if dragged || zoomed {
-            trace!("send update to drawer");
-            drawer.update(coords, iterations, cursor_rel);
-            trace!("done sending update to drawer");
-        } else if window.is_key_pressed(Key::Up, KeyRepeat::No) {
-            iterations *= 2;
-            info!("iterations: {iterations}");
-            drawer.update(coords, iterations, cursor_rel);
-        } else if window.is_key_pressed(Key::Down, KeyRepeat::No) && iterations > 1 {
-            iterations /= 2;
-            info!("iterations: {iterations}");
-            drawer.update(coords, iterations, cursor_rel);
+        'drawer_update: {
+            if dragged || zoomed {
+                trace!("send update to drawer");
+            } else if window.is_key_pressed(Key::Up, KeyRepeat::No) {
+                iterations *= 2;
+                info!("iterations: {iterations}");
+            } else if window.is_key_pressed(Key::Down, KeyRepeat::No) && iterations > 1 {
+                iterations /= 2;
+                info!("iterations: {iterations}");
+            } else {
+                break 'drawer_update;
+            }
+            drawer.update(coords.clone(), iterations, cursor_rel.as_ref());
         }
 
         drawer.update_display_buf();
