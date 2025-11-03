@@ -334,7 +334,6 @@ fn chunks_2d(
 // (making it impossible to compute usable delta values), set the current
 // point as the new reference point and replace the reference orbit with
 // the current point's orbit (affects all future delta calculations)
-#[inline]
 fn render_pixel(
     c: usize,
     r: usize,
@@ -512,15 +511,17 @@ pub fn render(
                     let x_inner_range = x_range.start + 1..x_range.end - 1;
                     let y_inner_range = y_range.start + 1..y_range.end - 1;
 
-                    let outer_perimeter = x_range
+                    let mut outer_perimeter = x_range
                         .clone()
                         .map(|c| (c, y_range.start)) // top edge
                         .chain(x_range.clone().map(|c| (c, y_range.end - 1))) // bottom edge
                         .chain(y_inner_range.clone().map(|r| (x_range.start, r))) // left edge excluding top and bottom pixel
                         .chain(y_inner_range.clone().map(|r| (x_range.end - 1, r))); // right edge excluding top and bottom pixel
 
-                    let all_black = outer_perimeter.fold(true, |all_black, (c, r)| {
-                        let val = render_pixel(
+                    // check if first pixel is black
+                    let first_pixel = {
+                        let (c, r) = outer_perimeter.next().unwrap();
+                        render_pixel(
                             c,
                             r,
                             width,
@@ -530,26 +531,71 @@ pub fn render(
                             buf_view,
                             ref_orbit,
                             writer_active,
-                        );
-                        all_black && val.is_none()
-                    });
+                        )
+                    };
 
-                    let mut inner_pixels = iproduct!(x_inner_range, y_inner_range).collect_vec();
-                    inner_pixels.sort_unstable_by_key(|(c, r)| {
-                        let x_diff = c.abs_diff(center.x);
-                        let y_diff = r.abs_diff(center.y);
-                        (x_diff as f64).hypot(y_diff as f64) as usize
-                    });
-
-                    if all_black {
-                        inner_pixels.into_iter().for_each(|(c, r)| {
-                            // SAFETY: all writes are disjoint
-                            unsafe {
-                                buf_view.0.add(r * width + c).write(0.into());
-                            }
+                    if first_pixel.is_none() {
+                        // check the rest of the perimeter
+                        let all_black = outer_perimeter.fold(true, |all_black, (c, r)| {
+                            let val = render_pixel(
+                                c,
+                                r,
+                                width,
+                                view,
+                                origin,
+                                iterations,
+                                buf_view,
+                                ref_orbit,
+                                writer_active,
+                            );
+                            all_black && val.is_none()
                         });
+
+                        let mut inner_pixels =
+                            iproduct!(x_inner_range, y_inner_range).collect_vec();
+                        inner_pixels.sort_unstable_by_key(|(c, r)| {
+                            let x_diff = c.abs_diff(center.x);
+                            let y_diff = r.abs_diff(center.y);
+                            (x_diff as f64).hypot(y_diff as f64) as usize
+                        });
+
+                        if all_black {
+                            inner_pixels.into_iter().for_each(|(c, r)| {
+                                // SAFETY: all writes are disjoint
+                                unsafe {
+                                    buf_view.0.add(r * width + c).write(0.into());
+                                    // debug
+                                    // buf_view
+                                    //     .0
+                                    //     .add(r * width + c)
+                                    //     .write(rgb_to_u32(255, 255, 255).into());
+                                }
+                            });
+                        } else {
+                            inner_pixels.into_iter().for_each(|(c, r)| {
+                                render_pixel(
+                                    c,
+                                    r,
+                                    width,
+                                    view,
+                                    origin,
+                                    iterations,
+                                    buf_view,
+                                    ref_orbit,
+                                    writer_active,
+                                );
+                            });
+                        }
                     } else {
-                        inner_pixels.into_iter().for_each(|(c, r)| {
+                        // fill in the rest of the square (skip the first pixel)
+                        let mut block = iproduct!(x_range, y_range).skip(1).collect_vec();
+                        block.sort_unstable_by_key(|(c, r)| {
+                            let x_diff = c.abs_diff(center.x);
+                            let y_diff = r.abs_diff(center.y);
+                            (x_diff as f64).hypot(y_diff as f64) as usize
+                        });
+
+                        block.into_iter().for_each(|(c, r)| {
                             render_pixel(
                                 c,
                                 r,
