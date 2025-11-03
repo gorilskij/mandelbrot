@@ -5,6 +5,7 @@ use dashu::float::FBig;
 use hsl::HSL;
 use indicatif::ProgressBar;
 use itertools::{Itertools, iproduct};
+use log::info;
 use num::{Complex, Zero};
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
@@ -98,7 +99,7 @@ fn calculate_orbit(x_0: Complex<FBig>, iterations: usize) -> (Orbit<FBig>, Orbit
 
 fn check_orbit(orbit: &Orbit<f64>) -> Result<Option<NonZeroUsize>, ()> {
     for (i, x) in orbit.orbit.iter().enumerate() {
-        if x.norm() > 4.0 {
+        if x.norm() > 2.0 {
             // this is always Some(...), i + 1 can't be 0
             return Ok(NonZeroUsize::new(i + 1));
         }
@@ -118,7 +119,7 @@ fn check_divergence_delta(
     let mut delta = delta;
     for (i, &c) in ref_orbit_f64.orbit.iter().enumerate() {
         let x = c + delta;
-        if x.norm() > 4.0 {
+        if x.norm() > 2.0 {
             // this is always Some(...), i + 1 can't be 0
             return Ok(NonZeroUsize::new(i + 1));
         }
@@ -187,6 +188,14 @@ fn val_to_color(val: Option<NonZeroUsize>) -> u32 {
             s: 0.7,
             l: ((val.get() as f64 / 40.0).sin() * 0.3 + 0.4),
         };
+
+        // let hsl = HSL {
+        //     h: (val.get() as f64 / 1200.0).ln() % 1.0 * 360.0,
+        //     s: 0.5,
+        //     l: 0.5,
+        //     // l: ((val.get() as f64 / 40.0).sin() * 0.3 + 0.4),
+        //     // l: ((val.get() as f64 / 1.0).ln().sin() > 0.0) as u8 as f64,
+        // };
 
         let (r, g, b) = hsl.to_rgb();
         rgb_to_u32(r, g, b)
@@ -387,14 +396,13 @@ fn render_pixel(
         // );
 
         let recalc_id = rng().random::<u8>();
-        println!("({recalc_id}) recalculating reference orbit");
+        info!("({recalc_id}) recalculating reference orbit");
 
         let delta_bf = Complex {
             re: delta.re.to_fbig(),
             im: delta.im.to_fbig(),
         };
 
-        let start = ProcessTime::now();
         let (new_orbit, new_orbit_f64) = calculate_orbit(
             Complex {
                 re: origin.x.clone(),
@@ -402,7 +410,6 @@ fn render_pixel(
             } + delta_bf,
             iterations,
         );
-        println!("({recalc_id}) done {:?}", start.elapsed());
 
         // guaranteed to be Ok(_)
         let val = check_orbit(&new_orbit_f64).unwrap();

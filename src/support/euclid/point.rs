@@ -223,6 +223,17 @@ where
     }
 }
 
+impl<'a, T: 'a, Unit> Mul<&'a T> for &'a Point<T, Unit>
+where
+    &'a T: Mul,
+{
+    type Output = Point<<&'a T as Mul>::Output, Unit>;
+
+    fn mul(self, rhs: &'a T) -> Self::Output {
+        self * Length::new_ref(rhs)
+    }
+}
+
 impl<T, Unit> Div<T> for Point<T, Unit>
 where
     T: Copy + Div,

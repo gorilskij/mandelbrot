@@ -48,6 +48,26 @@ impl ToFBig for f64 {
     }
 }
 
+impl ToFBig for usize {
+    fn to_fbig(self) -> FBig {
+        self.to_string()
+            .parse::<DBig>()
+            .unwrap()
+            .to_binary()
+            .value()
+    }
+
+    fn to_fbig_with_precision(self, bits: usize) -> FBig {
+        self.to_string()
+            .parse::<DBig>()
+            .unwrap()
+            .to_binary()
+            .value()
+            .with_precision(bits)
+            .value()
+    }
+}
+
 pub fn read_line_stdin() -> Result<Option<String>, ()> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).map_err(|_| ())?;
