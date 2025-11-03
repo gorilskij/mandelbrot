@@ -1,8 +1,10 @@
 pub mod maybe_pixel;
 mod renderer_thread;
 
-use crate::rendering::{CoordinatesBox, Pixels, sample_zoomed};
-use euclid::Point2D;
+use crate::{
+    rendering::{CoordinatesBox, Pixels, sample_zoomed},
+    support::Point,
+};
 use log::trace;
 use std::thread;
 
@@ -47,8 +49,8 @@ impl Drawer {
             height,
             //
             cache_fresh: true,
-            cache_coords: coords,
-            zoomed_coords: coords,
+            cache_coords: coords.clone(),
+            zoomed_coords: coords.clone(),
             //
             cache_buf: vec![0; width * height].into_boxed_slice(),
             zoomed_buf: vec![0; width * height].into_boxed_slice(),
@@ -71,14 +73,14 @@ impl Drawer {
         &mut self,
         new_zoomed_coords: CoordinatesBox,
         iterations: usize,
-        cursor_rel: Option<Point2D<usize, Pixels>>,
+        cursor_rel: Option<&Point<usize, Pixels>>,
     ) {
         // invalidate cache
         self.cache_fresh = false;
 
         // relaunch renderer thread
         self.renderer
-            .update(new_zoomed_coords, iterations, cursor_rel);
+            .update(&new_zoomed_coords, iterations, cursor_rel);
 
         trace!("drawer: sent update to renderer");
 
@@ -90,8 +92,8 @@ impl Drawer {
             self.width,
             self.height,
             //
-            self.cache_coords,
-            new_zoomed_coords,
+            &self.cache_coords,
+            &new_zoomed_coords,
         );
         self.zoomed_coords = new_zoomed_coords;
 
@@ -136,7 +138,7 @@ impl Drawer {
 
         if let Some(lock) = self.renderer.lock_if_done() {
             self.cache_buf.copy_from_slice(&lock);
-            self.cache_coords = self.zoomed_coords;
+            self.cache_coords = self.zoomed_coords.clone();
             self.display_buf.copy_from_slice(&lock);
             self.cache_fresh = true;
             return true;
@@ -155,7 +157,7 @@ impl Drawer {
 
         let lock = self.renderer.lock_when_done();
         self.cache_buf.copy_from_slice(&lock);
-        self.cache_coords = self.zoomed_coords;
+        self.cache_coords = self.zoomed_coords.clone();
         self.display_buf.copy_from_slice(&lock);
         self.cache_fresh = true;
     }
