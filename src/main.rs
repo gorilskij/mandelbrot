@@ -1,3 +1,5 @@
+#![feature(assert_matches)]
+
 mod drawing;
 mod rendering;
 
@@ -11,10 +13,10 @@ use rendering::*;
 fn main() {
     env_logger::init();
 
-    // let width = 1000;
-    // let height = 600;
-    let width = 1500;
-    let height = 1000;
+    let width = 1000;
+    let height = 600;
+    // let width = 1500;
+    // let height = 1000;
 
     let mut window = Window::new("Mandelbrot", width, height, WindowOptions::default()).unwrap();
 
