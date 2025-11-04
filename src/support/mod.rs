@@ -2,6 +2,7 @@ mod euclid;
 
 use dashu::float::{DBig, FBig};
 pub use euclid::*;
+use num::Num;
 
 pub trait ToFBig {
     fn to_fbig(self) -> FBig;

@@ -1,12 +1,12 @@
 use crate::drawing::maybe_pixel::MaybePixel;
 use crate::support::{Length, Point, Scale, ToFBig};
-use cpu_time::ProcessTime;
 use dashu::float::FBig;
 use hsl::HSL;
 use indicatif::ProgressBar;
 use itertools::{Itertools, iproduct};
 use log::info;
 use num::{Complex, Zero};
+use ordered_float::OrderedFloat;
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
 use parking_lot::RwLock;
@@ -54,7 +54,7 @@ pub struct CoordinatesBox {
 
 fn is_bad_value(v: &Complex<FBig>) -> bool {
     // implicitly also checks that neither is NaN
-    let k = 1000.0.to_fbig();
+    let k = 100_000.0.to_fbig();
     !(-&k <= v.re && v.re <= k && -&k <= v.im && v.im <= k)
 }
 
@@ -99,7 +99,7 @@ fn calculate_orbit(x_0: Complex<FBig>, iterations: usize) -> (Orbit<FBig>, Orbit
 
 fn check_orbit(orbit: &Orbit<f64>) -> Result<Option<NonZeroUsize>, ()> {
     for (i, x) in orbit.orbit.iter().enumerate() {
-        if x.norm() > 2.0 {
+        if x.re * x.re + x.im * x.im > 4.0 {
             // this is always Some(...), i + 1 can't be 0
             return Ok(NonZeroUsize::new(i + 1));
         }
@@ -119,7 +119,7 @@ fn check_divergence_delta(
     let mut delta = delta;
     for (i, &c) in ref_orbit_f64.orbit.iter().enumerate() {
         let x = c + delta;
-        if x.norm() > 2.0 {
+        if x.re * x.re + x.im * x.im > 4.0 {
             // this is always Some(...), i + 1 can't be 0
             return Ok(NonZeroUsize::new(i + 1));
         }
@@ -162,6 +162,7 @@ fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
 
 fn val_to_color(val: Option<NonZeroUsize>) -> u32 {
     if let Some(val) = val {
+        // return rgb_to_u32(255, 255, 255);
         // [0, 1)
         // let f = 1.0 - 1.0 / (val.get() as f64 / 100.0 + 1.0);
 
@@ -331,9 +332,9 @@ fn chunks_2d(
         .collect();
 
     chunks.sort_unstable_by_key(|(range_x, range_y)| {
-        let x_diff = range_x.start.abs_diff(center.x);
-        let y_diff = range_y.start.abs_diff(center.y);
-        (x_diff as f64).hypot(y_diff as f64) as usize
+        let x_diff = range_x.start.abs_diff(center.x) as f64;
+        let y_diff = range_y.start.abs_diff(center.y) as f64;
+        OrderedFloat(x_diff * x_diff + y_diff * y_diff)
     });
     chunks
 }
@@ -561,9 +562,9 @@ pub fn render(
                         let mut inner_pixels =
                             iproduct!(x_inner_range, y_inner_range).collect_vec();
                         inner_pixels.sort_unstable_by_key(|(c, r)| {
-                            let x_diff = c.abs_diff(center.x);
-                            let y_diff = r.abs_diff(center.y);
-                            (x_diff as f64).hypot(y_diff as f64) as usize
+                            let x_diff = c.abs_diff(center.x) as f64;
+                            let y_diff = r.abs_diff(center.y) as f64;
+                            OrderedFloat(x_diff * x_diff + y_diff * y_diff)
                         });
 
                         if all_black {
@@ -597,9 +598,9 @@ pub fn render(
                         // fill in the rest of the square (skip the first pixel)
                         let mut block = iproduct!(x_range, y_range).skip(1).collect_vec();
                         block.sort_unstable_by_key(|(c, r)| {
-                            let x_diff = c.abs_diff(center.x);
-                            let y_diff = r.abs_diff(center.y);
-                            (x_diff as f64).hypot(y_diff as f64) as usize
+                            let x_diff = c.abs_diff(center.x) as f64;
+                            let y_diff = r.abs_diff(center.y) as f64;
+                            OrderedFloat(x_diff * x_diff + y_diff * y_diff)
                         });
 
                         block.into_iter().for_each(|(c, r)| {
