@@ -408,13 +408,11 @@ fn render_pixel(
             // guaranteed to be Ok(_)
             let val = check_orbit(&new_orbit_f64).unwrap();
 
-            let new_len = ref_orbits.push(RefOrbit {
+            ref_orbits.push_front(RefOrbit {
                 delta_corr: delta,
                 orbit: new_orbit,
                 orbit_f64: new_orbit_f64,
             });
-
-            println!("new len: {new_len}");
 
             val
         });
@@ -470,11 +468,13 @@ pub fn render(
             iterations,
         );
 
-        AOList::new(RefOrbit {
+        let list = AOList::new();
+        list.push_front(RefOrbit {
             delta_corr: Complex::ZERO,
             orbit,
             orbit_f64,
-        })
+        });
+        list
     };
     let writer_active = &AtomicBool::new(false);
 

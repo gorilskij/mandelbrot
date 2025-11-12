@@ -3,33 +3,55 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::{mem, ptr};
 
+type Link<T> = AtomicPtr<Block<T>>;
+
 struct Block<T> {
     data: T,
-    next: AtomicPtr<Block<T>>,
+    next: Link<T>,
 }
 
 impl<T> Block<T> {
     fn new(data: T) -> Self {
         Self {
             data,
-            next: AtomicPtr::new(ptr::null_mut()),
+            next: Default::default(),
         }
     }
 }
 
-struct Head<T>(Block<T>);
+struct Head<T>(Link<T>);
 
 impl<T> Head<T> {
-    fn new(data: T) -> Self {
-        Self(Block::new(data))
+    fn new() -> Self {
+        Self(Default::default())
+    }
+
+    fn push_front(&self, data: T) {
+        let mut current_first_block = self.0.load(Ordering::Acquire);
+        let new_block_ptr = Box::leak(Box::new(Block {
+            data,
+            next: AtomicPtr::new(current_first_block),
+        }));
+
+        while let Err(actual_first_block) = self.0.compare_exchange(
+            current_first_block,
+            new_block_ptr,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            current_first_block = actual_first_block;
+            new_block_ptr
+                .next
+                .store(actual_first_block, Ordering::Release);
+        }
     }
 
     // returns new length
-    fn push(&self, data: T) -> usize {
+    fn push_back(&self, data: T) -> usize {
         let new_block_ptr = Box::leak(Box::new(Block::new(data)));
 
-        let mut len = 1;
-        let mut next_ptr = &self.0.next;
+        let mut len = 0;
+        let mut next_ptr = &self.0;
         while let Err(next) = next_ptr.compare_exchange(
             ptr::null_mut(),
             new_block_ptr,
@@ -56,9 +78,7 @@ impl<T> Drop for Head<T> {
         // ensuring all their writes are visible, otherwise this
         // code would need to use Acquire
 
-        // the first block is owned directly and is
-        // automatically dropped at the end of this scope
-        let mut next = self.0.next.load(Ordering::Relaxed);
+        let mut next = self.0.load(Ordering::Relaxed);
         while !next.is_null() {
             // SAFETY: next is not null, this code can only be run from a single thread
             let block = unsafe { Box::from_raw(next) };
@@ -104,18 +124,22 @@ impl<T> Clone for List<T> {
 }
 
 impl<T> List<T> {
-    pub fn new(data: T) -> Self {
-        Self(Arc::new(Head::new(data)))
+    pub fn new() -> Self {
+        Self(Arc::new(Head::new()))
+    }
+
+    pub fn push_front(&self, data: T) {
+        self.0.push_front(data)
     }
 
     // returns new length
-    pub fn push(&self, data: T) -> usize {
-        self.0.push(data)
+    pub fn push_back(&self, data: T) -> usize {
+        self.0.push_back(data)
     }
 
     pub fn iter(&self) -> Iter<'_, T> {
         Iter {
-            block: &raw const self.0.as_ref().0,
+            block: self.0.0.load(Ordering::Acquire),
             _phantom: PhantomData,
         }
     }
