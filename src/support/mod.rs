@@ -1,4 +1,3 @@
-mod append_only_list;
 mod euclid;
 
 use dashu::float::{DBig, FBig};

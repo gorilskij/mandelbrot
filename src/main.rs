@@ -4,6 +4,8 @@ mod drawing;
 mod rendering;
 mod support;
 
+use std::{borrow::Cow, str::FromStr};
+
 use crate::{
     drawing::Drawer,
     support::{Length, Point},
@@ -14,6 +16,32 @@ use log::{info, trace, warn};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use rendering::*;
 use support::ToFBig;
+
+struct ClipBoardData<'a> {
+    coords: Cow<'a, CoordinatesBox>,
+    iterations: usize,
+}
+
+impl ToString for ClipBoardData<'_> {
+    fn to_string(&self) -> String {
+        format!("{}/{}", self.coords.to_string(), self.iterations)
+    }
+}
+
+impl FromStr for ClipBoardData<'_> {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (coords, iterations) = s
+            .split_at_checked(s.chars().position(|c| c == '/').ok_or(())?)
+            .ok_or(())?;
+        let iterations = &iterations[1..]; // remove /
+        Ok(Self {
+            coords: Cow::Owned(coords.parse()?),
+            iterations: iterations.parse().map_err(drop)?,
+        })
+    }
+}
 
 fn main() {
     env_logger::init();
@@ -119,15 +147,20 @@ fn main() {
                 && window.is_key_pressed(Key::C, KeyRepeat::No)
             {
                 let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
-                ctx.set_contents(coords.to_string()).unwrap();
+                let data = ClipBoardData {
+                    coords: Cow::Borrowed(&coords),
+                    iterations,
+                };
+                ctx.set_contents(data.to_string()).unwrap();
                 info!("copied coords to clipboard");
                 false
             } else if (window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl))
                 && window.is_key_pressed(Key::V, KeyRepeat::No)
             {
                 let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
-                if let Ok(new_coords) = ctx.get_contents().unwrap().parse() {
-                    coords = new_coords;
+                if let Ok(new_data) = ctx.get_contents().unwrap().parse::<ClipBoardData>() {
+                    coords = new_data.coords.into_owned();
+                    iterations = new_data.iterations;
                     info!("pasted coords from clipboard");
                     true
                 } else {
