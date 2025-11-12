@@ -79,9 +79,10 @@ fn main() {
         // mouse position in pixels with the top-left corner of the window as the origin
         let cursor_rel = window
             .get_mouse_pos(MouseMode::Discard)
-            .map(|(x, y)| Point::<_, Pixels>::new(x.to_fbig(), y.to_fbig()));
+            .map(|(x, y)| Point::<_, Pixels>::new(x, y));
+        let cursor_rel_fbig = cursor_rel.map(|p| p.cast(|f| f.to_fbig()));
 
-        if let Some(cursor_rel) = &cursor_rel {
+        if let Some(cursor_rel) = &cursor_rel_fbig {
             let view_fbig = coords.view.cast(move |f| f.to_fbig());
 
             if window.get_mouse_down(MouseButton::Left) {
@@ -131,18 +132,24 @@ fn main() {
             }
         }
 
-        if {
+        enum UpdateDrawer {
+            AroundCursor,
+            AroundCenter,
+            No,
+        }
+
+        let update_drawer = {
             if dragged || zoomed {
                 trace!("send update to drawer");
-                true
+                UpdateDrawer::AroundCursor
             } else if window.is_key_pressed(Key::Up, KeyRepeat::No) {
                 iterations *= 2;
                 info!("iterations: {iterations}");
-                true
+                UpdateDrawer::AroundCursor
             } else if window.is_key_pressed(Key::Down, KeyRepeat::No) && iterations > 1 {
                 iterations /= 2;
                 info!("iterations: {iterations}");
-                true
+                UpdateDrawer::AroundCursor
             } else if (window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl))
                 && window.is_key_pressed(Key::C, KeyRepeat::No)
             {
@@ -153,7 +160,7 @@ fn main() {
                 };
                 ctx.set_contents(data.to_string()).unwrap();
                 info!("copied coords to clipboard");
-                false
+                UpdateDrawer::No
             } else if (window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl))
                 && window.is_key_pressed(Key::V, KeyRepeat::No)
             {
@@ -162,13 +169,13 @@ fn main() {
                     coords = new_data.coords.into_owned();
                     iterations = new_data.iterations;
                     info!("pasted coords from clipboard");
-                    true
+                    UpdateDrawer::AroundCenter
                 } else {
                     warn!("tried to paste with invalid clipboard");
-                    false
+                    UpdateDrawer::No
                 }
             } else {
-                false
+                UpdateDrawer::No
             }
             // for debug
             // else if window.is_key_pressed(Key::Left, KeyRepeat::No) {
@@ -200,10 +207,19 @@ fn main() {
             //         coords.view = new_view;
             //     }
             // }
-        } {
-            let cursor_rel = cursor_rel.map(|p| p.cast(|f| f.to_f64().value() as usize));
-            drawer.update(coords.clone(), iterations, cursor_rel.as_ref());
-        }
+        };
+
+        match update_drawer {
+            UpdateDrawer::AroundCursor => {
+                let cursor_rel_usize = cursor_rel.map(|p| p.cast(|f| *f as usize));
+                drawer.update(coords.clone(), iterations, cursor_rel_usize.as_ref());
+            }
+            UpdateDrawer::AroundCenter => {
+                let center = Point::new(width / 2, height / 2);
+                drawer.update(coords.clone(), iterations, Some(&center));
+            }
+            UpdateDrawer::No => {}
+        };
 
         drawer.update_display_buf();
         if drawer.try_cache_buf() {
