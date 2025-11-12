@@ -1,6 +1,6 @@
 use crate::drawing::maybe_pixel::MaybePixel;
 use crate::support::{Length, Point, Scale, ToFBig};
-use dashu::float::FBig;
+use dashu::float::{DBig, FBig};
 use hsl::HSL;
 use indicatif::ProgressBar;
 use itertools::{Itertools, iproduct};
@@ -13,9 +13,10 @@ use parking_lot::RwLock;
 use rand::{Rng, rng};
 use rayon::ThreadPool;
 use std::assert_matches::assert_matches;
-use std::cmp::min;
+use std::cmp::{self, min};
 use std::num::NonZeroUsize;
 use std::ops::Range;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use waker_interrupter::MultiInterrupter;
 
@@ -34,23 +35,43 @@ pub struct CoordinatesBox {
     pub view: View,
 }
 
-// trait TypedXY<T, U> {
-//     fn x(&self) -> Length<T, U>;
-//     fn y(&self) -> Length<T, U>;
-// }
+impl ToString for CoordinatesBox {
+    fn to_string(&self) -> String {
+        format!(
+            "{},{}|{:e}",
+            self.origin.x.to_decimal().value(),
+            self.origin.y.to_decimal().value(),
+            self.view.inner
+        )
+    }
+}
 
-// impl<T, U> TypedXY<T, U> for Point2D<T, U>
-// where
-//     T: Copy,
-// {
-//     fn x(&self) -> Length<T, U> {
-//         Length::new(self.x)
-//     }
+impl FromStr for CoordinatesBox {
+    type Err = ();
 
-//     fn y(&self) -> Length<T, U> {
-//         Length::new(self.y)
-//     }
-// }
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (origin_x, rest) = s.split_at(s.chars().position(|c| c == ',').ok_or(())?);
+        let rest = &rest[1..]; // remove ,
+        let (origin_y, view) = rest.split_at(rest.chars().position(|c| c == '|').ok_or(())?);
+        let view = &view[1..]; // remove |
+
+        let origin_x = origin_x
+            .parse::<DBig>()
+            .map_err(|_| ())?
+            .to_binary()
+            .value();
+        let origin_y = origin_y
+            .parse::<DBig>()
+            .map_err(|_| ())?
+            .to_binary()
+            .value();
+
+        Ok(Self {
+            origin: Point::new(origin_x, origin_y),
+            view: Scale::new(view.parse().map_err(|_| ())?),
+        })
+    }
+}
 
 fn is_bad_value(v: &Complex<FBig>) -> bool {
     // implicitly also checks that neither is NaN
@@ -134,27 +155,28 @@ fn check_divergence_delta(
     }
 }
 
-// fn __get_divergence_delta(ref_orbit_f64: &Orbit<f64>, delta: Complex<f64>) -> Vec<Complex<f64>> {
-//     // ref_orbit is [x_0, x_1, ...]
-//     // delta is delta_0
-//     // delta_{n+1} = 2 x_n delta_n + delta_n^2 + delta_0
+// debug
+fn __get_divergence_delta(ref_orbit_f64: &Orbit<f64>, delta: Complex<f64>) -> Vec<Complex<f64>> {
+    // ref_orbit is [x_0, x_1, ...]
+    // delta is delta_0
+    // delta_{n+1} = 2 x_n delta_n + delta_n^2 + delta_0
 
-//     let delta_0 = delta;
-//     let mut delta = delta;
-//     let mut out = vec![];
-//     for (i, &c) in ref_orbit_f64.orbit.iter().enumerate() {
-//         let x = c + delta;
-//         out.push(x);
-//         if x.norm() > 4.0 {
-//             // this is always Some(...), i + 1 can't be 0
-//             return out;
-//         }
+    let delta_0 = delta;
+    let mut delta = delta;
+    let mut out = vec![];
+    for (i, &c) in ref_orbit_f64.orbit.iter().enumerate() {
+        let x = c + delta;
+        out.push(x);
+        if x.re * x.re + x.im * x.im > 4.0 {
+            // this is always Some(...), i + 1 can't be 0
+            return out;
+        }
 
-//         delta = c * 2.0 * delta + delta * delta + delta_0;
-//     }
+        delta = c * 2.0 * delta + delta * delta + delta_0;
+    }
 
-//     out
-// }
+    out
+}
 
 fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
@@ -193,9 +215,9 @@ fn val_to_color(val: Option<NonZeroUsize>) -> u32 {
         // let hsl = HSL {
         //     h: (val.get() as f64 / 1200.0).ln() % 1.0 * 360.0,
         //     s: 0.5,
-        //     l: 0.5,
+        //     // l: 0.5,
         //     // l: ((val.get() as f64 / 40.0).sin() * 0.3 + 0.4),
-        //     // l: ((val.get() as f64 / 1.0).ln().sin() > 0.0) as u8 as f64,
+        //     l: ((val.get() as f64 / 1.0).ln().sin() > 0.0) as u8 as f64,
         // };
 
         let (r, g, b) = hsl.to_rgb();
@@ -417,19 +439,44 @@ fn render_pixel(
 
         println!("{} -> {}", lock.orbit.orbit.len(), new_orbit.orbit.len());
         // if new_orbit_f64.orbit.len() < lock.orbit_f64.orbit.len() {
-        //     println!("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$");
+        // println!("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$");
         // }
         // assert_matches!(
         //     check_divergence_delta(&lock.orbit_f64, delta - lock.delta_corr),
         //     Err(_)
         // );
         // assert_matches!(check_divergence_delta(&new_orbit_f64, Complex::ZERO), Ok(_));
-        // if new_orbit_f64.orbit.len() < lock.orbit_f64.orbit.len() {
-        //     let delta_orb = __get_divergence_delta(&lock.orbit_f64, delta - lock.delta_corr);
-        //     for (a, b) in delta_orb.iter().zip(&new_orbit_f64.orbit) {
-        //         println!(">>   {a:>20?} {b:>20?})");
-        //     }
-        // }
+        if new_orbit_f64.orbit.len() < lock.orbit_f64.orbit.len() {
+            let delta_orb = __get_divergence_delta(&lock.orbit_f64, delta - lock.delta_corr);
+            for i in 0..cmp::max(
+                cmp::max(lock.orbit_f64.orbit.len(), delta_orb.len()),
+                new_orbit_f64.orbit.len(),
+            ) {
+                // for ((r, d), n) in lock
+                //     .orbit_f64
+                //     .orbit
+                //     .iter()
+                //     .zip(&delta_orb)
+                //     .zip(&new_orbit_f64.orbit)
+                // {
+
+                let r = lock.orbit_f64.orbit.get(i);
+                let d = delta_orb.get(i);
+                let n = new_orbit_f64.orbit.get(i);
+
+                let r = r
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "None".to_string());
+                let d = d
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "None".to_string());
+                let n = n
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "None".to_string());
+
+                println!("{r:>50} {d:>50} {n:>50}");
+            }
+        }
 
         lock.orbit = new_orbit;
         lock.orbit_f64 = new_orbit_f64;

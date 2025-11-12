@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clipboard = "0.5.0"
 cpu-time = "1.0.0"
 crossbeam-channel = "0.5.15"
 dashu = { version = "0.4.2", features = ["num-traits"] }

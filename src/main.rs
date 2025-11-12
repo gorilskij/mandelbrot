@@ -8,8 +8,9 @@ use crate::{
     drawing::Drawer,
     support::{Length, Point},
 };
+use clipboard::{ClipboardContext, ClipboardProvider};
 use dashu::float::FBig;
-use log::{info, trace};
+use log::{info, trace, warn};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use rendering::*;
 use support::ToFBig;
@@ -102,15 +103,39 @@ fn main() {
             }
         }
 
-        'drawer_update: {
+        if {
             if dragged || zoomed {
                 trace!("send update to drawer");
+                true
             } else if window.is_key_pressed(Key::Up, KeyRepeat::No) {
                 iterations *= 2;
                 info!("iterations: {iterations}");
+                true
             } else if window.is_key_pressed(Key::Down, KeyRepeat::No) && iterations > 1 {
                 iterations /= 2;
                 info!("iterations: {iterations}");
+                true
+            } else if (window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl))
+                && window.is_key_pressed(Key::C, KeyRepeat::No)
+            {
+                let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
+                ctx.set_contents(coords.to_string()).unwrap();
+                info!("copied coords to clipboard");
+                false
+            } else if (window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl))
+                && window.is_key_pressed(Key::V, KeyRepeat::No)
+            {
+                let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
+                if let Ok(new_coords) = ctx.get_contents().unwrap().parse() {
+                    coords = new_coords;
+                    info!("pasted coords from clipboard");
+                    true
+                } else {
+                    warn!("tried to paste with invalid clipboard");
+                    false
+                }
+            } else {
+                false
             }
             // for debug
             // else if window.is_key_pressed(Key::Left, KeyRepeat::No) {
@@ -142,10 +167,7 @@ fn main() {
             //         coords.view = new_view;
             //     }
             // }
-            else {
-                break 'drawer_update;
-            }
-
+        } {
             let cursor_rel = cursor_rel.map(|p| p.cast(|f| f.to_f64().value() as usize));
             drawer.update(coords.clone(), iterations, cursor_rel.as_ref());
         }
