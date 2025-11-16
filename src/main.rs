@@ -1,5 +1,3 @@
-#![feature(assert_matches)]
-
 mod drawing;
 mod rendering;
 mod support;
