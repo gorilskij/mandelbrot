@@ -27,3 +27,4 @@ waker_interrupter = { path = "../waker_interrupter" }
 
 [profile.release]
 debug = true
+# debug-assertions = true

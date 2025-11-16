@@ -1,23 +1,21 @@
 use crate::drawing::maybe_pixel::MaybePixel;
+use crate::support::append_only::List as AOList;
 use crate::support::{Length, Point, Scale, ToFBig};
 use dashu::float::{DBig, FBig};
 use hsl::HSL;
 use indicatif::ProgressBar;
 use itertools::{Itertools, iproduct};
-use log::info;
 use num::{Complex, Zero};
 use ordered_float::OrderedFloat;
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
-use parking_lot::RwLock;
-use rand::{Rng, rng};
 use rayon::ThreadPool;
-use std::assert_matches::assert_matches;
-use std::cmp::{self, min};
+use std::cmp::min;
+use std::fmt::Display;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use waker_interrupter::MultiInterrupter;
 
 #[derive(Copy, Clone)]
@@ -35,9 +33,10 @@ pub struct CoordinatesBox {
     pub view: View,
 }
 
-impl ToString for CoordinatesBox {
-    fn to_string(&self) -> String {
-        format!(
+impl Display for CoordinatesBox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
             "{},{}|{:e}",
             self.origin.x.to_decimal().value(),
             self.origin.y.to_decimal().value(),
@@ -156,27 +155,27 @@ fn check_divergence_delta(
 }
 
 // debug
-fn __get_divergence_delta(ref_orbit_f64: &Orbit<f64>, delta: Complex<f64>) -> Vec<Complex<f64>> {
-    // ref_orbit is [x_0, x_1, ...]
-    // delta is delta_0
-    // delta_{n+1} = 2 x_n delta_n + delta_n^2 + delta_0
+// fn __get_divergence_delta(ref_orbit_f64: &Orbit<f64>, delta: Complex<f64>) -> Vec<Complex<f64>> {
+//     // ref_orbit is [x_0, x_1, ...]
+//     // delta is delta_0
+//     // delta_{n+1} = 2 x_n delta_n + delta_n^2 + delta_0
 
-    let delta_0 = delta;
-    let mut delta = delta;
-    let mut out = vec![];
-    for (i, &c) in ref_orbit_f64.orbit.iter().enumerate() {
-        let x = c + delta;
-        out.push(x);
-        if x.re * x.re + x.im * x.im > 4.0 {
-            // this is always Some(...), i + 1 can't be 0
-            return out;
-        }
+//     let delta_0 = delta;
+//     let mut delta = delta;
+//     let mut out = vec![];
+//     for (_, &c) in ref_orbit_f64.orbit.iter().enumerate() {
+//         let x = c + delta;
+//         out.push(x);
+//         if x.re * x.re + x.im * x.im > 4.0 {
+//             // this is always Some(...), i + 1 can't be 0
+//             return out;
+//         }
 
-        delta = c * 2.0 * delta + delta * delta + delta_0;
-    }
+//         delta = c * 2.0 * delta + delta * delta + delta_0;
+//     }
 
-    out
-}
+//     out
+// }
 
 fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
@@ -374,8 +373,7 @@ fn render_pixel(
     origin: &Origin,
     iterations: usize,
     buf_view: BufView,
-    ref_orbit: &RwLock<RefOrbit>,
-    writer_active: &AtomicBool,
+    ref_orbits: &AOList<RefOrbit>,
 ) -> Option<NonZeroUsize> {
     let c_typed = Length::<_, Pixels>::new(c as f64);
     let r_typed = Length::<_, Pixels>::new(r as f64);
@@ -385,109 +383,44 @@ fn render_pixel(
         im: (r_typed * view).inner,
     };
 
-    let val = loop {
-        // this block is necessary to properly drop the read lock
-        // let __len;
-        {
-            let lock = ref_orbit.read();
-            // __len = lock.orbit.orbit.len();
-            if let Ok(val) = check_divergence_delta(&lock.orbit_f64, delta - lock.delta_corr) {
-                break val;
-            } else {
-                assert_matches!(
-                    check_divergence_delta(&lock.orbit_f64, delta - lock.delta_corr),
-                    Err(_)
-                );
+    let val = ref_orbits
+        .iter()
+        .find_map(|ref_orbit| {
+            let out = check_divergence_delta(&ref_orbit.orbit, delta - ref_orbit.delta_corr).ok();
+
+            #[cfg(debug_assertions)]
+            if out.is_some() {
+                ref_orbit.hits.fetch_add(1, Ordering::Relaxed);
             }
-        }
 
-        if writer_active
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            // the next iteration will naturally block until the writer is done
-            continue;
-        }
-        let mut lock = ref_orbit.write();
+            out
+        })
+        .unwrap_or_else(|| {
+            let delta_fbig = Complex {
+                re: delta.re.to_fbig(),
+                im: delta.im.to_fbig(),
+            };
 
-        // let len__ = lock.orbit.orbit.len();
-        // println!(
-        //     "{} =? {} {}",
-        //     __len,
-        //     len__,
-        //     if __len == len__ { "" } else { "ERROR" }
-        // );
+            let (_, new_orbit) = calculate_orbit(
+                Complex {
+                    re: origin.x.clone(),
+                    im: origin.y.clone(),
+                } + delta_fbig,
+                iterations,
+            );
 
-        let recalc_id = rng().random::<u8>();
-        info!("({recalc_id}) recalculating reference orbit");
+            // guaranteed to be Ok(_)
+            let val = check_orbit(&new_orbit).unwrap();
 
-        let delta_bf = Complex {
-            re: delta.re.to_fbig(),
-            im: delta.im.to_fbig(),
-        };
+            ref_orbits.push_front(RefOrbit {
+                delta_corr: delta,
+                orbit: new_orbit,
+                #[cfg(debug_assertions)]
+                hits: Default::default(),
+            });
 
-        let (new_orbit, new_orbit_f64) = calculate_orbit(
-            Complex {
-                re: origin.x.clone(),
-                im: origin.y.clone(),
-            } + delta_bf,
-            iterations,
-        );
-
-        // guaranteed to be Ok(_)
-        let val = check_orbit(&new_orbit_f64).unwrap();
-
-        println!("{} -> {}", lock.orbit.orbit.len(), new_orbit.orbit.len());
-        // if new_orbit_f64.orbit.len() < lock.orbit_f64.orbit.len() {
-        // println!("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$");
-        // }
-        // assert_matches!(
-        //     check_divergence_delta(&lock.orbit_f64, delta - lock.delta_corr),
-        //     Err(_)
-        // );
-        // assert_matches!(check_divergence_delta(&new_orbit_f64, Complex::ZERO), Ok(_));
-        if new_orbit_f64.orbit.len() < lock.orbit_f64.orbit.len() {
-            let delta_orb = __get_divergence_delta(&lock.orbit_f64, delta - lock.delta_corr);
-            for i in 0..cmp::max(
-                cmp::max(lock.orbit_f64.orbit.len(), delta_orb.len()),
-                new_orbit_f64.orbit.len(),
-            ) {
-                // for ((r, d), n) in lock
-                //     .orbit_f64
-                //     .orbit
-                //     .iter()
-                //     .zip(&delta_orb)
-                //     .zip(&new_orbit_f64.orbit)
-                // {
-
-                let r = lock.orbit_f64.orbit.get(i);
-                let d = delta_orb.get(i);
-                let n = new_orbit_f64.orbit.get(i);
-
-                let r = r
-                    .map(|r| r.to_string())
-                    .unwrap_or_else(|| "None".to_string());
-                let d = d
-                    .map(|r| r.to_string())
-                    .unwrap_or_else(|| "None".to_string());
-                let n = n
-                    .map(|r| r.to_string())
-                    .unwrap_or_else(|| "None".to_string());
-
-                println!("{r:>50} {d:>50} {n:>50}");
-            }
-        }
-
-        lock.orbit = new_orbit;
-        lock.orbit_f64 = new_orbit_f64;
-
-        lock.delta_corr = delta;
-
-        drop(lock);
-        writer_active.store(false, Ordering::Release);
-
-        break val;
-    };
+            val
+        });
 
     // SAFETY: all writes are disjoint
     unsafe {
@@ -502,8 +435,9 @@ fn render_pixel(
 
 struct RefOrbit {
     delta_corr: Complex<f64>,
-    orbit: Orbit<FBig>,
-    orbit_f64: Orbit<f64>,
+    orbit: Orbit<f64>,
+    #[cfg(debug_assertions)]
+    hits: AtomicUsize,
 }
 
 pub fn render(
@@ -520,8 +454,8 @@ pub fn render(
 
     let buf_view = BufView(buf.as_mut_ptr());
 
-    let ref_orbit = &{
-        let (orbit, orbit_f64) = calculate_orbit(
+    let ref_orbits = &{
+        let (_, orbit) = calculate_orbit(
             Complex {
                 re: origin.x.clone(),
                 im: origin.y.clone(),
@@ -529,13 +463,15 @@ pub fn render(
             iterations,
         );
 
-        RwLock::new(RefOrbit {
+        let list = AOList::new();
+        list.push_front(RefOrbit {
             delta_corr: Complex::ZERO,
             orbit,
-            orbit_f64,
-        })
+            #[cfg(debug_assertions)]
+            hits: Default::default(),
+        });
+        list
     };
-    let writer_active = &AtomicBool::new(false);
 
     let side = 20;
     let chunks = chunks_2d(width, height, center, side);
@@ -576,32 +512,14 @@ pub fn render(
                     // check if first pixel is black
                     let first_pixel = {
                         let (c, r) = outer_perimeter.next().unwrap();
-                        render_pixel(
-                            c,
-                            r,
-                            width,
-                            view,
-                            origin,
-                            iterations,
-                            buf_view,
-                            ref_orbit,
-                            writer_active,
-                        )
+                        render_pixel(c, r, width, view, origin, iterations, buf_view, ref_orbits)
                     };
 
                     if first_pixel.is_none() {
                         // check the rest of the perimeter
                         let all_black = outer_perimeter.fold(true, |all_black, (c, r)| {
                             let val = render_pixel(
-                                c,
-                                r,
-                                width,
-                                view,
-                                origin,
-                                iterations,
-                                buf_view,
-                                ref_orbit,
-                                writer_active,
+                                c, r, width, view, origin, iterations, buf_view, ref_orbits,
                             );
                             all_black && val.is_none()
                         });
@@ -629,15 +547,7 @@ pub fn render(
                         } else {
                             inner_pixels.into_iter().for_each(|(c, r)| {
                                 render_pixel(
-                                    c,
-                                    r,
-                                    width,
-                                    view,
-                                    origin,
-                                    iterations,
-                                    buf_view,
-                                    ref_orbit,
-                                    writer_active,
+                                    c, r, width, view, origin, iterations, buf_view, ref_orbits,
                                 );
                             });
                         }
@@ -652,15 +562,7 @@ pub fn render(
 
                         block.into_iter().for_each(|(c, r)| {
                             render_pixel(
-                                c,
-                                r,
-                                width,
-                                view,
-                                origin,
-                                iterations,
-                                buf_view,
-                                ref_orbit,
-                                writer_active,
+                                c, r, width, view, origin, iterations, buf_view, ref_orbits,
                             );
                         });
                     }
@@ -672,4 +574,16 @@ pub fn render(
     });
 
     pbar.finish();
+
+    #[cfg(debug_assertions)]
+    {
+        println!("{:>10} {:>10}", "length", "hits");
+        for o in ref_orbits.iter() {
+            println!(
+                "{:>10} {:>10}",
+                o.orbit.orbit.len(),
+                o.hits.load(Ordering::Relaxed)
+            );
+        }
+    }
 }
