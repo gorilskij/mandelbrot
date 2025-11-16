@@ -1,22 +1,12 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::{mem, ptr};
 
 type Link<T> = AtomicPtr<Block<T>>;
 
 struct Block<T> {
     data: T,
     next: Link<T>,
-}
-
-impl<T> Block<T> {
-    fn new(data: T) -> Self {
-        Self {
-            data,
-            next: Default::default(),
-        }
-    }
 }
 
 struct Head<T>(Link<T>);
@@ -46,41 +36,43 @@ impl<T> Head<T> {
         }
     }
 
+    // unused
     // returns new length
-    fn push_back(&self, data: T) -> usize {
-        let new_block_ptr = Box::leak(Box::new(Block::new(data)));
+    // fn push_back(&self, data: T) -> usize {
+    //     let new_block_ptr = Box::leak(Box::new(Block::new(data)));
 
-        let mut len = 0;
-        let mut next_ptr = &self.0;
-        while let Err(next) = next_ptr.compare_exchange(
-            ptr::null_mut(),
-            new_block_ptr,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
-            let offset = mem::offset_of!(Block<T>, next);
+    //     let mut len = 0;
+    //     let mut next_ptr = &self.0;
+    //     while let Err(next) = next_ptr.compare_exchange(
+    //         ptr::null_mut(),
+    //         new_block_ptr,
+    //         Ordering::Release,
+    //         Ordering::Acquire,
+    //     ) {
+    //         let offset = mem::offset_of!(Block<T>, next);
 
-            // TODO: SAFETY
-            next_ptr = unsafe { &*(next.offset(offset as isize) as *mut AtomicPtr<_>) };
+    //         // TODO: SAFETY
+    //         next_ptr = unsafe { &*(next.offset(offset as isize) as *mut AtomicPtr<_>) };
 
-            len += 1;
-        }
+    //         len += 1;
+    //     }
 
-        len
-    }
+    //     len
+    // }
 }
 
 impl<T> Drop for Head<T> {
     fn drop(&mut self) {
         // NOTE: Relaxed ordering is used here because this code
         // only runs when all threads but one have dropped their
-        // Arc handles, this provides Acquire/Release synchronization
-        // ensuring all their writes are visible, otherwise this
-        // code would need to use Acquire
+        // Arc handles, synchronization is provided by Arc, this
+        // is single-threaded code
 
         let mut next = self.0.load(Ordering::Relaxed);
         while !next.is_null() {
-            // SAFETY: next is not null, this code can only be run from a single thread
+            // SAFETY: next is not null, this code can only be run
+            //   from a single thread so it is safe to drop `block`
+            //   at the end of this scope
             let block = unsafe { Box::from_raw(next) };
             next = block.next.load(Ordering::Relaxed);
         }
@@ -132,10 +124,11 @@ impl<T> List<T> {
         self.0.push_front(data)
     }
 
+    // unused
     // returns new length
-    pub fn push_back(&self, data: T) -> usize {
-        self.0.push_back(data)
-    }
+    // pub fn push_back(&self, data: T) -> usize {
+    //     self.0.push_back(data)
+    // }
 
     pub fn iter(&self) -> Iter<'_, T> {
         Iter {

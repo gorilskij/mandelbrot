@@ -4,7 +4,7 @@ mod drawing;
 mod rendering;
 mod support;
 
-use std::{borrow::Cow, str::FromStr};
+use std::{borrow::Cow, fmt::Display, str::FromStr};
 
 use crate::{
     drawing::Drawer,
@@ -22,9 +22,9 @@ struct ClipBoardData<'a> {
     iterations: usize,
 }
 
-impl ToString for ClipBoardData<'_> {
-    fn to_string(&self) -> String {
-        format!("{}/{}", self.coords.to_string(), self.iterations)
+impl Display for ClipBoardData<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.coords, self.iterations)
     }
 }
 

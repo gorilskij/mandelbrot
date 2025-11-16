@@ -5,20 +5,17 @@ use dashu::float::{DBig, FBig};
 use hsl::HSL;
 use indicatif::ProgressBar;
 use itertools::{Itertools, iproduct};
-use log::info;
 use num::{Complex, Zero};
 use ordered_float::OrderedFloat;
 use palette::rgb::Rgb;
 use palette::{Mix, Srgb, rgb};
-use parking_lot::RwLock;
-use rand::{Rng, rng};
 use rayon::ThreadPool;
-use std::assert_matches::assert_matches;
-use std::cmp::{self, min};
+use std::cmp::min;
+use std::fmt::Display;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use waker_interrupter::MultiInterrupter;
 
 #[derive(Copy, Clone)]
@@ -36,9 +33,10 @@ pub struct CoordinatesBox {
     pub view: View,
 }
 
-impl ToString for CoordinatesBox {
-    fn to_string(&self) -> String {
-        format!(
+impl Display for CoordinatesBox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
             "{},{}|{:e}",
             self.origin.x.to_decimal().value(),
             self.origin.y.to_decimal().value(),

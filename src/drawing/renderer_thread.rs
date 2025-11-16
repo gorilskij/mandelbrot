@@ -10,6 +10,8 @@ use std::time::Duration;
 use std::{mem, thread};
 use waker_interrupter as wi;
 
+type BufGuard<'a, T> = MutexGuard<'a, Box<[T]>>;
+
 pub mod render_buffer {
     use super::*;
 
@@ -45,7 +47,8 @@ pub mod render_buffer {
             if *done {
                 let buf = self.buffer.lock();
                 // SAFETY: if `done` is true, all the values in the buffer are valid u32 colors
-                let buf = unsafe { mem::transmute(buf) };
+                let buf =
+                    unsafe { mem::transmute::<BufGuard<'_, MaybePixel>, BufGuard<'_, u32>>(buf) };
                 Some(buf)
             } else {
                 None
@@ -57,7 +60,9 @@ pub mod render_buffer {
                 let done = self.done.lock();
                 if *done {
                     let buf = self.buffer.lock();
-                    let buf = unsafe { mem::transmute(buf) };
+                    let buf = unsafe {
+                        mem::transmute::<BufGuard<'_, MaybePixel>, BufGuard<'_, u32>>(buf)
+                    };
                     return buf;
                 }
 
@@ -73,9 +78,11 @@ pub mod render_buffer {
     }
 }
 
+pub type MessageTuple = (CoordinatesBox, usize, Option<Point<usize, Pixels>>);
+
 pub struct Handle {
     handle: thread::JoinHandle<()>,
-    sender: wi::Sender<(CoordinatesBox, usize, Option<Point<usize, Pixels>>)>,
+    sender: wi::Sender<MessageTuple>,
     buffer: RenderBuffer,
 }
 
