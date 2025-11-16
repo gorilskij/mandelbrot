@@ -227,10 +227,10 @@ fn val_to_color(val: Option<NonZeroUsize>) -> u32 {
 }
 
 fn interpolate(
-    color_tl: u32,
-    color_tr: u32,
-    color_bl: u32,
-    color_br: u32,
+    color_tl: u32, // top left
+    color_tr: u32, // top right
+    color_bl: u32, // bottom left
+    color_br: u32, // bottom right
     /* (y, x) where tl is (0, 0) */
     location: (f64, f64),
 ) -> u32 {
@@ -272,47 +272,28 @@ pub fn sample_zoomed(
     // src_origin and dest_origin are both absolute
     // calculate dest_origin in the [0, 1] reference frame given by src
     // let src_view_bf = Scale::<_, Pixels, Units>::new(BigFloat::from(src_view.0));
-    // TODO: check numerical properties at high zoom
     let dest_origin_rel_src = {
         let p = &(dest_origin - src_origin).cast(|f| f.to_f64().value()) / src_view;
-        Point::<_, Relative>::new(p.x / fwidth, p.y / fheight)
+        Point::<_, Relative>::new(p.x, p.y)
     };
 
     for dest_row in 0..height {
         for dest_col in 0..width {
-            // [0, 1] coordinates relative to the reference frame given by dest
-            let point_rel_dest =
-                Point::<_, Relative>::new(dest_col as f64 / fwidth, dest_row as f64 / fheight);
+            let point_rel_dest = Point::<_, Relative>::new(dest_col as f64, dest_row as f64);
 
-            // calculate [0, 1] coordinates in the reference frame given by src
             let point_rel_src = (dest_origin_rel_src + point_rel_dest * (*dest_view / *src_view))
-                .clamp(
-                    &Point::zero(),
-                    &Point::new((fwidth - 1.0) / fwidth, (fheight - 1.0) / fheight),
-                );
+                .clamp(&Point::zero(), &Point::new(fwidth - 1.0, fheight - 1.0));
 
-            let tl = (
-                (point_rel_src.y * fheight) as usize,
-                (point_rel_src.x * fwidth) as usize,
-            );
-            let tr = (
-                (point_rel_src.y * fheight) as usize,
-                (point_rel_src.x * fwidth).ceil() as usize,
-            );
-            let bl = (
-                (point_rel_src.y * fheight).ceil() as usize,
-                (point_rel_src.x * fwidth) as usize,
-            );
-            let br = (
-                (point_rel_src.y * fheight).ceil() as usize,
-                (point_rel_src.x * fwidth).ceil() as usize,
-            );
+            let x_floor = point_rel_src.x as usize;
+            let x_ceil = point_rel_src.x.ceil() as usize;
+            let y_floor = point_rel_src.y as usize;
+            let y_ceil = point_rel_src.y.ceil() as usize;
 
             let color = interpolate(
-                src[tl.0 * width + tl.1],
-                src[tr.0 * width + tr.1],
-                src[bl.0 * width + bl.1],
-                src[br.0 * width + br.1],
+                src[y_floor * width + x_floor], // top-left
+                src[y_floor * width + x_ceil],  // top-right
+                src[y_ceil * width + x_floor],  // bottom-left
+                src[y_ceil * width + x_ceil],   // bottom-right
                 (
                     point_rel_src.y - point_rel_src.y.floor(),
                     point_rel_src.x - point_rel_src.x.floor(),
