@@ -172,14 +172,15 @@ fn main() {
                     warn!("tried to paste with invalid clipboard");
                     UpdateDrawer::No
                 }
-            } else {
-                UpdateDrawer::No
             }
             // for debug
             // else if window.is_key_pressed(Key::Left, KeyRepeat::No) {
             //     // set vertical center to 0
-            //     coords.origin.y = -(height as f64 / 2.0 * coords.view.inner).to_fbig()
-            // } else if window.is_key_pressed(Key::Right, KeyRepeat::No) {
+            //     coords.origin.y = -(height as f64 / 2.0 * coords.view.inner).to_fbig();
+            //     UpdateDrawer::AroundCenter
+            // }
+            //
+            // else if window.is_key_pressed(Key::Right, KeyRepeat::No) {
             //     {
             //         let width = Length::<_, Pixels>::new(width as f64) * coords.view;
             //         println!(
@@ -205,6 +206,10 @@ fn main() {
             //         coords.view = new_view;
             //     }
             // }
+            //
+            else {
+                UpdateDrawer::No
+            }
         };
 
         match update_drawer {
