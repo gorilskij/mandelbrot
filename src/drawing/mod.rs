@@ -2,40 +2,32 @@ pub mod maybe_pixel;
 mod renderer_thread;
 
 use crate::{
+    drawing::maybe_pixel::MaybePixel,
     rendering::{CoordinatesBox, Pixels, sample_zoomed},
     support::Point,
 };
 use log::trace;
-use std::thread;
+use std::{iter, mem, thread};
+
+type Buf<T> = Box<[T]>;
+
+struct PartialBuf {
+    coords: CoordinatesBox,
+    buf: Buf<MaybePixel>,
+    zoomed: Buf<MaybePixel>,
+}
 
 pub struct Drawer {
     width: usize,
     height: usize,
-    //
-    /// This variable indicates whether cache_buf is fresh (i.e. it
-    /// consists of the completed rendering of the current view) or
-    /// stale (i.e. it's the rendering of a previous view that is
-    /// currently used for a zoomed preview while the current view is
-    /// being rendered)
-    cache_fresh: bool,
-    cache_coords: CoordinatesBox,
-    zoomed_coords: CoordinatesBox,
-    //
-    /// Cached version of the renderer buffer, this gets updated when
-    /// the renderer finishes rendering a given view. This buffer has
-    /// all pixels perfectly aligned and is never directly transformed.
-    cache_buf: Box<[u32]>,
-    /// Stretched version of cache_buf, this serves as a preview for
-    /// the new view currently being rendered (which is displayed over
-    /// it as it is generated). This buffer is always a fresh
-    /// transformation of cache_buf. When shrinking, the edges are
-    /// filled in.
-    zoomed_buf: Box<[u32]>,
+    coords: CoordinatesBox,
+    partial_bufs: Vec<PartialBuf>,
     /// When generating, this buffer is composed of the zoom_buf
     /// overlayed with the pixels that have been generated in the
     /// renderer buffer. This is the buffer that gets passed along to
     /// the UI renderer.
-    display_buf: Box<[u32]>,
+    display_buf: Buf<u32>,
+    display_buf_fresh: bool,
     /// The renderer contains its own buffer which it fills in with
     /// pixels as it runs the mandelbrot calculation. Every time there's
     /// a change in view, this buffer gets cleared and computation restarts
@@ -48,13 +40,11 @@ impl Drawer {
             width,
             height,
             //
-            cache_fresh: true,
-            cache_coords: coords.clone(),
-            zoomed_coords: coords.clone(),
+            coords: coords.clone(),
             //
-            cache_buf: vec![0; width * height].into_boxed_slice(),
-            zoomed_buf: vec![0; width * height].into_boxed_slice(),
+            partial_bufs: vec![],
             display_buf: vec![0; width * height].into_boxed_slice(),
+            display_buf_fresh: false,
             renderer: renderer_thread::spawn(width, height),
         };
 
@@ -75,8 +65,7 @@ impl Drawer {
         iterations: usize,
         cursor_rel: Option<&Point<usize, Pixels>>,
     ) {
-        // invalidate cache
-        self.cache_fresh = false;
+        self.display_buf_fresh = false;
 
         // relaunch renderer thread
         self.renderer
@@ -84,63 +73,95 @@ impl Drawer {
 
         trace!("drawer: sent update to renderer");
 
-        // update zoomed buffer
-        sample_zoomed(
-            &self.cache_buf,
-            &mut self.zoomed_buf,
-            //
-            self.width,
-            self.height,
-            //
-            &self.cache_coords,
-            &new_zoomed_coords,
-        );
-        self.zoomed_coords = new_zoomed_coords;
+        if self.partial_bufs.is_empty() {
+            // SAFETY: MaybePixel is repr(transparent)
+            let buf =
+                unsafe { mem::transmute::<Buf<u32>, Buf<MaybePixel>>(self.display_buf.clone()) };
+            let mut zoomed = vec![MaybePixel::none(); buf.len()].into_boxed_slice();
+            sample_zoomed(
+                &buf,
+                &mut zoomed,
+                self.width,
+                self.height,
+                &self.coords,
+                &new_zoomed_coords,
+            );
+            self.partial_bufs.push(PartialBuf {
+                coords: self.coords.clone(),
+                buf,
+                zoomed,
+            });
+        } else {
+            // update all partial bufs with the new coordinates
+            for pb in &mut self.partial_bufs {
+                sample_zoomed(
+                    &pb.buf,
+                    &mut pb.zoomed,
+                    self.width,
+                    self.height,
+                    &pb.coords,
+                    &new_zoomed_coords,
+                );
+            }
 
-        trace!("drawer: updated zoomed buffer");
+            // add a new partial buf
+            let buf = self.renderer.cloned_buffer();
+            let mut zoomed = vec![MaybePixel::none(); buf.len()].into_boxed_slice();
+            sample_zoomed(
+                &buf,
+                &mut zoomed,
+                self.width,
+                self.height,
+                &self.coords,
+                &new_zoomed_coords,
+            );
+            self.partial_bufs.insert(
+                0,
+                PartialBuf {
+                    coords: self.coords.clone(),
+                    buf,
+                    zoomed,
+                },
+            );
+        }
 
+        self.coords = new_zoomed_coords;
+
+        // TODO: I think this is not needed here
         self.update_display_buf();
     }
 
     pub fn update_display_buf(&mut self) {
-        // if the cache is fresh, the display buf is static
-        if self.cache_fresh {
+        if self.display_buf_fresh {
+            // no zooming or moving has happened since the last update
             return;
         }
 
-        // TODO: benchmark
-        // self.display_buf.copy_from_slice(&self.zoomed_buf);
         let render_buf = self.renderer.concurrent_view();
 
-        let mut rendered = 0;
         for i in 0..self.display_buf.len() {
-            let rendered_pixel = unsafe { render_buf.add(i).read() };
-            self.display_buf[i] = match rendered_pixel.get() {
-                Some(pixel) => {
-                    rendered += 1;
-                    pixel
-                }
-                None => self.zoomed_buf[i],
-            }
+            // SAFETY: this won't interfere with generation,
+            //   if a corrupted value is read, it will just be
+            //   overwritten on the next iteration, no big deal
+            self.display_buf[i] = iter::once(unsafe { render_buf.add(i).read() })
+                .chain(self.partial_bufs.iter().map(|pb| pb.zoomed[i]))
+                .find_map(|mp| mp.get())
+                .unwrap_or(0);
         }
-
-        trace!("rendered {} / {} pixels", rendered, self.display_buf.len());
     }
 
-    /// If the renderer is done rendering the current view, cache it in
-    /// the cache_buf and display_buf, otherwise keep the old cache_buf.
+    /// If the renderer is done rendering the current view, cache it.
     /// Return true if the cache was updated
     pub fn try_cache_buf(&mut self) -> bool {
         // ignore repeated calls if cache was successful
-        if self.cache_fresh {
+        if self.display_buf_fresh {
             return false;
         }
 
         if let Some(lock) = self.renderer.lock_if_done() {
-            self.cache_buf.copy_from_slice(&lock);
-            self.cache_coords = self.zoomed_coords.clone();
             self.display_buf.copy_from_slice(&lock);
-            self.cache_fresh = true;
+            self.partial_bufs.clear();
+            self.display_buf_fresh = true;
             return true;
         }
 
@@ -151,15 +172,14 @@ impl Drawer {
     /// immediately lock it and cache it to cache_buf and display_buf
     pub fn force_cache_buf(&mut self) {
         // ignore repeated calls
-        if self.cache_fresh {
+        if self.display_buf_fresh {
             return;
         }
 
         let lock = self.renderer.lock_when_done();
-        self.cache_buf.copy_from_slice(&lock);
-        self.cache_coords = self.zoomed_coords.clone();
         self.display_buf.copy_from_slice(&lock);
-        self.cache_fresh = true;
+        self.partial_bufs.clear();
+        self.display_buf_fresh = true;
     }
 
     pub fn display_buf(&self) -> &[u32] {

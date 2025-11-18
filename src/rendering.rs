@@ -227,13 +227,26 @@ fn val_to_color(val: Option<NonZeroUsize>) -> u32 {
 }
 
 fn interpolate(
-    color_tl: u32, // top left
-    color_tr: u32, // top right
-    color_bl: u32, // bottom left
-    color_br: u32, // bottom right
+    color_tl: MaybePixel, // top left
+    color_tr: MaybePixel, // top right
+    color_bl: MaybePixel, // bottom left
+    color_br: MaybePixel, // bottom right
     /* (y, x) where tl is (0, 0) */
     location: (f64, f64),
-) -> u32 {
+) -> MaybePixel {
+    let Some(color_tl) = color_tl.get() else {
+        return MaybePixel::none();
+    };
+    let Some(color_tr) = color_tr.get() else {
+        return MaybePixel::none();
+    };
+    let Some(color_bl) = color_bl.get() else {
+        return MaybePixel::none();
+    };
+    let Some(color_br) = color_br.get() else {
+        return MaybePixel::none();
+    };
+
     let color_tl = Rgb::<Srgb, _>::from(color_tl).into_format();
     let color_tr = Rgb::<Srgb, _>::from(color_tr).into_format();
     let color_bl = Rgb::<Srgb, _>::from(color_bl).into_format();
@@ -244,12 +257,12 @@ fn interpolate(
 
     let color = top.mix(bottom, location.0).into_format();
 
-    color.into_u32::<rgb::channels::Argb>()
+    color.into_u32::<rgb::channels::Argb>().into()
 }
 
 pub fn sample_zoomed(
-    src: &[u32],
-    dest: &mut [u32],
+    src: &[MaybePixel],
+    dest: &mut [MaybePixel],
     // src and dest must match
     width: usize,
     height: usize,

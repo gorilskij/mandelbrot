@@ -13,6 +13,8 @@ use waker_interrupter as wi;
 type BufGuard<'a, T> = MutexGuard<'a, Box<[T]>>;
 
 pub mod render_buffer {
+    use std::slice;
+
     use super::*;
 
     pub type Done = Arc<Mutex<bool>>;
@@ -22,6 +24,7 @@ pub mod render_buffer {
         // when the `done` Mutex is held, buffer can be updated but not cleared
         done: Done,
         buffer: Buffer,
+        len: usize,
         concurrent_view: *const MaybePixel,
     }
 
@@ -29,13 +32,15 @@ pub mod render_buffer {
         pub fn new(width: usize, height: usize) -> (Self, Done, Buffer) {
             let done = Arc::new(Mutex::new(false));
 
-            let buf = vec![MaybePixel::none(); width * height].into_boxed_slice();
+            let len = width * height;
+            let buf = vec![MaybePixel::none(); len].into_boxed_slice();
             let concurrent_view = buf.as_ptr();
             let buffer = Arc::new(Mutex::new(buf));
 
             let this = Self {
                 done: done.clone(),
                 buffer: buffer.clone(),
+                len,
                 concurrent_view,
             };
 
@@ -75,6 +80,13 @@ pub mod render_buffer {
         pub fn concurrent_view(&self) -> *const MaybePixel {
             self.concurrent_view
         }
+
+        pub fn cloned_buffer(&self) -> Box<[MaybePixel]> {
+            // SAFETY: self.concurrent_view just points to the beginning of a slice
+            unsafe { slice::from_raw_parts(self.concurrent_view, self.len) }
+                .to_vec() // clone
+                .into_boxed_slice()
+        }
     }
 }
 
@@ -101,6 +113,7 @@ impl Handle {
         to self.buffer {
             pub fn lock_if_done(&self) -> Option<MutexGuard<'_, Box<[u32]>>>;
             pub fn concurrent_view(&self) -> *const MaybePixel;
+            pub fn cloned_buffer(&self) -> Box<[MaybePixel]>;
             pub fn lock_when_done(&self) -> MutexGuard<'_, Box<[u32]>>;
         }
     }
