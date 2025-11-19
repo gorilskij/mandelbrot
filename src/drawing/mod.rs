@@ -6,6 +6,7 @@ use crate::{
     rendering::{CoordinatesBox, Pixels, sample_zoomed},
     support::Point,
 };
+use itertools::Itertools;
 use log::trace;
 use std::{iter, mem, thread};
 
@@ -15,8 +16,10 @@ struct PartialBuf {
     coords: CoordinatesBox,
     buf: Buf<MaybePixel>,
     zoomed: Buf<MaybePixel>,
+    hits: usize,
 }
 
+const MAX_NUM_PARTIAL_BUFS: usize = 5;
 pub struct Drawer {
     width: usize,
     height: usize,
@@ -90,6 +93,7 @@ impl Drawer {
                 coords: self.coords.clone(),
                 buf,
                 zoomed,
+                hits: 0,
             });
         } else {
             // update all partial bufs with the new coordinates
@@ -121,8 +125,28 @@ impl Drawer {
                     coords: self.coords.clone(),
                     buf,
                     zoomed,
+                    hits: 0,
                 },
             );
+
+            if self.partial_bufs.len() > MAX_NUM_PARTIAL_BUFS {
+                println!(
+                    "{:?}",
+                    self.partial_bufs.iter().map(|pb| pb.hits).collect_vec()
+                );
+                let i = self
+                    .partial_bufs
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .min_by_key(|(_, pb)| pb.hits)
+                    .unwrap()
+                    .0;
+                println!("remove {i}");
+                self.partial_bufs.remove(i);
+            }
+
+            println!(">> {}", self.partial_bufs.len());
         }
 
         self.coords = new_zoomed_coords;
@@ -139,13 +163,27 @@ impl Drawer {
 
         let render_buf = self.renderer.concurrent_view();
 
+        self.partial_bufs.iter_mut().for_each(|pb| pb.hits = 0);
+
         for i in 0..self.display_buf.len() {
             // SAFETY: this won't interfere with generation,
             //   if a corrupted value is read, it will just be
             //   overwritten on the next iteration, no big deal
-            self.display_buf[i] = iter::once(unsafe { render_buf.add(i).read() })
-                .chain(self.partial_bufs.iter().map(|pb| pb.zoomed[i]))
-                .find_map(|mp| mp.get())
+            self.display_buf[i] = iter::once((None, unsafe { render_buf.add(i).read() }))
+                .chain(
+                    self.partial_bufs
+                        .iter()
+                        .map(|pb| pb.zoomed[i])
+                        .enumerate()
+                        .map(|(i, pb)| (Some(i), pb)),
+                )
+                .find_map(|(j, mp)| mp.get().map(|p| (j, p)))
+                .map(|(j, p)| {
+                    if let Some(j) = j {
+                        self.partial_bufs[j].hits += 1;
+                    }
+                    p
+                })
                 .unwrap_or(0);
         }
     }
