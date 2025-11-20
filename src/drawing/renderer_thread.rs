@@ -10,10 +10,12 @@ use std::time::Duration;
 use std::{mem, thread};
 use waker_interrupter as wi;
 
-type BufGuard<'a, T> = MutexGuard<'a, Box<[T]>>;
+pub type BufGuard<'a, T> = MutexGuard<'a, Box<[T]>>;
 
 pub mod render_buffer {
     use std::slice;
+
+    use crate::drawing::new_buf;
 
     use super::*;
 
@@ -82,10 +84,15 @@ pub mod render_buffer {
         }
 
         pub fn cloned_buffer(&self) -> Box<[MaybePixel]> {
-            // SAFETY: self.concurrent_view just points to the beginning of a slice
+            // // SAFETY: self.concurrent_view just points to the beginning of a slice
             unsafe { slice::from_raw_parts(self.concurrent_view, self.len) }
                 .to_vec() // clone
                 .into_boxed_slice()
+            // let mut buf = new_buf(self.len);
+            // (0..self.len).for_each(|i| {
+            //     buf[i] = unsafe { self.concurrent_view.offset(i as isize).read_volatile() }
+            // });
+            // buf
         }
     }
 }
@@ -111,10 +118,10 @@ impl Handle {
 
     delegate! {
         to self.buffer {
-            pub fn lock_if_done(&self) -> Option<MutexGuard<'_, Box<[u32]>>>;
+            pub fn lock_if_done(&self) -> Option<BufGuard<'_, u32>>;
             pub fn concurrent_view(&self) -> *const MaybePixel;
             pub fn cloned_buffer(&self) -> Box<[MaybePixel]>;
-            pub fn lock_when_done(&self) -> MutexGuard<'_, Box<[u32]>>;
+            pub fn lock_when_done(&self) -> BufGuard<'_, u32>;
         }
     }
 

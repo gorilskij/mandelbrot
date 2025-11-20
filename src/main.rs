@@ -68,7 +68,8 @@ fn main() {
 
     let mut drawer = Drawer::new(width, height, coords.clone(), iterations);
 
-    let mut dragging = None::<Point<FBig, Pixels>>;
+    let mut dragging = None; //None::<Point<FBig, Pixels>>;
+    let mut scrolling = false;
 
     while window.is_open() {
         let mut zoomed = false;
@@ -84,33 +85,28 @@ fn main() {
             let view_fbig = coords.view.cast(move |f| f.to_fbig());
 
             if window.get_mouse_down(MouseButton::Left) {
-                if dragging.is_none() {
-                    trace!("start dragging");
-                }
+                match &dragging {
+                    None => {
+                        trace!("start dragging");
+                        dragging = Some((coords.origin.clone(), cursor_rel.clone()));
+                    }
 
-                if let Some(last) = dragging {
-                    dragged = true;
-
-                    let drag = cursor_rel - &last;
-                    coords.origin -= &(&drag * &view_fbig);
-                    // coords.origin = (
-                    // &coords.origin.0 - &drag_px.0 * &view_bf_px2un,
-                    // &coords.origin.1 - &drag_px.1 * &view_bf_px2un,
-                    // );
+                    Some((start_origin, start_cursor_rel)) => {
+                        coords.origin =
+                            start_origin - &(&(cursor_rel - start_cursor_rel) * &view_fbig);
+                    }
                 }
-                dragging = Some(cursor_rel.clone());
             } else {
                 if dragging.is_some() {
                     trace!("stop dragging");
                     // perform an update on release
+                    dragging = None;
                     dragged = true;
                 }
 
-                dragging = None;
-
                 // scroll wheel is only read outside of dragging
                 if let Some((_, scroll_y)) = window.get_scroll_wheel() {
-                    zoomed = true;
+                    scrolling = true;
 
                     let cursor_abs = &coords.origin + &(cursor_rel * &view_fbig);
                     trace!(
@@ -126,11 +122,16 @@ fn main() {
                     // the zoom level is just the width of the screen in units
                     let width = Length::<_, Pixels>::new(width as f64) * coords.view;
                     info!("zoom level: 10^{}", -width.inner.log10());
+                } else if scrolling == true {
+                    // only update when we stop scrolling
+                    scrolling = false;
+                    zoomed = true;
                 }
             }
         }
 
         enum UpdateDrawer {
+            SoftOnly,
             AroundCursor,
             AroundCenter,
             No,
@@ -138,8 +139,12 @@ fn main() {
 
         let update_drawer = {
             if dragged || zoomed {
-                trace!("send update to drawer");
+                println!("FINISHED DRAG OR ZOOM");
                 UpdateDrawer::AroundCursor
+            } else if dragging.is_some() || scrolling {
+                // don't start redrawing while dragging or scrolling
+                println!("DRAGGING OR ZOOMING");
+                UpdateDrawer::SoftOnly
             } else if window.is_key_pressed(Key::Up, KeyRepeat::No) {
                 iterations *= 2;
                 info!("iterations: {iterations}");
@@ -213,6 +218,12 @@ fn main() {
         };
 
         match update_drawer {
+            UpdateDrawer::SoftOnly => {
+                drawer.soft_update(coords.clone());
+                // let cursor_rel_usize = cursor_rel.map(|p| p.cast(|f| *f as usize));
+                // drawer.update(coords.clone(), iterations, cursor_rel_usize.as_ref());
+                // drawer.update_display_buf();
+            }
             UpdateDrawer::AroundCursor => {
                 let cursor_rel_usize = cursor_rel.map(|p| p.cast(|f| *f as usize));
                 drawer.update(coords.clone(), iterations, cursor_rel_usize.as_ref());
@@ -225,6 +236,7 @@ fn main() {
         };
 
         drawer.update_display_buf();
+
         if drawer.try_cache_buf() {
             trace!("updated cache buffer");
         }

@@ -20,6 +20,12 @@ impl MaybePixel {
     }
 }
 
+impl Default for MaybePixel {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
 impl From<u32> for MaybePixel {
     // creates a `Some` pixel
     fn from(value: u32) -> Self {
