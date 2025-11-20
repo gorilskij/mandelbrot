@@ -2,18 +2,14 @@ pub mod maybe_pixel;
 mod renderer_thread;
 
 use crate::{
-    drawing::{maybe_pixel::MaybePixel, renderer_thread::BufGuard},
+    drawing::maybe_pixel::MaybePixel,
     rendering::{CoordinatesBox, Pixels, sample_zoomed},
     support::Point,
 };
 use delegate::delegate;
 use itertools::Itertools;
 use log::trace;
-use std::{
-    iter, mem,
-    ops::{Index, IndexMut},
-    slice, thread,
-};
+use std::{iter, mem, thread};
 
 type Buf<T> = Box<[T]>;
 
@@ -35,6 +31,15 @@ impl ZoomedBuf {
             coords,
             buf: new_buf(len),
             zoomed: new_buf(len),
+            hits: 0,
+        }
+    }
+
+    fn from_buf(src: Box<[MaybePixel]>, coords: CoordinatesBox) -> Self {
+        Self {
+            coords,
+            buf: src.clone(),
+            zoomed: src,
             hits: 0,
         }
     }
@@ -77,7 +82,7 @@ enum DisplayBufState {
     Fresh,
 }
 
-const MAX_NUM_PARTIAL_BUFS: usize = 1;
+const MAX_NUM_PARTIAL_BUFS: usize = 5;
 pub struct Drawer {
     width: usize,
     height: usize,
@@ -161,35 +166,32 @@ impl Drawer {
         trace!("drawer: sent update to renderer");
         println!("drawer: sent update to renderer");
 
-        // add a new partial buf
-        // let buf = self.renderer.cloned_buffer();
-        // let zoomed = new_buf(buf.len());
-        // self.partial_bufs.insert(
-        //     0,
-        //     ZoomedBuf {
-        //         coords: self.current_coords.clone(),
-        //         buf,
-        //         zoomed,
-        //         hits: 0,
-        //     },
-        // );
+        // remove the least used partial buf if the list is full
+        if self.partial_bufs.len() >= MAX_NUM_PARTIAL_BUFS {
+            println!(
+                "{:?}",
+                self.partial_bufs.iter().map(|pb| pb.hits).collect_vec()
+            );
 
-        // if self.partial_bufs.len() > MAX_NUM_PARTIAL_BUFS {
-        //     println!(
-        //         "{:?}",
-        //         self.partial_bufs.iter().map(|pb| pb.hits).collect_vec()
-        //     );
-        //     let i = self
-        //         .partial_bufs
-        //         .iter()
-        //         .enumerate()
-        //         .skip(1)
-        //         .min_by_key(|(_, pb)| pb.hits)
-        //         .unwrap()
-        //         .0;
-        //     println!("remove {i}");
-        //     self.partial_bufs.remove(i);
-        // }
+            // vec.iter().enumerate() is a DoubleEndedIterator because
+            // std::slice::Iter is ExactSizeIterator and DoubleEndedIterator
+            let i = self
+                .partial_bufs
+                .iter()
+                .enumerate()
+                .rev()
+                .min_by_key(|(_, pb)| pb.hits)
+                .unwrap()
+                .0;
+            println!("remove {i}");
+            self.partial_bufs.remove(i);
+        }
+
+        // add a new partial buf
+        self.partial_bufs.push(ZoomedBuf::from_buf(
+            self.renderer.cloned_buffer(),
+            self.current_coords.clone(),
+        ));
 
         self.resample(new_coords);
 
@@ -229,45 +231,48 @@ impl Drawer {
             return;
         }
 
-        println!("hard display update");
-
         let render_buf = self.renderer.concurrent_view();
 
         self.partial_bufs.iter_mut().for_each(|pb| pb.hits = 0);
 
-        if self.display_buf_state == DisplayBufState::Rendering {
-            for i in 0..self.display_buf.len() {
-                self.display_buf.set(
-                    i,
-                    // SAFETY: this won't interfere with generation,
-                    //   if a corrupted value is read, it will just be
-                    //   overwritten on the next iteration, no big deal
-                    iter::once(unsafe { render_buf.add(i).read() })
-                        .chain(self.partial_bufs.iter().map(|pb| pb.zoomed[i]))
-                        .chain(iter::once(self.cached_buf.zoomed[i]))
-                        .find_map(|mp| mp.get())
-                        // .map(|p| {
-                        //     // TODO: reimplement or remove hits
-                        //     // if let Some(j) = j {
-                        //     // self.partial_bufs[j].hits += 1;
-                        //     // }
-                        //     p
-                        // })
-                        .unwrap_or_default(),
-                );
+        match self.display_buf_state {
+            DisplayBufState::Rendering => {
+                for i in 0..self.display_buf.len() {
+                    self.display_buf.set(
+                        i,
+                        // SAFETY: this won't interfere with generation,
+                        //   if a corrupted value is read, it will just be
+                        //   overwritten on the next iteration, no big deal
+                        iter::once(unsafe { render_buf.add(i).read() })
+                            .chain(self.partial_bufs.iter().rev().map(|pb| pb.zoomed[i]))
+                            .chain(iter::once(self.cached_buf.zoomed[i]))
+                            .find_map(|mp| mp.get())
+                            // .map(|p| {
+                            //     // TODO: reimplement or remove hits
+                            //     // if let Some(j) = j {
+                            //     // self.partial_bufs[j].hits += 1;
+                            //     // }
+                            //     p
+                            // })
+                            .unwrap_or_default(),
+                    );
+                }
             }
-        } else {
-            for i in 0..self.display_buf.len() {
-                self.display_buf.set(
-                    i,
-                    self.partial_bufs
-                        .iter()
-                        .map(|pb| pb.zoomed[i])
-                        .chain(iter::once(self.cached_buf.zoomed[i]))
-                        .find_map(|mp| mp.get())
-                        .unwrap_or_default(),
-                );
+            DisplayBufState::Zooming => {
+                for i in 0..self.display_buf.len() {
+                    self.display_buf.set(
+                        i,
+                        self.partial_bufs
+                            .iter()
+                            .rev()
+                            .map(|pb| pb.zoomed[i])
+                            .chain(iter::once(self.cached_buf.zoomed[i]))
+                            .find_map(|mp| mp.get())
+                            .unwrap_or_default(),
+                    );
+                }
             }
+            DisplayBufState::Fresh => {}
         }
     }
 
