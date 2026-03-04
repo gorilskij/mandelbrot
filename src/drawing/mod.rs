@@ -82,7 +82,7 @@ enum DisplayBufState {
     Fresh,
 }
 
-const MAX_NUM_PARTIAL_BUFS: usize = 5;
+const MAX_NUM_PARTIAL_BUFS: usize = 20;
 pub struct Drawer {
     width: usize,
     height: usize,
@@ -159,39 +159,45 @@ impl Drawer {
         iterations: usize,
         cursor_rel: Option<&Point<usize, Pixels>>,
     ) {
+        // trace!("drawer: sent update to renderer");
+        // println!("drawer: sent update to renderer");
+
+        // if let Some(renderer_buf) = self.renderer.cloned_buffer() {
+        //     println!("yes renderer buf");
+
+        //     // remove the least used partial buf if the list is full
+        //     if self.partial_bufs.len() >= MAX_NUM_PARTIAL_BUFS {
+        //         println!(
+        //             "{:?}",
+        //             self.partial_bufs.iter().map(|pb| pb.hits).collect_vec()
+        //         );
+
+        //         // vec.iter().enumerate() is a DoubleEndedIterator because
+        //         // std::slice::Iter is ExactSizeIterator and DoubleEndedIterator
+        //         let i = self
+        //             .partial_bufs
+        //             .iter()
+        //             .enumerate()
+        //             .rev()
+        //             .min_by_key(|(_, pb)| pb.hits)
+        //             .unwrap()
+        //             .0;
+        //         println!("remove {i}");
+        //         self.partial_bufs.remove(i);
+        //     }
+
+        //     // add a new partial buf
+        //     self.partial_bufs.push(ZoomedBuf::from_buf(
+        //         renderer_buf,
+        //         self.current_coords.clone(),
+        //     ));
+        // } else {
+        //     println!("no renderer buf");
+        // }
+
         // relaunch renderer thread
         self.display_buf_state = DisplayBufState::Rendering;
         self.renderer.update(&new_coords, iterations, cursor_rel);
-
-        trace!("drawer: sent update to renderer");
-        println!("drawer: sent update to renderer");
-
-        // remove the least used partial buf if the list is full
-        if self.partial_bufs.len() >= MAX_NUM_PARTIAL_BUFS {
-            println!(
-                "{:?}",
-                self.partial_bufs.iter().map(|pb| pb.hits).collect_vec()
-            );
-
-            // vec.iter().enumerate() is a DoubleEndedIterator because
-            // std::slice::Iter is ExactSizeIterator and DoubleEndedIterator
-            let i = self
-                .partial_bufs
-                .iter()
-                .enumerate()
-                .rev()
-                .min_by_key(|(_, pb)| pb.hits)
-                .unwrap()
-                .0;
-            println!("remove {i}");
-            self.partial_bufs.remove(i);
-        }
-
-        // add a new partial buf
-        self.partial_bufs.push(ZoomedBuf::from_buf(
-            self.renderer.cloned_buffer(),
-            self.current_coords.clone(),
-        ));
 
         self.resample(new_coords);
 

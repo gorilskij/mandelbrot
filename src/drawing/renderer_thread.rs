@@ -6,6 +6,7 @@ use delegate::delegate;
 use parking_lot::{Mutex, MutexGuard};
 use rayon::ThreadPoolBuilder;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::{mem, thread};
 use waker_interrupter as wi;
@@ -13,7 +14,7 @@ use waker_interrupter as wi;
 pub type BufGuard<'a, T> = MutexGuard<'a, Box<[T]>>;
 
 pub mod render_buffer {
-    use std::slice;
+    use std::{cmp, slice};
 
     use crate::drawing::new_buf;
 
@@ -28,10 +29,18 @@ pub mod render_buffer {
         buffer: Buffer,
         len: usize,
         concurrent_view: *const MaybePixel,
+        submitted_render_id: Arc<AtomicUsize>,
+        running_render_id: Arc<AtomicUsize>,
     }
 
     impl RenderBuffer {
-        pub fn new(width: usize, height: usize) -> (Self, Done, Buffer) {
+        pub fn new(
+            width: usize,
+            height: usize,
+            submitted_render_id: Arc<AtomicUsize>,
+            running_render_id: Arc<AtomicUsize>,
+        ) -> (Self, Done, Buffer) {
+            // TODO: make atomic
             let done = Arc::new(Mutex::new(false));
 
             let len = width * height;
@@ -44,6 +53,8 @@ pub mod render_buffer {
                 buffer: buffer.clone(),
                 len,
                 concurrent_view,
+                submitted_render_id,
+                running_render_id,
             };
 
             (this, done, buffer)
@@ -83,11 +94,27 @@ pub mod render_buffer {
             self.concurrent_view
         }
 
-        pub fn cloned_buffer(&self) -> Box<[MaybePixel]> {
-            // // SAFETY: self.concurrent_view just points to the beginning of a slice
-            unsafe { slice::from_raw_parts(self.concurrent_view, self.len) }
-                .to_vec() // clone
-                .into_boxed_slice()
+        pub fn cloned_buffer(&self) -> Option<Box<[MaybePixel]>> {
+            use std::cmp::Ordering::*;
+            use std::sync::atomic::Ordering::*;
+
+            match self
+                .submitted_render_id
+                .load(Acquire)
+                .cmp(&self.running_render_id.load(Acquire))
+            {
+                Greater => None,
+                Equal => {
+                    // // SAFETY: self.concurrent_view just points to the beginning of a slice
+                    Some(
+                        unsafe { slice::from_raw_parts(self.concurrent_view, self.len) }
+                            .to_vec() // clone
+                            .into_boxed_slice(),
+                    )
+                }
+                Less => unreachable!(),
+            }
+
             // let mut buf = new_buf(self.len);
             // (0..self.len).for_each(|i| {
             //     buf[i] = unsafe { self.concurrent_view.offset(i as isize).read_volatile() }
@@ -97,30 +124,38 @@ pub mod render_buffer {
     }
 }
 
-pub type MessageTuple = (CoordinatesBox, usize, Option<Point<usize, Pixels>>);
+pub type RenderId = usize;
+pub type MessageTuple = (
+    RenderId,
+    CoordinatesBox,
+    usize,
+    Option<Point<usize, Pixels>>,
+);
 
 pub struct Handle {
     handle: thread::JoinHandle<()>,
     sender: wi::Sender<MessageTuple>,
     buffer: RenderBuffer,
+    submitted_render_id: Arc<AtomicUsize>,
 }
 
 impl Handle {
     pub fn update(
-        &self,
+        &mut self,
         coords: &CoordinatesBox,
         iterations: usize,
         cursor_rel: Option<&Point<usize, Pixels>>,
     ) {
+        let render_id = self.submitted_render_id.fetch_add(1, Ordering::AcqRel);
         self.sender
-            .send((coords.clone(), iterations, cursor_rel.cloned()));
+            .send((render_id, coords.clone(), iterations, cursor_rel.cloned()));
     }
 
     delegate! {
         to self.buffer {
             pub fn lock_if_done(&self) -> Option<BufGuard<'_, u32>>;
             pub fn concurrent_view(&self) -> *const MaybePixel;
-            pub fn cloned_buffer(&self) -> Box<[MaybePixel]>;
+            pub fn cloned_buffer(&self) -> Option<Box<[MaybePixel]>>;
             pub fn lock_when_done(&self) -> BufGuard<'_, u32>;
         }
     }
@@ -134,24 +169,33 @@ impl Handle {
 pub fn spawn(width: usize, height: usize) -> Handle {
     let (sender, receiver) = wi::channel();
 
-    let (buffer, done_clone, buf_clone) = RenderBuffer::new(width, height);
+    let submitted_render_id = Arc::new(AtomicUsize::new(0));
+    let running_render_id = Arc::new(AtomicUsize::new(0));
+    let (buffer, done_clone, buf_clone) = RenderBuffer::new(
+        width,
+        height,
+        submitted_render_id.clone(),
+        running_render_id.clone(),
+    );
 
     let tp = ThreadPoolBuilder::new().num_threads(12).build().unwrap();
 
+    let running_render_id_clone = running_render_id;
     let handle = thread::spawn(move || {
         receiver.run_multithreaded(
             None,
             None,
-            |(new_zoomed_coords, iterations, cursor_rel): (_, _, Option<_>), int| {
+            |(render_id, new_zoomed_coords, iterations, cursor_rel): (_, _, _, Option<_>), int| {
                 *done_clone.lock() = false;
 
-                let mut buf_lock = buf_clone.lock();
-
-                for pixel in buf_lock.iter_mut() {
-                    pixel.set_none()
-                }
-
                 let center = cursor_rel.unwrap_or(Point::<_, Pixels>::new(width / 2, height / 2));
+
+                let mut buf_lock = buf_clone.lock();
+                println!("start clearing");
+                buf_lock.iter_mut().for_each(|p| p.set_none());
+                println!("== done clearing ==");
+
+                running_render_id_clone.store(render_id, Ordering::Release);
 
                 render(
                     &mut buf_lock,
@@ -172,5 +216,6 @@ pub fn spawn(width: usize, height: usize) -> Handle {
         handle,
         sender,
         buffer,
+        submitted_render_id,
     }
 }

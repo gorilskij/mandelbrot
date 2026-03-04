@@ -12,7 +12,7 @@ impl MaybePixel {
     }
 
     pub fn set_none(&mut self) {
-        self.0 |= Self::FLAG_BIT
+        self.0 = Self::FLAG_BIT
     }
 
     pub fn get(self) -> Option<u32> {
