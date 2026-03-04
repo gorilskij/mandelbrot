@@ -324,16 +324,19 @@ struct BufView(*mut MaybePixel);
 unsafe impl Send for BufView {}
 unsafe impl Sync for BufView {}
 
+const CHUNK_SIDE_POW: usize = 6; // chunk side length = 2^CHUNK_SIDE_POW
+
 /// Split up a 2d plane into side*side chunks and sort them
 /// by distance from the center, the idea is to redraw the
-/// canvas in a circle emanating from the center to prioritize
-/// the most interesting parts
+/// canvas in a circle emanating from the center or cursor
+/// to prioritize the most interesting parts
 fn chunks_2d(
     width: usize,
     height: usize,
     center: Point<usize, Pixels>,
-    side: usize,
 ) -> Vec<(Range<usize>, Range<usize>)> {
+    let side = 1 << CHUNK_SIDE_POW;
+
     let mut chunks: Vec<_> = (0..width)
         .step_by(side)
         .flat_map(move |x_start| {
@@ -352,6 +355,26 @@ fn chunks_2d(
         OrderedFloat(x_diff * x_diff + y_diff * y_diff)
     });
     chunks
+}
+
+fn chunk_order(x_range: Range<usize>, y_range: Range<usize>) -> Vec<(usize, usize)> {
+    let mut vec = Vec::with_capacity(x_range.len() * y_range.len());
+
+    let local_x_range = x_range.clone().step_by(1 << (CHUNK_SIDE_POW - 1));
+    let local_y_range = y_range.clone().step_by(1 << (CHUNK_SIDE_POW - 1));
+    vec.extend(iproduct!(local_x_range, local_y_range));
+
+    for side_pow in (1..CHUNK_SIDE_POW).rev() {
+        let local_x_range = (0..x_range.len()).step_by(1 << (side_pow - 1));
+        let local_y_range = (0..y_range.len()).step_by(1 << (side_pow - 1));
+
+        vec.extend(
+            iproduct!(local_x_range, local_y_range)
+                .filter(|(x, y)| x % (1 << side_pow) != 0 || y % (1 << side_pow) != 0)
+                .map(|(x, y)| (x + x_range.start, y + y_range.start)),
+        );
+    }
+    vec
 }
 
 // calculate divergence time from the delta of a reference orbit, if the
@@ -467,8 +490,7 @@ pub fn render(
         list
     };
 
-    let side = 20;
-    let chunks = chunks_2d(width, height, center, side);
+    let chunks = chunks_2d(width, height, center);
 
     let pbar = &ProgressBar::new(chunks.len() as u64);
     let int = &int;
@@ -496,21 +518,26 @@ pub fn render(
                     let x_inner_range = x_range.start + 1..x_range.end - 1;
                     let y_inner_range = y_range.start + 1..y_range.end - 1;
 
-                    let mut outer_perimeter = x_range
-                        .clone()
-                        .map(|c| (c, y_range.start)) // top edge
-                        .chain(x_range.clone().map(|c| (c, y_range.end - 1))) // bottom edge
-                        .chain(y_inner_range.clone().map(|r| (x_range.start, r))) // left edge excluding top and bottom pixel
-                        .chain(y_inner_range.clone().map(|r| (x_range.end - 1, r))); // right edge excluding top and bottom pixel
+                    // render the top-left pixel
+                    let first_pixel = render_pixel(
+                        x_range.start,
+                        y_range.start,
+                        width,
+                        view,
+                        origin,
+                        iterations,
+                        buf_view,
+                        ref_orbits,
+                    );
 
-                    // check if first pixel is black
-                    let first_pixel = {
-                        let (c, r) = outer_perimeter.next().unwrap();
-                        render_pixel(c, r, width, view, origin, iterations, buf_view, ref_orbits)
-                    };
-
+                    // if the top-left pixel is black, check if the whole perimeter of the chunk is black
                     if first_pixel.is_none() {
-                        // check the rest of the perimeter
+                        let outer_perimeter = (x_range.start + 1..x_range.end)
+                            .map(|c| (c, y_range.start)) // top edge excluding the first pixel
+                            .chain(x_range.clone().map(|c| (c, y_range.end - 1))) // bottom edge
+                            .chain(y_inner_range.clone().map(|r| (x_range.start, r))) // left edge excluding top and bottom pixel
+                            .chain(y_inner_range.clone().map(|r| (x_range.end - 1, r))); // right edge excluding top and bottom pixel
+
                         let all_black = outer_perimeter.fold(true, |all_black, (c, r)| {
                             let val = render_pixel(
                                 c, r, width, view, origin, iterations, buf_view, ref_orbits,
@@ -518,16 +545,9 @@ pub fn render(
                             all_black && val.is_none()
                         });
 
-                        let mut inner_pixels =
-                            iproduct!(x_inner_range, y_inner_range).collect_vec();
-                        inner_pixels.sort_unstable_by_key(|(c, r)| {
-                            let x_diff = c.abs_diff(center.x) as f64;
-                            let y_diff = r.abs_diff(center.y) as f64;
-                            OrderedFloat(x_diff * x_diff + y_diff * y_diff)
-                        });
-
+                        // if the perimeter is all black, assume the rest of the chunk is black
                         if all_black {
-                            inner_pixels.into_iter().for_each(|(c, r)| {
+                            iproduct!(x_inner_range, y_inner_range).for_each(|(c, r)| {
                                 // SAFETY: all writes are disjoint
                                 unsafe {
                                     buf_view.0.add(r * width + c).write(0.into());
@@ -538,27 +558,44 @@ pub fn render(
                                     //     .write(rgb_to_u32(255, 255, 255).into());
                                 }
                             });
-                        } else {
-                            inner_pixels.into_iter().for_each(|(c, r)| {
+                        }
+                        // if the perimeter is not all-black, render the rest of the chunk
+                        else {
+                            let out = chunk_order(x_inner_range.clone(), y_inner_range.clone());
+                            assert_eq!(
+                                out.len(),
+                                x_inner_range.len() * y_inner_range.len(),
+                                "{:?}\n{:?}",
+                                x_inner_range,
+                                y_inner_range
+                            );
+
+                            out.into_iter().for_each(|(c, r)| {
                                 render_pixel(
                                     c, r, width, view, origin, iterations, buf_view, ref_orbits,
                                 );
                             });
-                        }
-                    } else {
-                        // fill in the rest of the square (skip the first pixel)
-                        let mut block = iproduct!(x_range, y_range).skip(1).collect_vec();
-                        block.sort_unstable_by_key(|(c, r)| {
-                            let x_diff = c.abs_diff(center.x) as f64;
-                            let y_diff = r.abs_diff(center.y) as f64;
-                            OrderedFloat(x_diff * x_diff + y_diff * y_diff)
-                        });
 
-                        block.into_iter().for_each(|(c, r)| {
-                            render_pixel(
-                                c, r, width, view, origin, iterations, buf_view, ref_orbits,
-                            );
-                        });
+                            // DEBUG
+                            // chunk_order(x_range, y_range)
+                            //     .into_iter()
+                            //     .for_each(|(c, r)| {
+                            //         render_pixel(
+                            //             c, r, width, view, origin, iterations, buf_view, ref_orbits,
+                            //         );
+                            //     });
+                        }
+                    }
+                    // if the top-left pixel is not black, render the rest of the chunk
+                    else {
+                        chunk_order(x_range, y_range)
+                            .into_iter()
+                            .skip(1)
+                            .for_each(|(c, r)| {
+                                render_pixel(
+                                    c, r, width, view, origin, iterations, buf_view, ref_orbits,
+                                );
+                            });
                     }
 
                     pbar.inc(1);
