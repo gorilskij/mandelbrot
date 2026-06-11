@@ -83,6 +83,18 @@ pub fn floor_div2(i: &IBig) -> IBig {
     }
 }
 
+/// floor(i / 2^pow)
+pub fn floor_div_pow2(i: &IBig, pow: usize) -> IBig {
+    let d = IBig::from(1u64 << pow);
+    let q = i / &d;
+    // `/` truncates towards zero; fix up for negatives
+    if &(&q * &d) > i {
+        q - IBig::from(1)
+    } else {
+        q
+    }
+}
+
 /// index of the tile containing `coord` at `depth`
 ///
 /// NOTE: `coord` must carry enough precision to resolve the tile grid at

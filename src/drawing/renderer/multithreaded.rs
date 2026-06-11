@@ -1,6 +1,6 @@
 use crate::rendering::{CoordinatesBox, Pixels};
 use crate::support::Point;
-use crate::tiles::render::{RefCache, run_generation};
+use crate::tiles::render::{GroupCache, run_generation};
 use crate::tiles::store::TileStore;
 use parking_lot::Mutex;
 use rayon::ThreadPoolBuilder;
@@ -41,14 +41,13 @@ pub fn spawn(width: usize, height: usize, store: Arc<TileStore>) -> Handle {
     let tp = ThreadPoolBuilder::new().num_threads(12).build().unwrap();
 
     let handle = thread::spawn(move || {
-        // memoized per-tile reference orbits; persists across generations
-        // (references are a pure function of the tile) and is dropped only
-        // when the iteration count changes
-        let ref_cache = Mutex::new(RefCache::new());
+        // memoized per-group shared reference lists; persists across
+        // generations and is dropped only when the iteration count changes
+        let group_cache = Mutex::new(GroupCache::new());
 
         receiver.run_multithreaded(None, None, |(coords, iterations, cursor): Message, int| {
             run_generation(
-                &store, &ref_cache, width, height, &coords, iterations, cursor, int, &tp,
+                &store, &group_cache, width, height, &coords, iterations, cursor, int, &tp,
             );
         });
     });
