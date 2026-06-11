@@ -1,5 +1,5 @@
 use crate::drawing::maybe_pixel::MaybePixel;
-use crate::support::{Point, Scale, ToFBig};
+use crate::support::{Point, Scale};
 use dashu::float::{DBig, FBig};
 use hsl::HSL;
 use itertools::Itertools;
@@ -64,7 +64,7 @@ impl FromStr for CoordinatesBox {
 
 fn is_bad_value(v: &Complex<FBig>) -> bool {
     // implicitly also checks that neither is NaN
-    let k = 100_000.0.to_fbig();
+    let k: FBig = FBig::try_from(100_000.0).unwrap();
     !(-&k <= v.re && v.re <= k && -&k <= v.im && v.im <= k)
 }
 

@@ -375,13 +375,13 @@ mod tests {
 
     #[test]
     fn test_tile_index_and_origin() {
-        use crate::support::ToFBig;
+        let f = |x: f64| -> FBig { FBig::try_from(x).unwrap() };
         // depth 0 tile spans 4 units, tile 0 covers [0, 4)
-        assert_eq!(tile_index(&3.9.to_fbig(), 0), IBig::from(0));
-        assert_eq!(tile_index(&4.0.to_fbig(), 0), IBig::from(1));
-        assert_eq!(tile_index(&(-0.1).to_fbig(), 0), IBig::from(-1));
+        assert_eq!(tile_index(&f(3.9), 0), IBig::from(0));
+        assert_eq!(tile_index(&f(4.0), 0), IBig::from(1));
+        assert_eq!(tile_index(&f(-0.1), 0), IBig::from(-1));
         // depth 5 tile spans 4/32 = 0.125 units
-        assert_eq!(tile_index(&0.25.to_fbig(), 5), IBig::from(2));
+        assert_eq!(tile_index(&f(0.25), 5), IBig::from(2));
 
         let key = TileKey {
             depth: 5,

@@ -97,10 +97,10 @@ fn main() {
         let cursor_rel = window
             .get_mouse_pos(MouseMode::Discard)
             .map(|(x, y)| Point::<_, Pixels>::new(x, y));
-        let cursor_rel_fbig = cursor_rel.map(|p| p.cast(|f| f.to_fbig()));
+        let cursor_rel_fbig = cursor_rel.map(|p| p.cast(|f| -> FBig { FBig::try_from(*f).unwrap() }));
 
         if let Some(cursor_rel) = &cursor_rel_fbig {
-            let view_fbig = coords.view.cast(move |f| f.to_fbig());
+            let view_fbig = coords.view.cast(move |f| -> FBig { FBig::try_from(*f).unwrap() });
 
             if window.get_mouse_down(MouseButton::Left) {
                 match &dragging {
@@ -126,16 +126,26 @@ fn main() {
                 if let Some((_, scroll_y)) = window.get_scroll_wheel() {
                     scrolling = true;
 
-                    let cursor_abs = &coords.origin + &(cursor_rel * &view_fbig);
-                    trace!(
-                        "zoomed at {:?} (abs)",
-                        cursor_abs.cast(|f| f.to_f64().value())
-                    );
                     let multiplier = 1.0 + (scroll_y as f64 / 100.0).clamp(-0.2, 0.2);
+                    let old_view = coords.view.inner;
+                    let new_view = old_view / multiplier;
 
-                    coords.origin =
-                        &cursor_abs + &(&(&coords.origin - &cursor_abs) / &multiplier.to_fbig());
-                    coords.view = View::new(coords.view.inner / multiplier);
+                    // Lock the zoom onto the point under the cursor: hold
+                    // `origin + cursor*view` exactly invariant. The cursor
+                    // offset is converted f64 -> FBig *exactly* (mantissa
+                    // decode, not a lossy decimal round-trip) and there's no
+                    // division, so repeated zoom in/out doesn't drift —
+                    // new_origin = (origin + cursor*old_view) - cursor*new_view
+                    let cx = cursor_rel.x.to_f64().value();
+                    let cy = cursor_rel.y.to_f64().value();
+                    let exact = |f: f64| -> FBig { FBig::try_from(f).unwrap() };
+                    coords.origin.x =
+                        &(&coords.origin.x + &exact(cx * old_view)) - &exact(cx * new_view);
+                    coords.origin.y =
+                        &(&coords.origin.y + &exact(cy * old_view)) - &exact(cy * new_view);
+                    coords.view = View::new(new_view);
+
+                    trace!("zoomed (cursor-locked)");
 
                     // the zoom level is just the width of the screen in units
                     let width = Length::<_, Pixels>::new(width as f64) * coords.view;
