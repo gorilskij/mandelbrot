@@ -1,7 +1,8 @@
 use crate::rendering::{CoordinatesBox, Pixels};
 use crate::support::Point;
-use crate::tiles::render::{OrbitPool, run_generation};
+use crate::tiles::render::{RefCache, run_generation};
 use crate::tiles::store::TileStore;
+use parking_lot::Mutex;
 use rayon::ThreadPoolBuilder;
 use std::sync::Arc;
 use std::thread;
@@ -40,14 +41,14 @@ pub fn spawn(width: usize, height: usize, store: Arc<TileStore>) -> Handle {
     let tp = ThreadPoolBuilder::new().num_threads(12).build().unwrap();
 
     let handle = thread::spawn(move || {
-        // the orbit pool persists across render generations and is rebuilt
-        // only when the viewport strays too far from its anchor (or the
-        // iteration count changes)
-        let mut pool: Option<OrbitPool> = None;
+        // memoized per-tile reference orbits; persists across generations
+        // (references are a pure function of the tile) and is dropped only
+        // when the iteration count changes
+        let ref_cache = Mutex::new(RefCache::new());
 
         receiver.run_multithreaded(None, None, |(coords, iterations, cursor): Message, int| {
             run_generation(
-                &store, &mut pool, width, height, &coords, iterations, cursor, int, &tp,
+                &store, &ref_cache, width, height, &coords, iterations, cursor, int, &tp,
             );
         });
     });

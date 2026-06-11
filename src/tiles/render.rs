@@ -1,14 +1,26 @@
 //! Tile rendering: progressive coarse-to-fine refinement of the tiles
-//! visible in the current viewport, using perturbation theory against a
-//! shared pool of reference orbits.
+//! visible in the current viewport, using perturbation theory.
+//!
+//! Each tile owns its own reference-orbit list (the original algorithm,
+//! scoped to a tile instead of shared globally). The list starts with the
+//! orbit of the tile center and grows as pixels that can't be tracked
+//! against an existing reference promote their own orbit into it — so a
+//! single expensive (e.g. long, non-diverging) orbit computed once is reused
+//! by every other pixel in the tile, instead of being recomputed per pixel.
+//!
+//! Because each tile is rendered start-to-finish by a single worker (one
+//! tile per pass goes to one thread, and passes run sequentially behind a
+//! barrier), the list is only ever touched by one thread at a time. The
+//! promotion order is therefore fixed and rendering is deterministic: a given
+//! tile (at a given iteration count) always renders to exactly the same
+//! pixels, which is what keeps the image stable when zooming back and forth.
 
 use crate::rendering::{
     CoordinatesBox, Orbit, Pixels, calculate_orbit, check_divergence_delta, check_orbit,
     val_to_color,
 };
-use crate::support::ToFBig;
-use crate::support::append_only::List as AOList;
 use crate::support::Point;
+use crate::support::append_only::List as AOList;
 use crate::tiles::store::{
     NUM_PASSES, PASS_STRIDES, TILE_SIZE, Tile, TileKey, TileStore, depth_for_view, tile_index,
     units_per_pixel, units_per_pixel_fbig,
@@ -16,108 +28,103 @@ use crate::tiles::store::{
 use dashu::float::FBig;
 use dashu::integer::IBig;
 use itertools::iproduct;
-use log::{info, trace};
+use log::info;
 use num::Complex;
 use ordered_float::OrderedFloat;
+use parking_lot::Mutex;
 use rayon::ThreadPool;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-#[cfg(debug_assertions)]
-use std::sync::atomic::AtomicUsize;
-#[cfg(debug_assertions)]
-use std::sync::atomic::Ordering;
 use waker_interrupter::MultiInterrupter;
 
-/// How far (in current-view screen pixels) the viewport center may drift from
-/// the orbit pool's anchor before the pool is rebuilt. Deltas are f64; with
-/// ~16 significant digits, 1e7 pixels of drift still leaves plenty of
-/// precision per pixel.
-const MAX_ANCHOR_DISTANCE_PX: f64 = 1e7;
+/// the pixel coordinate the tile's first reference orbit is computed at
+/// (tile center); deltas are measured from here, so they stay small
+const REF_PIXEL: f64 = (TILE_SIZE / 2) as f64;
+
+/// drop the memoized reference lists once the cache grows past this many
+/// tiles, to keep memory bounded
+const REF_CACHE_CAP: usize = 2048;
 
 struct RefOrbit {
-    /// delta of this orbit's base point from the pool anchor
+    /// this reference's base point, as a delta from the tile center
     delta_corr: Complex<f64>,
     orbit: Orbit<f64>,
-    #[cfg(debug_assertions)]
-    hits: AtomicUsize,
 }
 
-/// A pool of reference orbits shared by all tiles. Deltas are measured from
-/// `anchor`. Orbits are appended as rendering discovers points whose deltas
-/// can't be tracked with the existing references (same condition as before:
-/// `check_divergence_delta` fails because the reference escaped too early);
-/// an orbit computed for a pixel in one tile is freely reused by other tiles.
-pub struct OrbitPool {
-    anchor: Complex<FBig>,
+/// Memoizes one reference-orbit list per tile. The list is a pure function of
+/// the tile (same center orbit, same deterministic promotion order), so
+/// memoizing it is a speed-up that also keeps the chosen references stable
+/// across re-renders. The whole cache is dropped when the iteration count
+/// changes.
+pub struct RefCache {
     iterations: usize,
-    orbits: AOList<RefOrbit>,
+    map: HashMap<TileKey, AOList<RefOrbit>>,
 }
 
-impl OrbitPool {
-    fn new(anchor: Complex<FBig>, iterations: usize) -> Self {
-        let (_, orbit_f64) = calculate_orbit(anchor.clone(), iterations);
-        let orbits = AOList::new();
-        orbits.push_front(RefOrbit {
-            delta_corr: Complex::ZERO,
-            orbit: orbit_f64,
-            #[cfg(debug_assertions)]
-            hits: Default::default(),
-        });
+impl RefCache {
+    pub fn new() -> Self {
         Self {
-            anchor,
-            iterations,
-            orbits,
+            iterations: 0,
+            map: HashMap::new(),
         }
     }
 }
 
-/// Reuse the existing orbit pool if it still fits the viewport (same
-/// iteration count, anchor close enough for f64 deltas), otherwise rebuild
-/// it anchored at the viewport center.
-fn ensure_pool(
-    pool: &mut Option<OrbitPool>,
-    coords: &CoordinatesBox,
-    width: usize,
-    height: usize,
-    iterations: usize,
-) {
-    let view = coords.view.inner;
-    let center = Complex {
-        re: &coords.origin.x + &(width as f64 / 2.0 * view).to_fbig(),
-        im: &coords.origin.y + &(height as f64 / 2.0 * view).to_fbig(),
-    };
-
-    if let Some(p) = pool {
-        if p.iterations == iterations {
-            let dx = (&p.anchor.re - &center.re).to_f64().value() / view;
-            let dy = (&p.anchor.im - &center.im).to_f64().value() / view;
-            if dx.hypot(dy) < MAX_ANCHOR_DISTANCE_PX {
-                trace!("reusing orbit pool");
-                return;
+/// Get (or create and memoize) a tile's reference list, seeded with the orbit
+/// of the tile center computed at full precision.
+fn tile_ref_list(cache: &Mutex<RefCache>, key: &TileKey, iterations: usize) -> AOList<RefOrbit> {
+    {
+        let c = cache.lock();
+        if c.iterations == iterations {
+            if let Some(list) = c.map.get(key) {
+                return list.clone();
             }
         }
     }
 
-    trace!("rebuilding orbit pool");
-    *pool = Some(OrbitPool::new(center, iterations));
+    // compute the center orbit outside the lock (the expensive part)
+    let upp = units_per_pixel_fbig(key.depth);
+    let origin = key.origin();
+    let ref_offset = FBig::from_parts(IBig::from(REF_PIXEL as i64), 0) * &upp;
+    let center = Complex {
+        re: &origin.x + &ref_offset,
+        im: &origin.y + &ref_offset,
+    };
+    let (_, orbit) = calculate_orbit(center, iterations);
+
+    let list = AOList::new();
+    list.push_front(RefOrbit {
+        delta_corr: Complex::ZERO,
+        orbit,
+    });
+
+    let mut c = cache.lock();
+    if c.iterations != iterations {
+        c.iterations = iterations;
+        c.map.clear();
+    }
+    if c.map.len() >= REF_CACHE_CAP {
+        c.map.clear();
+    }
+    c.map.entry(key.clone()).or_insert(list).clone()
 }
 
 /// Everything fixed about a tile for the duration of a render pass.
 struct TileCtx<'a> {
     tile: &'a Tile,
-    /// tile origin - pool anchor, in units (f64 is fine: it's small)
-    base_delta: Complex<f64>,
+    refs: &'a AOList<RefOrbit>,
     /// units per tile pixel
     upp: f64,
     /// exact tile origin and units per pixel, for computing fresh reference
-    /// orbits at full precision
+    /// orbits at full precision when a pixel promotes its own orbit
     origin: Point<FBig, crate::rendering::Units>,
     upp_fbig: FBig,
 }
 
 /// Render one pixel of a tile (or skip it if a previous, interrupted run
 /// already computed it). Returns whether the pixel is black (non-divergent).
-fn render_pixel(ctx: &TileCtx, c: usize, r: usize, iterations: usize, pool: &OrbitPool) -> bool {
+fn render_pixel(ctx: &TileCtx, c: usize, r: usize, iterations: usize) -> bool {
     let idx = r * TILE_SIZE + c;
 
     if let Some(raw) = ctx.tile.load(idx).get() {
@@ -125,43 +132,36 @@ fn render_pixel(ctx: &TileCtx, c: usize, r: usize, iterations: usize, pool: &Orb
         return raw == 0;
     }
 
-    let delta = ctx.base_delta
-        + Complex {
-            re: c as f64 * ctx.upp,
-            im: r as f64 * ctx.upp,
-        };
+    // delta of this pixel from the tile center (the first reference's base
+    // point); small and bounded (< ~90 px * upp), so f64 perturbation is
+    // accurate
+    let delta = Complex {
+        re: (c as f64 - REF_PIXEL) * ctx.upp,
+        im: (r as f64 - REF_PIXEL) * ctx.upp,
+    };
 
-    let val: Option<NonZeroUsize> = pool
-        .orbits
+    let val: Option<NonZeroUsize> = ctx
+        .refs
         .iter()
         .find_map(|ref_orbit| {
-            let out = check_divergence_delta(&ref_orbit.orbit, delta - ref_orbit.delta_corr).ok();
-
-            #[cfg(debug_assertions)]
-            if out.is_some() {
-                ref_orbit.hits.fetch_add(1, Ordering::Relaxed);
-            }
-
-            out
+            check_divergence_delta(&ref_orbit.orbit, delta - ref_orbit.delta_corr).ok()
         })
         .unwrap_or_else(|| {
-            // no usable reference orbit: compute this point's own orbit at
-            // full precision and add it to the pool as a new reference
+            // no usable reference: compute this pixel's own orbit at full
+            // precision and add it to the list so later pixels reuse it
+            // (this is what stops a short reference + many long orbits from
+            // recomputing a full orbit per pixel)
             let x_0 = Complex {
-                re: &ctx.origin.x + &(FBig::from_parts(IBig::from(c), 0) * &ctx.upp_fbig),
-                im: &ctx.origin.y + &(FBig::from_parts(IBig::from(r), 0) * &ctx.upp_fbig),
+                re: &ctx.origin.x + &(FBig::from_parts(IBig::from(c as i64), 0) * &ctx.upp_fbig),
+                im: &ctx.origin.y + &(FBig::from_parts(IBig::from(r as i64), 0) * &ctx.upp_fbig),
             };
-
             let (_, new_orbit) = calculate_orbit(x_0, iterations);
-
-            // guaranteed to be Ok(_)
+            // guaranteed Ok(_): new_orbit is the true orbit of this point
             let val = check_orbit(&new_orbit).unwrap();
 
-            pool.orbits.push_front(RefOrbit {
+            ctx.refs.push_front(RefOrbit {
                 delta_corr: delta,
                 orbit: new_orbit,
-                #[cfg(debug_assertions)]
-                hits: Default::default(),
             });
 
             val
@@ -176,9 +176,9 @@ fn render_pixel(ctx: &TileCtx, c: usize, r: usize, iterations: usize, pool: &Orb
 /// skipped when the pass is retried).
 fn render_tile_pass(
     tile: &Tile,
+    refs: &AOList<RefOrbit>,
     pass: u8,
     iterations: usize,
-    pool: &OrbitPool,
     int: &MultiInterrupter,
 ) -> bool {
     let stride = PASS_STRIDES[pass as usize];
@@ -187,10 +187,7 @@ fn render_tile_pass(
     let origin = tile.key.origin();
     let ctx = TileCtx {
         tile,
-        base_delta: Complex {
-            re: (&origin.x - &pool.anchor.re).to_f64().value(),
-            im: (&origin.y - &pool.anchor.im).to_f64().value(),
-        },
+        refs,
         upp: units_per_pixel(tile.key.depth),
         upp_fbig: units_per_pixel_fbig(tile.key.depth),
         origin,
@@ -208,7 +205,7 @@ fn render_tile_pass(
                     continue;
                 }
             }
-            all_black &= render_pixel(&ctx, c, r, iterations, pool);
+            all_black &= render_pixel(&ctx, c, r, iterations);
         }
     }
 
@@ -224,11 +221,11 @@ fn render_tile_pass(
             }
             if r == 0 || r == TILE_SIZE - 1 {
                 for c in 0..TILE_SIZE {
-                    perimeter_black &= render_pixel(&ctx, c, r, iterations, pool);
+                    perimeter_black &= render_pixel(&ctx, c, r, iterations);
                 }
             } else {
                 for c in [0, TILE_SIZE - 1] {
-                    perimeter_black &= render_pixel(&ctx, c, r, iterations, pool);
+                    perimeter_black &= render_pixel(&ctx, c, r, iterations);
                 }
             }
         }
@@ -255,7 +252,7 @@ fn render_tile_pass(
 /// when interrupted by a newer request.
 pub fn run_generation(
     store: &TileStore,
-    pool_slot: &mut Option<OrbitPool>,
+    ref_cache: &Mutex<RefCache>,
     width: usize,
     height: usize,
     coords: &CoordinatesBox,
@@ -270,13 +267,9 @@ pub fn run_generation(
 
     info!("render generation {generation}: depth {depth}, iterations {iterations}");
 
-    ensure_pool(pool_slot, coords, width, height, iterations);
-    let pool: &OrbitPool = pool_slot.as_ref().unwrap();
-
     // enumerate the tiles intersecting the viewport
     let x0 = tile_index(&coords.origin.x, depth);
     let y0 = tile_index(&coords.origin.y, depth);
-    // screen-space size of a tile and position of tile (x0, y0)
     let tile_px = TILE_SIZE as f64 * (units_per_pixel(depth) / view);
     let origin00 = TileKey {
         depth,
@@ -299,7 +292,8 @@ pub fn run_generation(
             y: &y0 + IBig::from(j),
         };
         let tile = store.get_or_insert(&key, iterations, generation);
-        tile.render_gen.store(generation, std::sync::atomic::Ordering::Relaxed);
+        tile.render_gen
+            .store(generation, std::sync::atomic::Ordering::Relaxed);
 
         if tile.iterations.load(std::sync::atomic::Ordering::Relaxed) != iterations {
             // cached contents were computed with a different iteration count
@@ -337,6 +331,7 @@ pub fn run_generation(
 
         let rx = &rx;
         let int = &int;
+        let ref_cache = &*ref_cache;
         tp.scope(|s| {
             for _ in 0..tp.current_num_threads() {
                 s.spawn(move |_| {
@@ -344,7 +339,8 @@ pub fn run_generation(
                         if int.interrupted() {
                             return;
                         }
-                        if render_tile_pass(&tile, pass, iterations, pool, int) {
+                        let refs = tile_ref_list(ref_cache, &tile.key, iterations);
+                        if render_tile_pass(&tile, &refs, pass, iterations, int) {
                             store.bump_progress();
                         }
                     }
@@ -354,16 +350,4 @@ pub fn run_generation(
     }
 
     store.bump_progress();
-
-    #[cfg(debug_assertions)]
-    {
-        println!("{:>10} {:>10}", "length", "hits");
-        for o in pool.orbits.iter() {
-            println!(
-                "{:>10} {:>10}",
-                o.orbit.orbit.len(),
-                o.hits.load(Ordering::Relaxed)
-            );
-        }
-    }
 }
