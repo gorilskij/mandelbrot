@@ -1,6 +1,7 @@
 mod drawing;
 mod rendering;
 mod support;
+mod tiles;
 
 use std::{borrow::Cow, fmt::Display, str::FromStr};
 
@@ -217,12 +218,26 @@ fn main() {
             }
         };
 
+        // keep the origin's precision comfortably above what the current
+        // zoom depth needs (tile indexing at depth d needs ~d bits to
+        // resolve the tile grid, plus a margin)
+        let needed_bits = (96.0 - coords.view.inner.log2().min(0.0)) as usize;
+        if coords.origin.x.precision() < needed_bits
+            || coords.origin.y.precision() < needed_bits
+        {
+            // raise (never lower) each component's precision
+            coords.origin = coords.origin.cast(|f| {
+                if f.precision() < needed_bits {
+                    f.clone().with_precision(needed_bits).value()
+                } else {
+                    f.clone()
+                }
+            });
+        }
+
         match update_drawer {
             UpdateDrawer::SoftOnly => {
                 drawer.soft_update(coords.clone());
-                // let cursor_rel_usize = cursor_rel.map(|p| p.cast(|f| *f as usize));
-                // drawer.update(coords.clone(), iterations, cursor_rel_usize.as_ref());
-                // drawer.update_display_buf();
             }
             UpdateDrawer::AroundCursor => {
                 let cursor_rel_usize = cursor_rel.map(|p| p.cast(|f| *f as usize));
@@ -236,10 +251,6 @@ fn main() {
         };
 
         drawer.update_display_buf();
-
-        if drawer.try_cache_buf() {
-            trace!("updated cache buffer");
-        }
 
         window
             .update_with_buffer(drawer.display_buf(), width, height)
