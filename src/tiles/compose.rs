@@ -98,25 +98,35 @@ fn compose_tile(
         return;
     }
 
-    // 1-2. the tile itself, or the nearest ancestor with any data
+    // 1-2. the tile itself or an ancestor. Among everything available up the
+    // chain, pick the source with the finest *actual* sample spacing rather
+    // than blindly preferring the target tile: a freshly-started target tile
+    // that has only finished its coarse pass is lower resolution than a fully
+    // rendered parent upscaled 2x, and switching to it would make the image
+    // visibly "pop" (jump) at every depth boundary while zooming. The
+    // effective stride, measured in target-tile pixels, is the tile's
+    // completed stride times 2^(levels climbed); the smaller, the sharper.
+    // Ties favor the deeper (native) tile so we don't cling to ancestors.
     let mut candidate = key.clone();
     let mut candidate_rect = rect;
-    for _ in 0..=climb_budget {
+    let mut best: Option<(usize, Arc<Tile>, Rect)> = None;
+    let mut best_eff = f64::INFINITY;
+    for climb in 0..=climb_budget {
         if let Some(tile) = store.get(&candidate) {
             if let Some(stride) = tile.completed_stride() {
-                tile.touch(frame);
-                sample_tile_rect(
-                    &tile,
-                    stride,
-                    candidate_rect,
-                    (px_start, px_end),
-                    (py_start, py_end),
-                    width,
-                    out,
-                );
-                return;
+                let eff = stride as f64 * (1u64 << climb.min(52)) as f64;
+                if eff < best_eff {
+                    best_eff = eff;
+                    best = Some((stride, tile, candidate_rect));
+                }
             }
         }
+        // the finest possible source at the next level up has effective
+        // stride 2^(climb+1); if our best already matches that, stop climbing
+        if best_eff <= (1u64 << (climb + 1).min(52)) as f64 {
+            break;
+        }
+
         // grow the rect to the parent tile's screen-space square
         let (bx, by) = candidate.parent_offset();
         candidate_rect = Rect {
@@ -125,6 +135,20 @@ fn compose_tile(
             side: candidate_rect.side * 2.0,
         };
         candidate = candidate.parent();
+    }
+
+    if let Some((stride, tile, src_rect)) = best {
+        tile.touch(frame);
+        sample_tile_rect(
+            &tile,
+            stride,
+            src_rect,
+            (px_start, px_end),
+            (py_start, py_end),
+            width,
+            out,
+        );
+        return;
     }
 
     // 3. descendants (the preview available after zooming out)
