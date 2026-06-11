@@ -8,7 +8,9 @@ use std::{borrow::Cow, fmt::Display, str::FromStr};
 use crate::{
     drawing::Drawer,
     support::{Length, Point},
+    tiles::perturb::gpu::{Gpu, GpuState},
 };
+use std::sync::Arc;
 use clipboard::{ClipboardContext, ClipboardProvider};
 use dashu::float::FBig;
 use log::{info, trace, warn};
@@ -45,6 +47,8 @@ impl FromStr for ClipBoardData<'_> {
 fn main() {
     env_logger::init();
 
+    let gpu = Arc::new(Gpu(Arc::new(GpuState::new())));
+
     // let width = 1000;
     // let height = 600;
     let mut width = 1500;
@@ -76,7 +80,7 @@ fn main() {
 
     let mut iterations = 2048;
 
-    let mut drawer = Drawer::new(width, height, coords.clone(), iterations);
+    let mut drawer = Drawer::new(width, height, coords.clone(), iterations, gpu);
 
     let mut dragging = None; //None::<Point<FBig, Pixels>>;
     let mut scrolling = false;

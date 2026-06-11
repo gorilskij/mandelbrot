@@ -5,7 +5,7 @@ use crate::{
     drawing::renderer::multithreaded,
     rendering::{CoordinatesBox, Pixels},
     support::Point,
-    tiles::{compose::compose, store::MEMORY_BUDGET_BYTES, store::TileStore},
+    tiles::{compose::compose, perturb::Perturbator, store::MEMORY_BUDGET_BYTES, store::TileStore},
 };
 use std::{sync::Arc, thread};
 
@@ -28,9 +28,15 @@ pub struct Drawer {
 }
 
 impl Drawer {
-    pub fn new(width: usize, height: usize, coords: CoordinatesBox, iterations: usize) -> Self {
+    pub fn new(
+        width: usize,
+        height: usize,
+        coords: CoordinatesBox,
+        iterations: usize,
+        backend: Arc<dyn Perturbator + Send + Sync>,
+    ) -> Self {
         let store = Arc::new(TileStore::new(MEMORY_BUDGET_BYTES));
-        let renderer = multithreaded::spawn(store.clone());
+        let renderer = multithreaded::spawn(store.clone(), backend);
 
         let mut this = Self {
             width,

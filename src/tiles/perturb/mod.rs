@@ -5,7 +5,7 @@
 //! actual per-pixel perturbation evaluation is delegated to a `Perturbator`
 //! backend. There are two sister implementations, each a unit struct:
 //!   - [`cpu::Cpu`]  — f32 perturbation on the CPU (rayon).
-//!   - [`gpu::Gpu`]  — wgpu compute (step 2, not yet implemented).
+//!   - [`gpu::Gpu`]  — wgpu compute.
 //!
 //! Reference *base points* are always high-precision FBig and computed on the
 //! CPU (GPUs have no bignum); a backend only ever sees the projected `Pf`
@@ -33,7 +33,7 @@ pub type RefList = AOList<RefOrbit>;
 
 /// Evaluates a tile's progressive pass against a group's reference list.
 /// Implemented by the `cpu` and `gpu` sister modules.
-pub trait Perturbator {
+pub trait Perturbator: Sync {
     /// Render one progressive pass of `tile` against `refs`, promoting new
     /// references for pixels that no existing reference can resolve.
     /// `anchor_px` is the group anchor's pixel offset within the group (deltas

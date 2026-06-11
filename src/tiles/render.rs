@@ -11,7 +11,6 @@
 
 use crate::rendering::{CoordinatesBox, Pixels, calculate_orbit};
 use crate::support::Point;
-use crate::tiles::perturb::cpu::Cpu;
 use crate::tiles::perturb::{Perturbator, RefList, RefOrbit};
 use crate::tiles::store::{
     GROUP_POW, GROUP_TILES, NUM_PASSES, TILE_SIZE, Tile, TileKey, TileStore, depth_for_view,
@@ -27,10 +26,6 @@ use rayon::ThreadPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use waker_interrupter::MultiInterrupter;
-
-/// The perturbation backend in use. Swap to `perturb::gpu::Gpu` for the GPU
-/// path once it's implemented.
-const BACKEND: Cpu = Cpu;
 
 /// group side length in pixels (GROUP_TILES tiles * TILE_SIZE px)
 const GROUP_SIDE_PX: i64 = (GROUP_TILES * TILE_SIZE) as i64;
@@ -156,6 +151,7 @@ pub fn run_generation(
     cursor: Option<Point<usize, Pixels>>,
     int: MultiInterrupter,
     tp: &ThreadPool,
+    backend: &(dyn Perturbator + Send),
 ) {
     // TEST: spacebar requests a full reset — dump every tile and every group
     // reference list, so everything is recomputed with fresh references
@@ -235,7 +231,7 @@ pub fn run_generation(
                     continue;
                 }
                 let gref = group_list(group_cache, &group_of(&tile.key), iterations);
-                if BACKEND.render_tile_pass(tile, &gref.list, gref.anchor_px, pass, iterations, &int)
+                if backend.render_tile_pass(tile, &gref.list, gref.anchor_px, pass, iterations, &int)
                 {
                     store.bump_progress();
                 }
@@ -262,7 +258,7 @@ pub fn run_generation(
                             return;
                         }
                         let gref = group_list(group_cache, &group_of(&tile.key), iterations);
-                        if BACKEND.render_tile_pass(
+                        if backend.render_tile_pass(
                             &tile,
                             &gref.list,
                             gref.anchor_px,

@@ -1,5 +1,6 @@
 use crate::rendering::{CoordinatesBox, Pixels};
 use crate::support::Point;
+use crate::tiles::perturb::Perturbator;
 use crate::tiles::render::{GroupCache, run_generation};
 use crate::tiles::store::TileStore;
 use parking_lot::Mutex;
@@ -43,7 +44,10 @@ impl Handle {
     }
 }
 
-pub fn spawn(store: Arc<TileStore>) -> Handle {
+pub fn spawn(
+    store: Arc<TileStore>,
+    backend: Arc<dyn Perturbator + Send + Sync>,
+) -> Handle {
     let (sender, receiver) = wi::channel();
 
     let tp = ThreadPoolBuilder::new().num_threads(12).build().unwrap();
@@ -67,6 +71,7 @@ pub fn spawn(store: Arc<TileStore>) -> Handle {
                     cursor,
                     int,
                     &tp,
+                    backend.as_ref(),
                 );
             },
         );
