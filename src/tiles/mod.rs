@@ -4,5 +4,6 @@
 //! falling back to coarser (or finer) levels while rendering catches up.
 
 pub mod compose;
+pub mod perturb;
 pub mod render;
 pub mod store;

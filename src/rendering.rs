@@ -68,12 +68,17 @@ fn is_bad_value(v: &Complex<FBig>) -> bool {
     !(-&k <= v.re && v.re <= k && -&k <= v.im && v.im <= k)
 }
 
+/// Working float type for perturbation (reference projection + delta
+/// iteration). Set to f32 for GPU-precision testing; flip back to f64 to
+/// restore full CPU precision.
+pub type Pf = f32;
+
 pub struct Orbit<F> {
     pub is_full: bool,
     pub orbit: Box<[Complex<F>]>,
 }
 
-pub fn calculate_orbit(x_0: Complex<FBig>, iterations: usize) -> (Orbit<FBig>, Orbit<f64>) {
+pub fn calculate_orbit(x_0: Complex<FBig>, iterations: usize) -> (Orbit<FBig>, Orbit<Pf>) {
     let mut out = Vec::with_capacity(iterations + 1);
     let mut x_n = x_0.clone();
     out.push(x_n.clone());
@@ -87,11 +92,11 @@ pub fn calculate_orbit(x_0: Complex<FBig>, iterations: usize) -> (Orbit<FBig>, O
         out.push(x_n.clone());
     }
     let out = out.into_boxed_slice();
-    let out_f64 = out
+    let out_pf = out
         .iter()
         .map(|c| Complex {
-            re: c.re.to_f64().value(),
-            im: c.im.to_f64().value(),
+            re: c.re.to_f32().value(),
+            im: c.im.to_f32().value(),
         })
         .collect_vec()
         .into_boxed_slice();
@@ -102,12 +107,12 @@ pub fn calculate_orbit(x_0: Complex<FBig>, iterations: usize) -> (Orbit<FBig>, O
         },
         Orbit {
             is_full,
-            orbit: out_f64,
+            orbit: out_pf,
         },
     )
 }
 
-pub fn check_orbit(orbit: &Orbit<f64>) -> Result<Option<NonZeroUsize>, ()> {
+pub fn check_orbit(orbit: &Orbit<Pf>) -> Result<Option<NonZeroUsize>, ()> {
     for (i, x) in orbit.orbit.iter().enumerate() {
         if x.re * x.re + x.im * x.im > 4.0 {
             // this is always Some(...), i + 1 can't be 0
@@ -118,8 +123,8 @@ pub fn check_orbit(orbit: &Orbit<f64>) -> Result<Option<NonZeroUsize>, ()> {
 }
 
 pub fn check_divergence_delta(
-    ref_orbit_f64: &Orbit<f64>,
-    delta: Complex<f64>,
+    ref_orbit: &Orbit<Pf>,
+    delta: Complex<Pf>,
 ) -> Result<Option<NonZeroUsize>, ()> {
     // ref_orbit is [x_0, x_1, ...]
     // delta is delta_0
@@ -127,7 +132,7 @@ pub fn check_divergence_delta(
 
     let delta_0 = delta;
     let mut delta = delta;
-    for (i, &c) in ref_orbit_f64.orbit.iter().enumerate() {
+    for (i, &c) in ref_orbit.orbit.iter().enumerate() {
         let x = c + delta;
         if x.re * x.re + x.im * x.im > 4.0 {
             // this is always Some(...), i + 1 can't be 0
@@ -137,7 +142,7 @@ pub fn check_divergence_delta(
         delta = c * 2.0 * delta + delta * delta + delta_0;
     }
 
-    if ref_orbit_f64.is_full {
+    if ref_orbit.is_full {
         Ok(None)
     } else {
         Err(())
