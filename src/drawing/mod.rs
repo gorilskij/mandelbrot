@@ -70,6 +70,18 @@ impl Drawer {
         self.dirty = true;
     }
 
+    /// TEST: dump all tiles + reference lists and re-render from scratch
+    /// (with fresh random reference orbits). Bound to spacebar.
+    pub fn reset(
+        &mut self,
+        new_coords: CoordinatesBox,
+        iterations: usize,
+        cursor_rel: Option<&Point<usize, Pixels>>,
+    ) {
+        self.store.request_reset();
+        self.update(new_coords, iterations, cursor_rel);
+    }
+
     /// Recompose the display buffer if the view moved or rendering made
     /// progress since the last call.
     pub fn update_display_buf(&mut self) {

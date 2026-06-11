@@ -2,19 +2,12 @@
 //! visible in the current viewport, using perturbation theory.
 //!
 //! Tiles are bundled into large square *groups* (GROUP_TILES x GROUP_TILES
-//! tiles, i.e. screen-sized or larger). All tiles in a group share one
-//! reference-orbit list — the original whole-screen concurrent list, just
-//! keyed per group instead of per frame. The list is the lock-free
-//! append-only list, so the tiles of a group can render in parallel and
-//! promote new references into the shared list concurrently, exactly as the
-//! single-screen renderer did. A single reference covering a whole group is
-//! fine: the original used a single reference for the entire screen at any
-//! zoom, so the perturbation accuracy across a group is not a concern.
-//!
-//! Deltas are measured from the group's center (the anchor), in the same
-//! spirit as before; because a tile's offset within its group is a small
-//! integer, the per-pixel delta is computed in exact integer pixel units and
-//! only then scaled, so it stays precise at any zoom.
+//! tiles). All tiles in a group share one reference-orbit list — the original
+//! whole-screen concurrent (lock-free append-only) list, keyed per group. The
+//! group's seed reference is the FBig orbit of a point in the group (its
+//! center normally; a RANDOM point in TEST/spacebar mode, so different
+//! reference choices can be compared). Other pixels are tracked as f64 deltas
+//! against the list, promoting their own orbit when no reference fits.
 
 use crate::rendering::{
     CoordinatesBox, Orbit, Pixels, calculate_orbit, check_divergence_delta, check_orbit,
@@ -23,10 +16,9 @@ use crate::rendering::{
 use crate::support::Point;
 use crate::support::append_only::List as AOList;
 use crate::tiles::store::{
-    NUM_PASSES, PASS_STRIDES, TILE_SIZE, Tile, TileKey, TileStore, depth_for_view, floor_div_pow2,
-    tile_index, units_per_pixel, units_per_pixel_fbig,
+    GROUP_POW, GROUP_TILES, NUM_PASSES, PASS_STRIDES, TILE_SIZE, Tile, TileKey, TileStore,
+    depth_for_view, floor_div_pow2, pixel_to_coord, tile_index, units_per_pixel, working_precision,
 };
-use dashu::float::FBig;
 use dashu::integer::IBig;
 use itertools::iproduct;
 use log::info;
@@ -39,17 +31,20 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use waker_interrupter::MultiInterrupter;
 
-/// group side length, in tiles (2^GROUP_POW). 32 tiles => 4096 px per side,
-/// comfortably larger than a screen, so the screen usually falls in 1-4
-/// groups and only that many full-precision anchor orbits are computed.
-const GROUP_POW: usize = 5;
-const GROUP_TILES: usize = 1 << GROUP_POW;
-/// pixel offset of the group center (anchor) from the group's top-left
-const HALF_GROUP_PX: i64 = (GROUP_TILES * TILE_SIZE / 2) as i64;
+/// group side length in pixels (GROUP_TILES tiles * TILE_SIZE px)
+const GROUP_SIDE_PX: i64 = (GROUP_TILES * TILE_SIZE) as i64;
 
-/// drop the memoized group lists once the cache grows past this many groups,
-/// to keep memory bounded
+/// drop the memoized group lists once the cache grows past this many groups
 const GROUP_CACHE_CAP: usize = 256;
+
+/// TEST: when true, each group's seed reference is a random point in the
+/// group instead of its center (so pressing space re-rolls the references).
+const RANDOM_REFERENCE: bool = false;
+
+/// TEST: when true, render everything single-threaded in a fixed order
+/// (tiles in sorted order, pixels in loop order) so the shared group list
+/// grows in one deterministic sequence and output is reproducible.
+const DETERMINISTIC: bool = false;
 
 struct RefOrbit {
     /// this reference's base point, as a delta from the group anchor
@@ -57,8 +52,13 @@ struct RefOrbit {
     orbit: Orbit<f64>,
 }
 
-/// A group's shared reference list (the original lock-free concurrent list).
-type GroupList = AOList<RefOrbit>;
+/// A group's shared reference list plus its anchor (the pixel offset, within
+/// the group, that deltas are measured from — the seed reference's location).
+#[derive(Clone)]
+struct GroupRef {
+    list: AOList<RefOrbit>,
+    anchor_px: (i64, i64),
+}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct GroupKey {
@@ -75,11 +75,11 @@ fn group_of(key: &TileKey) -> GroupKey {
     }
 }
 
-/// Memoizes one shared list per group, seeded with the orbit of the group
-/// center (anchor). Dropped when the iteration count changes.
+/// Memoizes one shared list per group. Dropped when the iteration count
+/// changes or on an explicit reset (spacebar).
 pub struct GroupCache {
     iterations: usize,
-    map: HashMap<GroupKey, GroupList>,
+    map: HashMap<GroupKey, GroupRef>,
 }
 
 impl GroupCache {
@@ -89,40 +89,51 @@ impl GroupCache {
             map: HashMap::new(),
         }
     }
+
+    pub fn clear(&mut self) {
+        self.iterations = 0;
+        self.map.clear();
+    }
 }
 
 /// Get (or create and memoize) a group's shared reference list, seeded with
-/// the orbit of the group center computed at full precision.
-fn group_list(cache: &Mutex<GroupCache>, gkey: &GroupKey, iterations: usize) -> GroupList {
+/// the FBig orbit of the group's anchor point computed at full precision.
+fn group_list(cache: &Mutex<GroupCache>, gkey: &GroupKey, iterations: usize) -> GroupRef {
     {
         let c = cache.lock();
         if c.iterations == iterations {
-            if let Some(list) = c.map.get(gkey) {
-                return list.clone();
+            if let Some(gref) = c.map.get(gkey) {
+                return gref.clone();
             }
         }
     }
 
-    // compute the anchor (group center) orbit outside the lock
-    let upp = units_per_pixel_fbig(gkey.depth);
-    let group_origin = TileKey {
-        depth: gkey.depth,
-        x: &gkey.gx * IBig::from(GROUP_TILES as u64),
-        y: &gkey.gy * IBig::from(GROUP_TILES as u64),
-    }
-    .origin();
-    let half = FBig::from_parts(IBig::from(HALF_GROUP_PX), 0) * &upp;
+    // choose the anchor pixel offset within the group
+    let anchor_px = if RANDOM_REFERENCE {
+        let pick = || ((rand::random::<f64>() * GROUP_SIDE_PX as f64) as i64).clamp(0, GROUP_SIDE_PX - 1);
+        (pick(), pick())
+    } else {
+        (GROUP_SIDE_PX / 2, GROUP_SIDE_PX / 2)
+    };
+
+    // anchor absolute coordinate, built at high precision (see
+    // working_precision) so the reference orbit is actually accurate
+    let prec = working_precision(gkey.depth);
+    let group_px = IBig::from((GROUP_TILES * TILE_SIZE) as u64);
+    let anchor_global_x = &gkey.gx * &group_px + IBig::from(anchor_px.0);
+    let anchor_global_y = &gkey.gy * &group_px + IBig::from(anchor_px.1);
     let anchor = Complex {
-        re: &group_origin.x + &half,
-        im: &group_origin.y + &half,
+        re: pixel_to_coord(anchor_global_x, gkey.depth, prec),
+        im: pixel_to_coord(anchor_global_y, gkey.depth, prec),
     };
     let (_, orbit) = calculate_orbit(anchor, iterations);
 
-    let list: GroupList = AOList::new();
+    let list = AOList::new();
     list.push_front(RefOrbit {
         delta_corr: Complex::ZERO,
         orbit,
     });
+    let gref = GroupRef { list, anchor_px };
 
     let mut c = cache.lock();
     if c.iterations != iterations {
@@ -132,23 +143,26 @@ fn group_list(cache: &Mutex<GroupCache>, gkey: &GroupKey, iterations: usize) -> 
     if c.map.len() >= GROUP_CACHE_CAP {
         c.map.clear();
     }
-    c.map.entry(gkey.clone()).or_insert(list).clone()
+    c.map.entry(gkey.clone()).or_insert(gref).clone()
 }
 
 /// Everything fixed about a tile for the duration of a render pass.
 struct TileCtx<'a> {
     tile: &'a Tile,
-    refs: &'a GroupList,
+    refs: &'a AOList<RefOrbit>,
     /// units per tile pixel
     upp: f64,
     /// pixel offset of this tile's (0, 0) pixel from the group anchor, in the
     /// depth's exact integer pixel grid (small: |.| < group size)
     anchor_dx: i64,
     anchor_dy: i64,
-    /// exact tile origin and units per pixel, for computing fresh reference
-    /// orbits at full precision when a pixel promotes its own orbit
-    origin: Point<FBig, crate::rendering::Units>,
-    upp_fbig: FBig,
+    /// global pixel coordinate of this tile's (0, 0) pixel, and the depth /
+    /// precision, for building fresh reference orbits at high precision when a
+    /// pixel promotes its own orbit
+    tile_px0_x: IBig,
+    tile_px0_y: IBig,
+    depth: i64,
+    prec: usize,
 }
 
 /// Render one pixel of a tile (or skip it if a previous, interrupted run
@@ -176,12 +190,12 @@ fn render_pixel(ctx: &TileCtx, c: usize, r: usize, iterations: usize) -> bool {
             check_divergence_delta(&ref_orbit.orbit, delta - ref_orbit.delta_corr).ok()
         })
         .unwrap_or_else(|| {
-            // no usable reference: compute this pixel's own orbit at full
+            // no usable reference: compute this pixel's own orbit at high
             // precision and add it to the shared list so later pixels (in any
             // tile of the group) reuse it
             let x_0 = Complex {
-                re: &ctx.origin.x + &(FBig::from_parts(IBig::from(c as i64), 0) * &ctx.upp_fbig),
-                im: &ctx.origin.y + &(FBig::from_parts(IBig::from(r as i64), 0) * &ctx.upp_fbig),
+                re: pixel_to_coord(&ctx.tile_px0_x + IBig::from(c as u64), ctx.depth, ctx.prec),
+                im: pixel_to_coord(&ctx.tile_px0_y + IBig::from(r as u64), ctx.depth, ctx.prec),
             };
             let (_, new_orbit) = calculate_orbit(x_0, iterations);
             // guaranteed Ok(_): new_orbit is the true orbit of this point
@@ -204,7 +218,8 @@ fn render_pixel(ctx: &TileCtx, c: usize, r: usize, iterations: usize) -> bool {
 /// skipped when the pass is retried).
 fn render_tile_pass(
     tile: &Tile,
-    refs: &GroupList,
+    refs: &AOList<RefOrbit>,
+    anchor_px: (i64, i64),
     pass: u8,
     iterations: usize,
     int: &MultiInterrupter,
@@ -212,23 +227,25 @@ fn render_tile_pass(
     let stride = PASS_STRIDES[pass as usize];
     let coarser_stride = (pass > 0).then(|| PASS_STRIDES[pass as usize - 1]);
 
-    // tile offset within its group (small integer), and the pixel offset of
-    // this tile's origin from the group anchor
+    // tile offset within its group (small integer)
     let gkey = group_of(&tile.key);
     let local_x = i64::try_from(&(&tile.key.x - &gkey.gx * IBig::from(GROUP_TILES as u64)))
         .expect("tile-in-group offset fits i64");
     let local_y = i64::try_from(&(&tile.key.y - &gkey.gy * IBig::from(GROUP_TILES as u64)))
         .expect("tile-in-group offset fits i64");
 
-    let origin = tile.key.origin();
+    let depth = tile.key.depth;
+    let tile_size = IBig::from(TILE_SIZE as u64);
     let ctx = TileCtx {
         tile,
         refs,
-        upp: units_per_pixel(tile.key.depth),
-        anchor_dx: local_x * TILE_SIZE as i64 - HALF_GROUP_PX,
-        anchor_dy: local_y * TILE_SIZE as i64 - HALF_GROUP_PX,
-        upp_fbig: units_per_pixel_fbig(tile.key.depth),
-        origin,
+        upp: units_per_pixel(depth),
+        anchor_dx: local_x * TILE_SIZE as i64 - anchor_px.0,
+        anchor_dy: local_y * TILE_SIZE as i64 - anchor_px.1,
+        tile_px0_x: &tile.key.x * &tile_size,
+        tile_px0_y: &tile.key.y * &tile_size,
+        depth,
+        prec: working_precision(depth),
     };
 
     let mut all_black = true;
@@ -299,6 +316,14 @@ pub fn run_generation(
     int: MultiInterrupter,
     tp: &ThreadPool,
 ) {
+    // TEST: spacebar requests a full reset — dump every tile and every group
+    // reference list, so everything is recomputed with fresh random references
+    if store.take_reset() {
+        store.clear();
+        group_cache.lock().clear();
+        info!("reset: dumped all tiles and reference lists");
+    }
+
     let generation = store.begin_generation();
     let view = coords.view.inner;
     let depth = depth_for_view(view);
@@ -359,6 +384,23 @@ pub fn run_generation(
             return;
         }
 
+        if DETERMINISTIC {
+            // TEST: single-threaded, fixed order — fully reproducible
+            for (_, tile) in tiles.iter() {
+                if int.interrupted() {
+                    return;
+                }
+                if tile.passes_done() > pass {
+                    continue;
+                }
+                let gref = group_list(group_cache, &group_of(&tile.key), iterations);
+                if render_tile_pass(tile, &gref.list, gref.anchor_px, pass, iterations, &int) {
+                    store.bump_progress();
+                }
+            }
+            continue;
+        }
+
         let (tx, rx) = crossbeam_channel::unbounded();
         tiles
             .iter()
@@ -377,8 +419,15 @@ pub fn run_generation(
                         if int.interrupted() {
                             return;
                         }
-                        let refs = group_list(group_cache, &group_of(&tile.key), iterations);
-                        if render_tile_pass(&tile, &refs, pass, iterations, int) {
+                        let gref = group_list(group_cache, &group_of(&tile.key), iterations);
+                        if render_tile_pass(
+                            &tile,
+                            &gref.list,
+                            gref.anchor_px,
+                            pass,
+                            iterations,
+                            int,
+                        ) {
                             store.bump_progress();
                         }
                     }

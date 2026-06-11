@@ -16,7 +16,7 @@ use dashu::integer::IBig;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 pub const TILE_POW: usize = 7;
 /// side length of a tile in pixels
@@ -33,6 +33,11 @@ pub const DEPTH_0_TILE_SPAN_LOG2: i64 = 2; // 4 units
 /// pixels and refinement looks like the resolution increasing.
 pub const PASS_STRIDES: [usize; 5] = [16, 8, 4, 2, 1];
 pub const NUM_PASSES: u8 = PASS_STRIDES.len() as u8;
+
+/// tiles are bundled into GROUP_TILES x GROUP_TILES groups that share one
+/// reference-orbit list
+pub const GROUP_POW: usize = 5;
+pub const GROUP_TILES: usize = 1 << GROUP_POW;
 
 /// memory budget for the tile cache; old tiles are dropped (LRU) beyond this
 pub const MEMORY_BUDGET_BYTES: usize = 1 << 30; // 1 GiB ~ 16k tiles
@@ -57,6 +62,28 @@ pub fn units_per_pixel(depth: i64) -> f64 {
 /// units per pixel at a given depth, exact
 pub fn units_per_pixel_fbig(depth: i64) -> FBig {
     pow2(upp_log2(depth))
+}
+
+/// Working precision (bits) for reference-orbit base points at a given depth.
+///
+/// CRITICAL: FBig infers its precision from how it is constructed
+/// (`from_parts` uses the significand's bit length, and arithmetic rounds to
+/// `Context::max` of the operands). If we build a reference point from a small
+/// integer tile index it ends up with only a handful of bits of precision, so
+/// the reference orbit — and therefore the whole perturbation — is computed
+/// far less accurately than even f64. Reference points must instead be built
+/// at a precision that comfortably exceeds f64, scaled with depth (deeper =
+/// more bits to even locate the point).
+pub fn working_precision(depth: i64) -> usize {
+    depth.max(0) as usize + 128
+}
+
+/// Exact absolute coordinate of a pixel (in the depth's global pixel grid),
+/// built at `prec` bits so the reference orbit computed from it is accurate.
+/// The value is `pixel * 2^upp_log2(depth)`, exact, with a high-precision
+/// context attached for the subsequent orbit arithmetic.
+pub fn pixel_to_coord(pixel: IBig, depth: i64, prec: usize) -> FBig {
+    FBig::from_parts(pixel, 0).with_precision(prec).value() << upp_log2(depth) as isize
 }
 
 /// The depth at which tiles should be rendered for a given view scale
@@ -236,6 +263,8 @@ pub struct TileStore {
     progress: AtomicU64,
     /// current render generation
     generation: AtomicU64,
+    /// TEST: set by spacebar; the next render dumps everything and restarts
+    reset: AtomicBool,
     max_tiles: usize,
 }
 
@@ -246,8 +275,25 @@ impl TileStore {
             frame: AtomicU64::new(0),
             progress: AtomicU64::new(0),
             generation: AtomicU64::new(0),
+            reset: AtomicBool::new(false),
             max_tiles: (memory_budget_bytes / TILE_BYTES).max(64),
         }
+    }
+
+    /// TEST: request a full reset (dump all tiles) on the next render.
+    pub fn request_reset(&self) {
+        self.reset.store(true, Ordering::Release);
+    }
+
+    /// TEST: consume the reset request.
+    pub fn take_reset(&self) -> bool {
+        self.reset.swap(false, Ordering::AcqRel)
+    }
+
+    /// TEST: drop every cached tile.
+    pub fn clear(&self) {
+        self.map.lock().clear();
+        self.bump_progress();
     }
 
     pub fn get(&self, key: &TileKey) -> Option<Arc<Tile>> {

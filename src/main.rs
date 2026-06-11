@@ -135,6 +135,7 @@ fn main() {
             SoftOnly,
             AroundCursor,
             AroundCenter,
+            Reset,
             No,
         }
 
@@ -146,6 +147,10 @@ fn main() {
                 // don't start redrawing while dragging or scrolling
                 println!("DRAGGING OR ZOOMING");
                 UpdateDrawer::SoftOnly
+            } else if window.is_key_pressed(Key::Space, KeyRepeat::No) {
+                // TEST: dump everything and re-render with fresh random refs
+                info!("reset (spacebar)");
+                UpdateDrawer::Reset
             } else if window.is_key_pressed(Key::Up, KeyRepeat::No) {
                 iterations *= 2;
                 info!("iterations: {iterations}");
@@ -246,6 +251,10 @@ fn main() {
             UpdateDrawer::AroundCenter => {
                 let center = Point::new(width / 2, height / 2);
                 drawer.update(coords.clone(), iterations, Some(&center));
+            }
+            UpdateDrawer::Reset => {
+                let center = Point::new(width / 2, height / 2);
+                drawer.reset(coords.clone(), iterations, Some(&center));
             }
             UpdateDrawer::No => {}
         };

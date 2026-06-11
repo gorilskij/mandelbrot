@@ -11,11 +11,18 @@
 
 use crate::rendering::{CoordinatesBox, interpolate};
 use crate::tiles::store::{
-    TILE_SIZE, Tile, TileKey, TileStore, depth_for_view, tile_index, units_per_pixel,
+    GROUP_POW, GROUP_TILES, TILE_SIZE, Tile, TileKey, TileStore, depth_for_view, floor_div_pow2,
+    tile_index, units_per_pixel,
 };
 use dashu::integer::IBig;
 use itertools::iproduct;
 use std::sync::Arc;
+
+/// DEBUG: draw a cyan grid at group boundaries. Compile-time gated; flip to
+/// `true` to visualise which group each region belongs to.
+const DEBUG_GROUP_OUTLINES: bool = false;
+const GROUP_OUTLINE: u32 = 0x00FFFF; // cyan
+const OUTLINE_THICKNESS: i64 = 4;
 
 /// how many levels up to look for a coarser fallback tile
 const MAX_CLIMB: usize = 40;
@@ -70,6 +77,85 @@ pub fn compose(
             side: tile_px,
         };
         compose_tile(store, frame, &key, rect, width, height, out, MAX_CLIMB, MAX_DESCEND);
+    }
+
+    // DEBUG: draw the group grid on top of everything (compile-time gated)
+    if DEBUG_GROUP_OUTLINES {
+        draw_group_outlines(coords, width, height, out);
+    }
+}
+
+/// DEBUG: overlay a cyan grid at the group boundaries, so glitches can be
+/// correlated with the groups (each group shares one reference list).
+#[allow(dead_code)]
+fn draw_group_outlines(coords: &CoordinatesBox, width: usize, height: usize, out: &mut [u32]) {
+    let view = coords.view.inner;
+    let depth = depth_for_view(view);
+    let tile_px = TILE_SIZE as f64 * (units_per_pixel(depth) / view);
+
+    let x0 = tile_index(&coords.origin.x, depth);
+    let y0 = tile_index(&coords.origin.y, depth);
+    let origin00 = TileKey {
+        depth,
+        x: x0.clone(),
+        y: y0.clone(),
+    }
+    .origin();
+    let sx0 = (&origin00.x - &coords.origin.x).to_f64().value() / view;
+    let sy0 = (&origin00.y - &coords.origin.y).to_f64().value() / view;
+    let nx = ((width as f64 - sx0) / tile_px).ceil().max(1.0) as i64;
+    let ny = ((height as f64 - sy0) / tile_px).ceil().max(1.0) as i64;
+
+    let g = IBig::from(GROUP_TILES as u64);
+
+    // vertical lines at group boundaries (tile indices that are multiples of
+    // GROUP_TILES), screen x = sx0 + (boundary_tile - x0) * tile_px
+    let gx_start = floor_div_pow2(&x0, GROUP_POW);
+    let gx_end = floor_div_pow2(&(&x0 + IBig::from(nx)), GROUP_POW) + IBig::from(1);
+    let mut gi = gx_start.clone();
+    while gi <= gx_end {
+        let boundary = &gi * &g;
+        let off = i64::try_from(&(&boundary - &x0)).unwrap_or(i64::MAX / 2);
+        let sx = sx0 + off as f64 * tile_px;
+        draw_vline(out, width, height, sx);
+        gi += IBig::from(1);
+    }
+
+    // horizontal lines
+    let gy_start = floor_div_pow2(&y0, GROUP_POW);
+    let gy_end = floor_div_pow2(&(&y0 + IBig::from(ny)), GROUP_POW) + IBig::from(1);
+    let mut gj = gy_start.clone();
+    while gj <= gy_end {
+        let boundary = &gj * &g;
+        let off = i64::try_from(&(&boundary - &y0)).unwrap_or(i64::MAX / 2);
+        let sy = sy0 + off as f64 * tile_px;
+        draw_hline(out, width, height, sy);
+        gj += IBig::from(1);
+    }
+}
+
+#[allow(dead_code)]
+fn draw_vline(out: &mut [u32], width: usize, height: usize, sx: f64) {
+    let center = sx.round() as i64;
+    for d in 0..OUTLINE_THICKNESS {
+        let px = center - OUTLINE_THICKNESS / 2 + d;
+        if px >= 0 && (px as usize) < width {
+            for py in 0..height {
+                out[py * width + px as usize] = GROUP_OUTLINE;
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn draw_hline(out: &mut [u32], width: usize, height: usize, sy: f64) {
+    let center = sy.round() as i64;
+    for d in 0..OUTLINE_THICKNESS {
+        let py = center - OUTLINE_THICKNESS / 2 + d;
+        if py >= 0 && (py as usize) < height {
+            let row = py as usize * width;
+            out[row..row + width].fill(GROUP_OUTLINE);
+        }
     }
 }
 
