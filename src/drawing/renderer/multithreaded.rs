@@ -1,10 +1,10 @@
 use crate::drawing::maybe_pixel::MaybePixel;
-use crate::drawing::renderer_thread::render_buffer::RenderBuffer;
 use crate::rendering::{CoordinatesBox, Pixels, render};
 use crate::support::Point;
 use delegate::delegate;
 use parking_lot::{Mutex, MutexGuard};
 use rayon::ThreadPoolBuilder;
+use render_buffer::RenderBuffer;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;

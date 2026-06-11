@@ -230,7 +230,7 @@ where
     type Output = Point<<&'a T as Mul>::Output, Unit>;
 
     fn mul(self, rhs: &'a T) -> Self::Output {
-        self * Length::new_ref(rhs)
+        self * Length::from_ref(rhs)
     }
 }
 
@@ -252,7 +252,7 @@ where
     type Output = Point<<&'a T as Div>::Output, Unit>;
 
     fn div(self, rhs: &'a T) -> Self::Output {
-        self / Length::new_ref(rhs)
+        self / Length::from_ref(rhs)
     }
 }
 

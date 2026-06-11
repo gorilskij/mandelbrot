@@ -1,8 +1,8 @@
 pub mod maybe_pixel;
-mod renderer_thread;
+mod renderer;
 
 use crate::{
-    drawing::maybe_pixel::MaybePixel,
+    drawing::{maybe_pixel::MaybePixel, renderer::multithreaded},
     rendering::{CoordinatesBox, Pixels, sample_zoomed},
     support::Point,
 };
@@ -94,7 +94,7 @@ pub struct Drawer {
     display_buf: DisplayBuf,
     display_buf_state: DisplayBufState,
     //
-    renderer: renderer_thread::Handle,
+    renderer: multithreaded::Handle,
 }
 
 impl Drawer {
@@ -110,7 +110,7 @@ impl Drawer {
             display_buf: DisplayBuf::new(width * height),
             display_buf_state: DisplayBufState::Zooming,
             //
-            renderer: renderer_thread::spawn(width, height),
+            renderer: multithreaded::spawn(width, height),
         };
 
         // initial render
