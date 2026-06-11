@@ -8,19 +8,19 @@
 //! single expensive (e.g. long, non-diverging) orbit computed once is reused
 //! by every other pixel in the tile, instead of being recomputed per pixel.
 //!
-//! Because each tile is rendered start-to-finish by a single worker (one
-//! tile per pass goes to one thread, and passes run sequentially behind a
-//! barrier), the list is only ever touched by one thread at a time. The
-//! promotion order is therefore fixed and rendering is deterministic: a given
-//! tile (at a given iteration count) always renders to exactly the same
-//! pixels, which is what keeps the image stable when zooming back and forth.
+//! Each tile is rendered start-to-finish by a single worker (one tile per
+//! pass goes to one thread, and passes run sequentially behind a barrier), so
+//! a tile's list is only ever touched by one thread at a time. It is therefore
+//! a plain `Vec` behind an *uncontended* mutex — no lock-free/atomic list
+//! machinery. The promotion order is fixed, so rendering is deterministic: a
+//! given tile (at a given iteration count) always renders to exactly the same
+//! pixels, which keeps the image stable when zooming back and forth.
 
 use crate::rendering::{
     CoordinatesBox, Orbit, Pixels, calculate_orbit, check_divergence_delta, check_orbit,
     val_to_color,
 };
 use crate::support::Point;
-use crate::support::append_only::List as AOList;
 use crate::tiles::store::{
     NUM_PASSES, PASS_STRIDES, TILE_SIZE, Tile, TileKey, TileStore, depth_for_view, tile_index,
     units_per_pixel, units_per_pixel_fbig,
@@ -52,14 +52,18 @@ struct RefOrbit {
     orbit: Orbit<f64>,
 }
 
-/// Memoizes one reference-orbit list per tile. The list is a pure function of
-/// the tile (same center orbit, same deterministic promotion order), so
-/// memoizing it is a speed-up that also keeps the chosen references stable
-/// across re-renders. The whole cache is dropped when the iteration count
-/// changes.
+/// One tile's reference list. Touched by a single worker at a time, so the
+/// mutex is always uncontended — it exists only so the memoized list can be
+/// owned by the cache and handed out by cheap `Arc` clone.
+type RefList = Arc<Mutex<Vec<RefOrbit>>>;
+
+/// Memoizes one reference list per tile. The list is a pure function of the
+/// tile (same center orbit, same deterministic promotion order), so memoizing
+/// it is a speed-up that also keeps the chosen references stable across
+/// re-renders. The whole cache is dropped when the iteration count changes.
 pub struct RefCache {
     iterations: usize,
-    map: HashMap<TileKey, AOList<RefOrbit>>,
+    map: HashMap<TileKey, RefList>,
 }
 
 impl RefCache {
@@ -73,7 +77,7 @@ impl RefCache {
 
 /// Get (or create and memoize) a tile's reference list, seeded with the orbit
 /// of the tile center computed at full precision.
-fn tile_ref_list(cache: &Mutex<RefCache>, key: &TileKey, iterations: usize) -> AOList<RefOrbit> {
+fn tile_ref_list(cache: &Mutex<RefCache>, key: &TileKey, iterations: usize) -> RefList {
     {
         let c = cache.lock();
         if c.iterations == iterations {
@@ -93,11 +97,10 @@ fn tile_ref_list(cache: &Mutex<RefCache>, key: &TileKey, iterations: usize) -> A
     };
     let (_, orbit) = calculate_orbit(center, iterations);
 
-    let list = AOList::new();
-    list.push_front(RefOrbit {
+    let list: RefList = Arc::new(Mutex::new(vec![RefOrbit {
         delta_corr: Complex::ZERO,
         orbit,
-    });
+    }]));
 
     let mut c = cache.lock();
     if c.iterations != iterations {
@@ -113,7 +116,6 @@ fn tile_ref_list(cache: &Mutex<RefCache>, key: &TileKey, iterations: usize) -> A
 /// Everything fixed about a tile for the duration of a render pass.
 struct TileCtx<'a> {
     tile: &'a Tile,
-    refs: &'a AOList<RefOrbit>,
     /// units per tile pixel
     upp: f64,
     /// exact tile origin and units per pixel, for computing fresh reference
@@ -124,7 +126,13 @@ struct TileCtx<'a> {
 
 /// Render one pixel of a tile (or skip it if a previous, interrupted run
 /// already computed it). Returns whether the pixel is black (non-divergent).
-fn render_pixel(ctx: &TileCtx, c: usize, r: usize, iterations: usize) -> bool {
+fn render_pixel(
+    ctx: &TileCtx,
+    refs: &mut Vec<RefOrbit>,
+    c: usize,
+    r: usize,
+    iterations: usize,
+) -> bool {
     let idx = r * TILE_SIZE + c;
 
     if let Some(raw) = ctx.tile.load(idx).get() {
@@ -140,13 +148,17 @@ fn render_pixel(ctx: &TileCtx, c: usize, r: usize, iterations: usize) -> bool {
         im: (r as f64 - REF_PIXEL) * ctx.upp,
     };
 
-    let val: Option<NonZeroUsize> = ctx
-        .refs
+    // try existing references, newest (nearest, most recently promoted) first
+    let found: Option<Option<NonZeroUsize>> = refs
         .iter()
+        .rev()
         .find_map(|ref_orbit| {
             check_divergence_delta(&ref_orbit.orbit, delta - ref_orbit.delta_corr).ok()
-        })
-        .unwrap_or_else(|| {
+        });
+
+    let val: Option<NonZeroUsize> = match found {
+        Some(v) => v,
+        None => {
             // no usable reference: compute this pixel's own orbit at full
             // precision and add it to the list so later pixels reuse it
             // (this is what stops a short reference + many long orbits from
@@ -159,13 +171,14 @@ fn render_pixel(ctx: &TileCtx, c: usize, r: usize, iterations: usize) -> bool {
             // guaranteed Ok(_): new_orbit is the true orbit of this point
             let val = check_orbit(&new_orbit).unwrap();
 
-            ctx.refs.push_front(RefOrbit {
+            refs.push(RefOrbit {
                 delta_corr: delta,
                 orbit: new_orbit,
             });
 
             val
-        });
+        }
+    };
 
     ctx.tile.store(idx, val_to_color(val).into());
     val.is_none()
@@ -176,7 +189,7 @@ fn render_pixel(ctx: &TileCtx, c: usize, r: usize, iterations: usize) -> bool {
 /// skipped when the pass is retried).
 fn render_tile_pass(
     tile: &Tile,
-    refs: &AOList<RefOrbit>,
+    refs: &mut Vec<RefOrbit>,
     pass: u8,
     iterations: usize,
     int: &MultiInterrupter,
@@ -187,7 +200,6 @@ fn render_tile_pass(
     let origin = tile.key.origin();
     let ctx = TileCtx {
         tile,
-        refs,
         upp: units_per_pixel(tile.key.depth),
         upp_fbig: units_per_pixel_fbig(tile.key.depth),
         origin,
@@ -205,7 +217,7 @@ fn render_tile_pass(
                     continue;
                 }
             }
-            all_black &= render_pixel(&ctx, c, r, iterations);
+            all_black &= render_pixel(&ctx, refs, c, r, iterations);
         }
     }
 
@@ -221,11 +233,11 @@ fn render_tile_pass(
             }
             if r == 0 || r == TILE_SIZE - 1 {
                 for c in 0..TILE_SIZE {
-                    perimeter_black &= render_pixel(&ctx, c, r, iterations);
+                    perimeter_black &= render_pixel(&ctx, refs, c, r, iterations);
                 }
             } else {
                 for c in [0, TILE_SIZE - 1] {
-                    perimeter_black &= render_pixel(&ctx, c, r, iterations);
+                    perimeter_black &= render_pixel(&ctx, refs, c, r, iterations);
                 }
             }
         }
@@ -339,8 +351,10 @@ pub fn run_generation(
                         if int.interrupted() {
                             return;
                         }
-                        let refs = tile_ref_list(ref_cache, &tile.key, iterations);
-                        if render_tile_pass(&tile, &refs, pass, iterations, int) {
+                        let list = tile_ref_list(ref_cache, &tile.key, iterations);
+                        // uncontended: this tile is ours for this pass
+                        let mut refs = list.lock();
+                        if render_tile_pass(&tile, &mut refs, pass, iterations, int) {
                             store.bump_progress();
                         }
                     }
