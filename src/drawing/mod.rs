@@ -30,7 +30,7 @@ pub struct Drawer {
 impl Drawer {
     pub fn new(width: usize, height: usize, coords: CoordinatesBox, iterations: usize) -> Self {
         let store = Arc::new(TileStore::new(MEMORY_BUDGET_BYTES));
-        let renderer = multithreaded::spawn(width, height, store.clone());
+        let renderer = multithreaded::spawn(store.clone());
 
         let mut this = Self {
             width,
@@ -48,14 +48,6 @@ impl Drawer {
         this
     }
 
-    /// Update the view without launching a render (used while a drag or
-    /// zoom gesture is still in progress); the compositor will reassemble
-    /// the new viewport from existing tiles.
-    pub fn soft_update(&mut self, new_coords: CoordinatesBox) {
-        self.current_coords = new_coords;
-        self.dirty = true;
-    }
-
     /// Update the view and (re)launch rendering for it, prioritized around
     /// the cursor when given. Cancels any render in progress; finished tiles
     /// are kept.
@@ -65,9 +57,20 @@ impl Drawer {
         iterations: usize,
         cursor_rel: Option<&Point<usize, Pixels>>,
     ) {
-        self.renderer.update(&new_coords, iterations, cursor_rel);
+        self.renderer
+            .update(&new_coords, iterations, cursor_rel, self.width, self.height);
         self.current_coords = new_coords;
         self.dirty = true;
+    }
+
+    /// Resize the display buffer to match the window and re-render the current
+    /// view at the new size.
+    pub fn resize(&mut self, width: usize, height: usize, iterations: usize) {
+        self.width = width;
+        self.height = height;
+        self.display_buf = vec![0; width * height].into_boxed_slice();
+        let coords = self.current_coords.clone();
+        self.update(coords, iterations, None);
     }
 
     /// TEST: dump all tiles + reference lists and re-render from scratch

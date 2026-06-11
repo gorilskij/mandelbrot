@@ -47,10 +47,19 @@ fn main() {
 
     // let width = 1000;
     // let height = 600;
-    let width = 1500;
-    let height = 1000;
+    let mut width = 1500;
+    let mut height = 1000;
 
-    let mut window = Window::new("Mandelbrot", width, height, WindowOptions::default()).unwrap();
+    let mut window = Window::new(
+        "Mandelbrot",
+        width,
+        height,
+        WindowOptions {
+            resize: true,
+            ..WindowOptions::default()
+        },
+    )
+    .unwrap();
 
     window.set_target_fps(60);
 
@@ -75,6 +84,14 @@ fn main() {
     while window.is_open() {
         let mut zoomed = false;
         let mut dragged = false;
+
+        // follow window resizes: resize buffers and re-render at the new size
+        let (w, h) = window.get_size();
+        if (w, h) != (width, height) && w > 0 && h > 0 {
+            width = w;
+            height = h;
+            drawer.resize(width, height, iterations);
+        }
 
         // mouse position in pixels with the top-left corner of the window as the origin
         let cursor_rel = window
@@ -132,7 +149,6 @@ fn main() {
         }
 
         enum UpdateDrawer {
-            SoftOnly,
             AroundCursor,
             AroundCenter,
             Reset,
@@ -140,13 +156,12 @@ fn main() {
         }
 
         let update_drawer = {
-            if dragged || zoomed {
-                println!("FINISHED DRAG OR ZOOM");
+            if dragged || zoomed || dragging.is_some() || scrolling {
+                // render continuously during the gesture: the tile cache means
+                // only newly-revealed tiles are computed, and the renderer is
+                // interruptible (per-tile progress is kept), so panning/zooming
+                // fills in live instead of only after the gesture ends
                 UpdateDrawer::AroundCursor
-            } else if dragging.is_some() || scrolling {
-                // don't start redrawing while dragging or scrolling
-                println!("DRAGGING OR ZOOMING");
-                UpdateDrawer::SoftOnly
             } else if window.is_key_pressed(Key::Space, KeyRepeat::No) {
                 // TEST: dump everything and re-render with fresh random refs
                 info!("reset (spacebar)");
@@ -159,28 +174,45 @@ fn main() {
                 iterations /= 2;
                 info!("iterations: {iterations}");
                 UpdateDrawer::AroundCursor
-            } else if (window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl))
+            } else if (window.is_key_down(Key::LeftCtrl)
+                || window.is_key_down(Key::RightCtrl)
+                || window.is_key_down(Key::LeftSuper)
+                || window.is_key_down(Key::RightSuper))
                 && window.is_key_pressed(Key::C, KeyRepeat::No)
             {
-                let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
                 let data = ClipBoardData {
                     coords: Cow::Borrowed(&coords),
                     iterations,
                 };
-                ctx.set_contents(data.to_string()).unwrap();
-                info!("copied coords to clipboard");
+                let s = data.to_string();
+                // always print to the terminal, so coords are recoverable even
+                // if the clipboard backend fails
+                info!("COPIED: {s}");
+                match ClipboardProvider::new()
+                    .and_then(|mut ctx: ClipboardContext| ctx.set_contents(s.clone()))
+                {
+                    Ok(()) => {}
+                    Err(e) => warn!("clipboard copy failed: {e}"),
+                }
                 UpdateDrawer::No
-            } else if (window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl))
+            } else if (window.is_key_down(Key::LeftCtrl)
+                || window.is_key_down(Key::RightCtrl)
+                || window.is_key_down(Key::LeftSuper)
+                || window.is_key_down(Key::RightSuper))
                 && window.is_key_pressed(Key::V, KeyRepeat::No)
             {
                 let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
-                if let Ok(new_data) = ctx.get_contents().unwrap().parse::<ClipBoardData>() {
+                let contents = ctx.get_contents().unwrap_or_default();
+                if let Ok(new_data) = contents.parse::<ClipBoardData>() {
                     coords = new_data.coords.into_owned();
                     iterations = new_data.iterations;
-                    info!("pasted coords from clipboard");
+                    // print the raw pasted string (the parsed origin has
+                    // unlimited precision until the top-up below bounds it, so
+                    // re-Displaying it via to_decimal would panic)
+                    info!("PASTED: {}", contents.trim());
                     UpdateDrawer::AroundCenter
                 } else {
-                    warn!("tried to paste with invalid clipboard");
+                    warn!("PASTE FAILED: invalid clipboard contents: {contents:?}");
                     UpdateDrawer::No
                 }
             }
@@ -241,9 +273,6 @@ fn main() {
         }
 
         match update_drawer {
-            UpdateDrawer::SoftOnly => {
-                drawer.soft_update(coords.clone());
-            }
             UpdateDrawer::AroundCursor => {
                 let cursor_rel_usize = cursor_rel.map(|p| p.cast(|f| *f as usize));
                 drawer.update(coords.clone(), iterations, cursor_rel_usize.as_ref());
