@@ -36,7 +36,7 @@ pub const NUM_PASSES: u8 = PASS_STRIDES.len() as u8;
 
 /// tiles are bundled into GROUP_TILES x GROUP_TILES groups that share one
 /// reference-orbit list
-pub const GROUP_POW: usize = 5;
+pub const GROUP_POW: usize = 4;
 pub const GROUP_TILES: usize = 1 << GROUP_POW;
 
 /// memory budget for the tile cache; old tiles are dropped (LRU) beyond this

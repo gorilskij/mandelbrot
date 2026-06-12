@@ -56,13 +56,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let delta_0 = pixel_deltas[idx];
 
     for (var ri = 0u; ri < uniforms.ref_count; ri++) {
-        let meta = ref_metas[ri];
-        let corr = vec2<f32>(meta.delta_corr_re, meta.delta_corr_im);
+        let rm = ref_metas[ri];
+        let corr = vec2<f32>(rm.delta_corr_re, rm.delta_corr_im);
         var delta = delta_0 - corr;
         let d0 = delta;
 
-        for (var i = 0u; i < meta.orbit_len; i++) {
-            let c = orbit_data[meta.orbit_offset + i];
+        for (var i = 0u; i < rm.orbit_len; i++) {
+            let c = orbit_data[rm.orbit_offset + i];
             let x = c + delta;
             if dot(x, x) > 4.0 {
                 output[idx] = i + 1u;
@@ -78,7 +78,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             delta = vec2<f32>(re, im);
         }
 
-        if meta.is_full != 0u {
+        if rm.is_full != 0u {
             output[idx] = 0u;
             return;
         }
@@ -260,8 +260,19 @@ fn render_tile_pass_gpu(
         return false;
     }
 
-    let (ref_metas, orbit_data) = pack_refs(refs);
-    let counts = gpu_dispatch(state, &pixel_deltas, &ref_metas, &orbit_data);
+    // use only the most recent reference — the front of the list
+    let front = refs.iter().next().expect("ref list is never empty");
+    let ref_meta = RefMetaGpu {
+        delta_corr_re: front.delta_corr.re,
+        delta_corr_im: front.delta_corr.im,
+        is_full: front.orbit.is_full as u32,
+        orbit_len: front.orbit.orbit.len() as u32,
+        orbit_offset: 0,
+        _pad: [0; 3],
+    };
+    let orbit_data: Vec<[f32; 2]> = front.orbit.orbit.iter().map(|c| [c.re, c.im]).collect();
+
+    let counts = gpu_dispatch(state, &pixel_deltas, &[ref_meta], &orbit_data);
 
     for (i, &tile_idx) in pixel_indices.iter().enumerate() {
         let count = counts[i];
@@ -296,33 +307,6 @@ fn render_tile_pass_gpu(
 
     tile.finish_pass(pass + 1);
     true
-}
-
-fn pack_refs(refs: &RefList) -> (Vec<RefMetaGpu>, Vec<[f32; 2]>) {
-    let mut metas: Vec<RefMetaGpu> = Vec::new();
-    let mut orbit_data: Vec<[f32; 2]> = Vec::new();
-
-    for ref_orbit in refs.iter() {
-        let offset = orbit_data.len() as u32;
-        for c in ref_orbit.orbit.orbit.iter() {
-            orbit_data.push([c.re, c.im]);
-        }
-        metas.push(RefMetaGpu {
-            delta_corr_re: ref_orbit.delta_corr.re,
-            delta_corr_im: ref_orbit.delta_corr.im,
-            is_full: ref_orbit.orbit.is_full as u32,
-            orbit_len: ref_orbit.orbit.orbit.len() as u32,
-            orbit_offset: offset,
-            _pad: [0; 3],
-        });
-    }
-
-    // wgpu requires non-empty buffers
-    if orbit_data.is_empty() {
-        orbit_data.push([0.0; 2]);
-    }
-
-    (metas, orbit_data)
 }
 
 /// Dispatch the compute shader; returns raw iteration counts per pixel.

@@ -8,7 +8,7 @@ use std::{borrow::Cow, fmt::Display, str::FromStr};
 use crate::{
     drawing::Drawer,
     support::{Length, Point},
-    tiles::perturb::gpu::{Gpu, GpuState},
+    tiles::perturb::{Toggle, gpu::{Gpu, GpuState}},
 };
 use std::sync::Arc;
 use clipboard::{ClipboardContext, ClipboardProvider};
@@ -47,7 +47,8 @@ impl FromStr for ClipBoardData<'_> {
 fn main() {
     env_logger::init();
 
-    let gpu = Arc::new(Gpu(Arc::new(GpuState::new())));
+    let (toggle, use_gpu) = Toggle::new(Gpu(Arc::new(GpuState::new())));
+    let gpu = Arc::new(toggle);
 
     // let width = 1000;
     // let height = 600;
@@ -179,6 +180,11 @@ fn main() {
             } else if window.is_key_pressed(Key::Space, KeyRepeat::No) {
                 // TEST: dump everything and re-render with fresh random refs
                 info!("reset (spacebar)");
+                UpdateDrawer::Reset
+            } else if window.is_key_pressed(Key::Escape, KeyRepeat::No) {
+                let now_gpu = !use_gpu.load(std::sync::atomic::Ordering::Relaxed);
+                use_gpu.store(now_gpu, std::sync::atomic::Ordering::Relaxed);
+                info!("backend: {}", if now_gpu { "GPU" } else { "CPU" });
                 UpdateDrawer::Reset
             } else if window.is_key_pressed(Key::Up, KeyRepeat::No) {
                 iterations *= 2;
