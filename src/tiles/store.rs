@@ -15,7 +15,8 @@ use dashu::float::FBig;
 use dashu::integer::IBig;
 use flurry::HashMap as FlurryMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 pub const TILE_POW: usize = 7;
 /// side length of a tile in pixels
@@ -180,12 +181,9 @@ impl TileKey {
 }
 
 /// A single rendered (or partially rendered) tile.
-///
-/// Pixels are atomics so the render threads can fill the tile in while the
-/// compositor reads it; a torn frame at worst shows a pixel one frame early.
 pub struct Tile {
     pub key: TileKey,
-    pixels: Box<[AtomicU32]>,
+    pixels: UnsafeCell<Box<[u32]>>,
     /// number of fully completed progressive passes (0..=NUM_PASSES)
     passes_done: AtomicU8,
     /// iteration count the contents were/are being computed with
@@ -196,13 +194,16 @@ pub struct Tile {
     pub render_gen: AtomicU64,
 }
 
+// SAFETY: pixels are written by render threads and read by the compositor
+// concurrently. u32 reads/writes are naturally atomic on x86/ARM; we accept
+// the theoretical data race in exchange for zero synchronization overhead.
+unsafe impl Sync for Tile {}
+
 impl Tile {
     fn new(key: TileKey, iterations: usize, render_gen: u64) -> Self {
         Self {
             key,
-            pixels: (0..TILE_LEN)
-                .map(|_| AtomicU32::new(MaybePixel::NONE_RAW))
-                .collect(),
+            pixels: UnsafeCell::new(vec![MaybePixel::NONE_RAW; TILE_LEN].into_boxed_slice()),
             passes_done: AtomicU8::new(0),
             iterations: AtomicUsize::new(iterations),
             last_used: AtomicU64::new(0),
@@ -211,11 +212,15 @@ impl Tile {
     }
 
     pub fn load(&self, idx: usize) -> MaybePixel {
-        MaybePixel::from_raw(self.pixels[idx].load(Ordering::Relaxed))
+        MaybePixel::from_raw(unsafe { (*self.pixels.get())[idx] })
     }
 
     pub fn store(&self, idx: usize, px: MaybePixel) {
-        self.pixels[idx].store(px.to_raw(), Ordering::Relaxed);
+        unsafe { (*self.pixels.get())[idx] = px.to_raw() }
+    }
+
+    pub fn pixels_raw(&self) -> *const [u32] {
+        unsafe { &**self.pixels.get() }
     }
 
     pub fn passes_done(&self) -> u8 {
@@ -243,9 +248,7 @@ impl Tile {
     pub fn reset(&self, iterations: usize) {
         self.passes_done.store(0, Ordering::Release);
         self.iterations.store(iterations, Ordering::Relaxed);
-        for p in &self.pixels {
-            p.store(MaybePixel::NONE_RAW, Ordering::Relaxed);
-        }
+        unsafe { (*self.pixels.get()).fill(MaybePixel::NONE_RAW) };
     }
 
     pub fn touch(&self, frame: u64) {

@@ -25,7 +25,7 @@ const GROUP_OUTLINE: u32 = 0x00FFFF; // cyan
 const OUTLINE_THICKNESS: i64 = 4;
 
 /// how many levels up to look for a coarser fallback tile
-const MAX_CLIMB: usize = 40;
+pub const MAX_CLIMB: usize = 40;
 /// how many levels down to look for finer fallback tiles (4^k lookups!)
 const MAX_DESCEND: usize = 3;
 

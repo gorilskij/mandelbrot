@@ -114,6 +114,10 @@ impl Drawer {
         &self.display_buf
     }
 
+    pub fn store(&self) -> &Arc<TileStore> {
+        &self.store
+    }
+
     pub fn stop(self) -> thread::Result<()> {
         self.renderer.terminate_and_join()
     }

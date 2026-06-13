@@ -1,11 +1,11 @@
 mod drawing;
+mod gpu_compositor;
 mod rendering;
 mod support;
 mod tiles;
 
 use std::borrow::Cow;
 use std::fmt::Display;
-use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +21,7 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::drawing::Drawer;
+use crate::gpu_compositor::GpuCompositor;
 use crate::rendering::*;
 use crate::support::{Length, Point, ToFBig};
 use crate::tiles::perturb::{Perturbator, Toggle, gpu::{Gpu, GpuState}};
@@ -62,10 +63,8 @@ enum UpdateKind {
 }
 
 struct App {
-    // Winit / softbuffer — created in resumed().
     window: Option<Arc<Window>>,
-    context: Option<softbuffer::Context<Arc<Window>>>,
-    surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    compositor: Option<GpuCompositor>,
     drawer: Option<Drawer>,
     backend: Arc<dyn Perturbator + Send + Sync>,
     use_gpu: Arc<std::sync::atomic::AtomicBool>,
@@ -97,8 +96,7 @@ impl App {
         let (toggle, use_gpu) = Toggle::new(Gpu(Arc::new(GpuState::new())));
         Self {
             window: None,
-            context: None,
-            surface: None,
+            compositor: None,
             drawer: None,
             backend: Arc::new(toggle),
             use_gpu,
@@ -129,13 +127,8 @@ impl App {
         self.phys_width = phys_width;
         self.phys_height = phys_height;
 
-        if let Some(surface) = &mut self.surface {
-            surface
-                .resize(
-                    NonZeroU32::new(phys_width).unwrap(),
-                    NonZeroU32::new(phys_height).unwrap(),
-                )
-                .unwrap();
+        if let Some(compositor) = &mut self.compositor {
+            compositor.resize(phys_width, phys_height);
         }
         if let Some(drawer) = &mut self.drawer {
             drawer.resize(phys_width as usize, phys_height as usize, self.iterations);
@@ -210,11 +203,9 @@ impl ApplicationHandler for App {
                 .unwrap(),
         );
 
-        let context = softbuffer::Context::new(window.clone()).unwrap();
-        let surface = softbuffer::Surface::new(&context, window.clone()).unwrap();
-
         let PhysicalSize { width, height } = window.inner_size();
 
+        let compositor = GpuCompositor::new(window.clone());
         let drawer = Drawer::new(
             width as usize,
             height as usize,
@@ -224,8 +215,7 @@ impl ApplicationHandler for App {
         );
 
         self.window = Some(window);
-        self.context = Some(context);
-        self.surface = Some(surface);
+        self.compositor = Some(compositor);
         self.drawer = Some(drawer);
 
         self.resize(width, height);
@@ -250,15 +240,17 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                let (Some(surface), Some(drawer)) =
-                    (&mut self.surface, &mut self.drawer)
+                let (Some(compositor), Some(drawer)) =
+                    (&mut self.compositor, &self.drawer)
                 else {
                     return;
                 };
-                drawer.update_display_buf();
-                let mut buf = surface.buffer_mut().unwrap();
-                buf.copy_from_slice(drawer.display_buf());
-                buf.present().unwrap();
+                compositor.render(
+                    drawer.store(),
+                    &self.coords,
+                    self.phys_width,
+                    self.phys_height,
+                );
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -305,8 +297,8 @@ impl ApplicationHandler for App {
                 // Only zoom when not dragging (matches old behaviour).
                 if !self.mouse_left_down {
                     let y = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y as f64 * 10.0,
-                        MouseScrollDelta::PixelDelta(pos) => pos.y,
+                        MouseScrollDelta::LineDelta(_, y) => y as f64 * 2.5,
+                        MouseScrollDelta::PixelDelta(pos) => pos.y / 4.0,
                     };
                     self.apply_scroll_zoom(y);
                     self.bump_precision();
