@@ -80,8 +80,8 @@ struct App {
     mouse_left_down: bool,
     /// (start_origin_in_units, start_cursor_physical_pixels)
     dragging: Option<(Point<FBig, Units>, (f64, f64))>,
-    scroll_delta: f64,   // accumulated scroll since last about_to_wait
-    scrolling: bool,     // were we scrolling last frame?
+    got_scroll: bool,    // did we receive scroll events since last about_to_wait?
+    scrolling: bool,     // were we scrolling last about_to_wait?
     modifiers: ModifiersState,
 
     // Queued update from key events; processed in about_to_wait.
@@ -109,7 +109,7 @@ impl App {
             cursor_pos: None,
             mouse_left_down: false,
             dragging: None,
-            scroll_delta: 0.0,
+            got_scroll: false,
             scrolling: false,
             modifiers: ModifiersState::empty(),
             pending_update: UpdateKind::No,
@@ -148,6 +148,36 @@ impl App {
                     f.clone()
                 }
             });
+        }
+    }
+
+    fn apply_scroll_zoom(&mut self, delta_y: f64) {
+        let multiplier = 1.0 + (delta_y / 100.0).clamp(-0.2, 0.2);
+        let old_view = self.coords.view.inner;
+        let new_view = old_view / multiplier;
+
+        if let Some((cx, cy)) = self.cursor_pos {
+            let exact = |f: f64| FBig::try_from(f).unwrap();
+            self.coords.origin.x =
+                &(&self.coords.origin.x + &exact(cx * old_view)) - &exact(cx * new_view);
+            self.coords.origin.y =
+                &(&self.coords.origin.y + &exact(cy * old_view)) - &exact(cy * new_view);
+        }
+        self.coords.view = View::new(new_view);
+    }
+
+    fn call_drawer_update(&mut self) {
+        let coords = self.coords.clone();
+        let iters = self.iterations;
+        let cursor = self.cursor_usize();
+        if let Some(drawer) = &mut self.drawer {
+            drawer.update(coords, iters, cursor.as_ref());
+        }
+    }
+
+    fn do_request_redraw(&self) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -227,7 +257,7 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = Some((position.x, position.y));
 
-                // Update drag coords on every cursor move while button is held.
+                // Update drag coords immediately on every cursor move.
                 if self.mouse_left_down {
                     if let Some((start_origin, start_cursor)) = self.dragging.clone() {
                         let dx = position.x - start_cursor.0;
@@ -238,8 +268,8 @@ impl ApplicationHandler for App {
                             &start_origin.x - &exact(dx * view),
                             &start_origin.y - &exact(dy * view),
                         );
-                        self.pending_update =
-                            self.pending_update.max(UpdateKind::AroundCursor);
+                        self.call_drawer_update();
+                        self.do_request_redraw();
                     }
                 }
             }
@@ -260,8 +290,6 @@ impl ApplicationHandler for App {
                     self.mouse_left_down = false;
                     if self.dragging.take().is_some() {
                         trace!("stop dragging");
-                        self.pending_update =
-                            self.pending_update.max(UpdateKind::AroundCursor);
                     }
                 }
             },
@@ -273,7 +301,12 @@ impl ApplicationHandler for App {
                         MouseScrollDelta::LineDelta(_, y) => y as f64 * 10.0,
                         MouseScrollDelta::PixelDelta(pos) => pos.y,
                     };
-                    self.scroll_delta += y;
+                    self.apply_scroll_zoom(y);
+                    self.bump_precision();
+                    self.call_drawer_update();
+                    self.do_request_redraw();
+                    self.scrolling = true;
+                    self.got_scroll = true;
                 }
             }
 
@@ -348,38 +381,15 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Apply accumulated scroll zoom.
-        if self.scroll_delta != 0.0 {
-            let multiplier = 1.0 + (self.scroll_delta / 100.0).clamp(-0.2, 0.2);
-            let old_view = self.coords.view.inner;
-            let new_view = old_view / multiplier;
-
-            if let Some((cx, cy)) = self.cursor_pos {
-                let exact = |f: f64| FBig::try_from(f).unwrap();
-                self.coords.origin.x =
-                    &(&self.coords.origin.x + &exact(cx * old_view))
-                        - &exact(cx * new_view);
-                self.coords.origin.y =
-                    &(&self.coords.origin.y + &exact(cy * old_view))
-                        - &exact(cy * new_view);
-            }
-            self.coords.view = View::new(new_view);
-
-            trace!("zoomed (cursor-locked)");
+        // Detect scroll-end: got_scroll is set by each MouseWheel event.
+        // When it's false for a whole about_to_wait cycle, the gesture ended.
+        if std::mem::take(&mut self.got_scroll) {
+            // Scroll in progress — zoom already applied per event, log zoom level.
             let w = Length::<_, Pixels>::new(self.phys_width as f64) * self.coords.view;
             info!("zoom level: 10^{}", -w.inner.log10());
-
-            self.scrolling = true;
-            self.scroll_delta = 0.0;
-            self.pending_update = self.pending_update.max(UpdateKind::AroundCursor);
         } else if self.scrolling {
             self.scrolling = false;
             // Final update once the scroll gesture ends.
-            self.pending_update = self.pending_update.max(UpdateKind::AroundCursor);
-        }
-
-        // Ongoing drag also needs continuous drawer updates.
-        if self.dragging.is_some() {
             self.pending_update = self.pending_update.max(UpdateKind::AroundCursor);
         }
 
