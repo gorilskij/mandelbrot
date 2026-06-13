@@ -13,8 +13,7 @@ use crate::rendering::Units;
 use crate::support::Point;
 use dashu::float::FBig;
 use dashu::integer::IBig;
-use parking_lot::Mutex;
-use std::collections::HashMap;
+use flurry::HashMap as FlurryMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -132,7 +131,7 @@ pub fn tile_index(coord: &FBig, depth: i64) -> IBig {
     (coord.clone() << (-span_log2) as isize).floor().to_int().value()
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TileKey {
     pub depth: i64,
     pub x: IBig,
@@ -256,7 +255,7 @@ impl Tile {
 
 /// Concurrent tile cache with a memory budget and LRU eviction.
 pub struct TileStore {
-    map: Mutex<HashMap<TileKey, Arc<Tile>>>,
+    map: FlurryMap<TileKey, Arc<Tile>>,
     /// display frame counter, bumped by the compositor (drives LRU)
     frame: AtomicU64,
     /// bumped whenever a render pass completes (tells the drawer to recompose)
@@ -271,7 +270,7 @@ pub struct TileStore {
 impl TileStore {
     pub fn new(memory_budget_bytes: usize) -> Self {
         Self {
-            map: Mutex::new(HashMap::new()),
+            map: FlurryMap::new(),
             frame: AtomicU64::new(0),
             progress: AtomicU64::new(0),
             generation: AtomicU64::new(0),
@@ -292,20 +291,23 @@ impl TileStore {
 
     /// TEST: drop every cached tile.
     pub fn clear(&self) {
-        self.map.lock().clear();
+        let guard = self.map.guard();
+        self.map.retain(|_, _| false, &guard);
         self.bump_progress();
     }
 
     pub fn get(&self, key: &TileKey) -> Option<Arc<Tile>> {
-        self.map.lock().get(key).cloned()
+        self.map.get(key, &self.map.guard()).cloned()
     }
 
     pub fn get_or_insert(&self, key: &TileKey, iterations: usize, render_gen: u64) -> Arc<Tile> {
-        self.map
-            .lock()
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(Tile::new(key.clone(), iterations, render_gen)))
-            .clone()
+        let guard = self.map.guard();
+        if let Some(tile) = self.map.get(key, &guard) {
+            return tile.clone();
+        }
+        let tile = Arc::new(Tile::new(key.clone(), iterations, render_gen));
+        self.map.insert(key.clone(), tile.clone(), &guard);
+        tile
     }
 
     pub fn begin_generation(&self) -> u64 {
@@ -328,21 +330,21 @@ impl TileStore {
     /// Tiles belonging to the current render generation are never dropped.
     pub fn evict_excess(&self) {
         let generation = self.generation.load(Ordering::Acquire);
-        let mut map = self.map.lock();
-        if map.len() <= self.max_tiles {
+        let guard = self.map.guard();
+        if self.map.len() <= self.max_tiles {
             return;
         }
-        let excess = map.len() - self.max_tiles;
+        let excess = self.map.len() - self.max_tiles;
 
-        let mut candidates: Vec<(u64, TileKey)> = map
-            .values()
-            .filter(|t| t.render_gen.load(Ordering::Relaxed) != generation)
-            .map(|t| (t.last_used.load(Ordering::Relaxed), t.key.clone()))
+        let mut candidates: Vec<(u64, TileKey)> = self.map
+            .iter(&guard)
+            .filter(|(_, t)| t.render_gen.load(Ordering::Relaxed) != generation)
+            .map(|(k, t)| (t.last_used.load(Ordering::Relaxed), k.clone()))
             .collect();
         candidates.sort_unstable_by_key(|(last_used, _)| *last_used);
 
         for (_, key) in candidates.into_iter().take(excess) {
-            map.remove(&key);
+            self.map.remove(&key, &guard);
         }
     }
 }
