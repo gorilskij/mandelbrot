@@ -68,6 +68,7 @@ struct App {
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     drawer: Option<Drawer>,
     backend: Arc<dyn Perturbator + Send + Sync>,
+    use_gpu: Arc<std::sync::atomic::AtomicBool>,
 
     // Physical pixel dimensions of the window.
     phys_width: u32,
@@ -93,13 +94,14 @@ struct App {
 impl App {
     fn new() -> Self {
         let precision = 100;
-        let (toggle, _use_gpu) = Toggle::new(Gpu(Arc::new(GpuState::new())));
+        let (toggle, use_gpu) = Toggle::new(Gpu(Arc::new(GpuState::new())));
         Self {
             window: None,
             context: None,
             surface: None,
             drawer: None,
             backend: Arc::new(toggle),
+            use_gpu,
             phys_width: 0,
             phys_height: 0,
             coords: CoordinatesBox {
@@ -333,6 +335,12 @@ impl ApplicationHandler for App {
                 match code {
                     KeyCode::Space => {
                         info!("reset (spacebar)");
+                        self.pending_update = UpdateKind::Reset;
+                    }
+                    KeyCode::Escape => {
+                        let now_gpu = !self.use_gpu.load(std::sync::atomic::Ordering::Relaxed);
+                        self.use_gpu.store(now_gpu, std::sync::atomic::Ordering::Relaxed);
+                        info!("backend: {}", if now_gpu { "GPU" } else { "CPU" });
                         self.pending_update = UpdateKind::Reset;
                     }
                     KeyCode::ArrowUp => {
