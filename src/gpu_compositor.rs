@@ -298,19 +298,19 @@ impl GpuCompositor {
         {
             let store_frame = store.next_frame();
 
-            // Use the minimum passes_done of visible tiles to set the grid resolution.
-            // Each sample becomes one texel; the GPU bilinearly magnifies to screen.
-            let mut min_passes = NUM_PASSES as usize + 1;
+            // Use the maximum passes_done of visible tiles to set the grid resolution.
+            // This ensures tiles that just completed a finer pass are visually distinct
+            // from their previous coarser state (sampling the same pixel positions at
+            // a coarser grid_tex_size would yield identical output — no visible update).
+            // Tiles at lower passes are block-replicated to fill their slot.
+            let mut max_passes = 0usize;
             for (i, j) in iproduct!(0..nx, 0..ny) {
                 let key = TileKey { depth, x: &x0 + IBig::from(i), y: &y0 + IBig::from(j) };
                 let pd = store.get(&key).map_or(0, |t| t.passes_done()) as usize;
-                if pd > 0 {
-                    min_passes = min_passes.min(pd);
-                }
+                max_passes = max_passes.max(pd);
             }
-            // Fall back to finest resolution if no tile has data yet (ancestor path).
-            let grid_tex_size = if min_passes <= NUM_PASSES as usize {
-                TILE_SIZE / PASS_STRIDES[min_passes - 1]
+            let grid_tex_size = if max_passes > 0 {
+                TILE_SIZE / PASS_STRIDES[max_passes - 1]
             } else {
                 TILE_SIZE / PASS_STRIDES[0]
             };
