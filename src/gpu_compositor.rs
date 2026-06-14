@@ -269,6 +269,38 @@ impl GpuCompositor {
         })
     }
 
+    /// Force Metal/Vulkan to compile both render pipelines now so the first
+    /// real frame doesn't stall. A zero-vertex draw is enough to trigger it.
+    pub fn warmup(&mut self) {
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            _ => return,
+        };
+        let view = frame.texture.create_view(&Default::default());
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.draw(0..0, 0..1);
+            pass.set_pipeline(&self.bar_pipeline);
+            pass.draw(0..0, 0..1);
+        }
+        self.queue.submit([enc.finish()]);
+        frame.present();
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;

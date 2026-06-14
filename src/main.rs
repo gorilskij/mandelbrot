@@ -88,6 +88,13 @@ struct App {
 
     // Queued update from key events; processed in about_to_wait.
     pending_update: UpdateKind,
+
+    // Render-loop pacing: count consecutive about_to_wait cycles with no tile
+    // progress. Once this exceeds a threshold we switch from WaitUntil(16ms)
+    // to Wait (event-driven), draining the swap chain so the next user
+    // interaction frame is never delayed by queued-but-stale GPU frames.
+    idle_frames: u32,
+    last_store_progress: u64,
 }
 
 impl App {
@@ -117,6 +124,8 @@ impl App {
             scrolling: false,
             modifiers: ModifiersState::empty(),
             pending_update: UpdateKind::No,
+            idle_frames: 0,
+            last_store_progress: 0,
         }
     }
 
@@ -213,7 +222,8 @@ impl ApplicationHandler for App {
             exact(0.0  - (height as f64 / 2.0) * view),
         );
 
-        let compositor = GpuCompositor::new(window.clone());
+        let mut compositor = GpuCompositor::new(window.clone());
+        compositor.warmup();
         let drawer = Drawer::new(
             width as usize,
             height as usize,
@@ -275,7 +285,7 @@ impl ApplicationHandler for App {
                             &start_origin.x - &exact(dx * view),
                             &start_origin.y - &exact(dy * view),
                         );
-                        self.call_drawer_update();
+                        self.pending_update = self.pending_update.max(UpdateKind::AroundCursor);
                         self.do_request_redraw();
                     }
                 }
@@ -429,13 +439,27 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Pace to ~60 fps and request a redraw every frame so rendering
-        // progress is shown continuously.
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(16),
-        ));
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        // Track tile computation progress. While progressing, run at ~60fps.
+        // Once idle for a few frames, switch to event-driven (ControlFlow::Wait)
+        // so the swap chain drains and the next user interaction gets a frame
+        // immediately rather than waiting for queued-but-stale GPU frames.
+        let progress = self.drawer.as_ref().map_or(0, |d| d.store().progress());
+        if progress != self.last_store_progress || update != UpdateKind::No {
+            self.last_store_progress = progress;
+            self.idle_frames = 0;
+        } else {
+            self.idle_frames = self.idle_frames.saturating_add(1);
+        }
+
+        if self.idle_frames < 5 {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(16),
+            ));
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 }
