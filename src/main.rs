@@ -247,7 +247,7 @@ impl ApplicationHandler for App {
                     rt.stop();
                 }
                 if let Some(drawer) = self.drawer.take() {
-                    drawer.stop().unwrap();
+                    drawer.stop();
                 }
                 event_loop.exit();
             }

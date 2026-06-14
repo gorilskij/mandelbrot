@@ -7,7 +7,7 @@ use crate::{
     support::Point,
     tiles::{compose::compose, perturb::Perturbator, store::MEMORY_BUDGET_BYTES, store::TileStore},
 };
-use std::{sync::Arc, thread};
+use std::sync::Arc;
 
 /// Owns the tile store, the render thread handle and the display buffer.
 /// All preview/caching logic that used to live here (cached_buf,
@@ -118,7 +118,9 @@ impl Drawer {
         &self.store
     }
 
-    pub fn stop(self) -> thread::Result<()> {
-        self.renderer.terminate_and_join()
+    /// Signal compute to stop and return immediately (the render thread is
+    /// detached). Used on window close so exit is instant even mid-generation.
+    pub fn stop(self) {
+        self.renderer.terminate();
     }
 }

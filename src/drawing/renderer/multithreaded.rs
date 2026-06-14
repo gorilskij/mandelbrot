@@ -38,9 +38,12 @@ impl Handle {
             .send((coords.clone(), iterations, cursor_rel.cloned(), width, height));
     }
 
-    pub fn terminate_and_join(self) -> thread::Result<()> {
+    /// Signal the render thread to stop, without waiting for the in-flight
+    /// generation to finish. The `JoinHandle` is dropped (detached); the OS
+    /// reclaims the thread at process exit. This keeps window close instant
+    /// even mid-generation, where a join could block for a whole tile pass.
+    pub fn terminate(self) {
         self.sender.terminate();
-        self.handle.join()
     }
 }
 
