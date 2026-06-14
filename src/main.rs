@@ -21,7 +21,7 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::drawing::Drawer;
-use crate::gpu_compositor::GpuCompositor;
+use crate::gpu_compositor::{GpuCompositor, RenderThread};
 use crate::rendering::*;
 use crate::support::{Length, Point, ToFBig};
 use crate::tiles::perturb::{Perturbator, Toggle, gpu::{Gpu, GpuState}};
@@ -64,7 +64,7 @@ enum UpdateKind {
 
 struct App {
     window: Option<Arc<Window>>,
-    compositor: Option<GpuCompositor>,
+    render_thread: Option<RenderThread>,
     drawer: Option<Drawer>,
     backend: Arc<dyn Perturbator + Send + Sync>,
     use_gpu: Arc<std::sync::atomic::AtomicBool>,
@@ -97,7 +97,7 @@ impl App {
         let exact = |f: f64| FBig::try_from(f).unwrap().with_precision(precision).value();
         Self {
             window: None,
-            compositor: None,
+            render_thread: None,
             drawer: None,
             backend: Arc::new(toggle),
             use_gpu,
@@ -127,8 +127,8 @@ impl App {
         self.phys_width = phys_width;
         self.phys_height = phys_height;
 
-        if let Some(compositor) = &mut self.compositor {
-            compositor.resize(phys_width, phys_height);
+        if let Some(rt) = &self.render_thread {
+            rt.resize(phys_width, phys_height);
         }
         if let Some(drawer) = &mut self.drawer {
             drawer.resize(phys_width as usize, phys_height as usize, self.iterations);
@@ -165,18 +165,12 @@ impl App {
         self.coords.view = View::new(new_view);
     }
 
-    fn call_drawer_update(&mut self) {
-        let coords = self.coords.clone();
-        let iters = self.iterations;
-        let cursor = self.cursor_usize();
-        if let Some(drawer) = &mut self.drawer {
-            drawer.update(coords, iters, cursor.as_ref());
-        }
-    }
-
-    fn do_request_redraw(&self) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
+    /// Publish the current view to the render thread, which redraws it on its
+    /// next loop. Replaces the old `window.request_redraw()` path now that the
+    /// main thread no longer renders.
+    fn publish_view(&self) {
+        if let Some(rt) = &self.render_thread {
+            rt.set_view(self.coords.clone(), self.phys_width, self.phys_height);
         }
     }
 
@@ -222,8 +216,18 @@ impl ApplicationHandler for App {
             self.backend.clone(),
         );
 
+        // Hand the compositor and a store handle to the render thread; it owns
+        // the surface and draws independently of the main event loop from here.
+        let render_thread = RenderThread::spawn(
+            compositor,
+            drawer.store().clone(),
+            self.coords.clone(),
+            width,
+            height,
+        );
+
         self.window = Some(window);
-        self.compositor = Some(compositor);
+        self.render_thread = Some(render_thread);
         self.drawer = Some(drawer);
 
         self.resize(width, height);
@@ -237,8 +241,13 @@ impl ApplicationHandler for App {
     ) {
         match event {
             WindowEvent::CloseRequested => {
+                // Stop the render thread first so it releases the surface
+                // before we tear down the compute side and exit.
+                if let Some(mut rt) = self.render_thread.take() {
+                    rt.stop();
+                }
                 if let Some(drawer) = self.drawer.take() {
-                    drawer.stop().unwrap();
+                    drawer.stop();
                 }
                 event_loop.exit();
             }
@@ -247,19 +256,8 @@ impl ApplicationHandler for App {
                 self.resize(width, height);
             }
 
-            WindowEvent::RedrawRequested => {
-                let (Some(compositor), Some(drawer)) =
-                    (&mut self.compositor, &self.drawer)
-                else {
-                    return;
-                };
-                compositor.render(
-                    drawer.store(),
-                    &self.coords,
-                    self.phys_width,
-                    self.phys_height,
-                );
-            }
+            // Rendering is driven by the render thread, not RedrawRequested.
+            WindowEvent::RedrawRequested => {}
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = Some((position.x, position.y));
@@ -275,8 +273,8 @@ impl ApplicationHandler for App {
                             &start_origin.x - &exact(dx * view),
                             &start_origin.y - &exact(dy * view),
                         );
-                        self.call_drawer_update();
-                        self.do_request_redraw();
+                        self.pending_update = self.pending_update.max(UpdateKind::AroundCursor);
+                        self.publish_view();
                     }
                 }
             }
@@ -310,8 +308,11 @@ impl ApplicationHandler for App {
                     };
                     self.apply_scroll_zoom(y);
                     self.bump_precision();
-                    self.call_drawer_update();
-                    self.do_request_redraw();
+                    // Show the zoomed view immediately (interpolated from
+                    // existing tiles); schedule the compute refresh for the
+                    // about_to_wait batch so we don't thrash it per event.
+                    self.pending_update = self.pending_update.max(UpdateKind::AroundCursor);
+                    self.publish_view();
                     self.scrolling = true;
                     self.got_scroll = true;
                 }
@@ -428,14 +429,22 @@ impl ApplicationHandler for App {
                 }
             }
         }
+        if update != UpdateKind::No {
+            // Push the (possibly changed) view so the render thread repaints.
+            self.publish_view();
+        }
 
-        // Pace to ~60 fps and request a redraw every frame so rendering
-        // progress is shown continuously.
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(16),
-        ));
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        // The render thread owns continuous redraw, so the main thread is now
+        // purely event-driven. The one exception is scroll-end detection: it
+        // relies on a follow-up about_to_wait after the gesture stops, so while
+        // a scroll is in flight we schedule a short wakeup; otherwise we sleep
+        // until the next OS event.
+        if self.scrolling {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(150),
+            ));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 }
