@@ -20,7 +20,7 @@ impl<T, FromUnit, ToUnit> Scale<T, FromUnit, ToUnit> {
         }
     }
 
-    pub fn new_ref(s: &T) -> &Self {
+    pub fn from_ref(s: &T) -> &Self {
         // SAFETY: repr(transparent)
         unsafe { transmute(s) }
     }

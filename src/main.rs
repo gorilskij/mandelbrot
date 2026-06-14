@@ -1,19 +1,30 @@
 mod drawing;
+mod gpu_compositor;
 mod rendering;
 mod support;
+mod tiles;
 
-use std::{borrow::Cow, fmt::Display, str::FromStr};
+use std::borrow::Cow;
+use std::fmt::Display;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use crate::{
-    drawing::Drawer,
-    support::{Length, Point},
-};
 use clipboard::{ClipboardContext, ClipboardProvider};
 use dashu::float::FBig;
 use log::{info, trace, warn};
-use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
-use rendering::*;
-use support::ToFBig;
+use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::window::{Window, WindowId};
+
+use crate::drawing::Drawer;
+use crate::gpu_compositor::GpuCompositor;
+use crate::rendering::*;
+use crate::support::{Length, Point, ToFBig};
+use crate::tiles::perturb::{Perturbator, Toggle, gpu::{Gpu, GpuState}};
 
 struct ClipBoardData<'a> {
     coords: Cow<'a, CoordinatesBox>,
@@ -33,7 +44,7 @@ impl FromStr for ClipBoardData<'_> {
         let (coords, iterations) = s
             .split_at_checked(s.chars().position(|c| c == '/').ok_or(())?)
             .ok_or(())?;
-        let iterations = &iterations[1..]; // remove /
+        let iterations = &iterations[1..];
         Ok(Self {
             coords: Cow::Owned(coords.parse()?),
             iterations: iterations.parse().map_err(drop)?,
@@ -41,198 +52,397 @@ impl FromStr for ClipBoardData<'_> {
     }
 }
 
-fn main() {
-    env_logger::init();
+/// Priority-ordered: higher variant wins when merging two pending updates.
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum UpdateKind {
+    #[default]
+    No,
+    AroundCursor,
+    AroundCenter,
+    Reset,
+}
 
-    let width = 1000;
-    let height = 600;
-    // let width = 1500;
-    // let height = 1000;
+struct App {
+    window: Option<Arc<Window>>,
+    compositor: Option<GpuCompositor>,
+    drawer: Option<Drawer>,
+    backend: Arc<dyn Perturbator + Send + Sync>,
+    use_gpu: Arc<std::sync::atomic::AtomicBool>,
 
-    let mut window = Window::new("Mandelbrot", width, height, WindowOptions::default()).unwrap();
+    // Physical pixel dimensions of the window.
+    phys_width: u32,
+    phys_height: u32,
 
-    window.set_target_fps(60);
+    // Mandelbrot state.
+    coords: CoordinatesBox,
+    iterations: usize,
 
-    let precision = 100;
-    let mut coords = CoordinatesBox {
-        // these (origin, view) are always in sync with (zoomed.origin, zoomed.view)
-        origin: Point::new(
-            -2.5.to_fbig_with_precision(precision),
-            -1.0.to_fbig_with_precision(precision),
-        ),
-        // range (1) / pixel
-        view: View::new(1.0 / 300.0),
-    };
+    // Input state.
+    cursor_pos: Option<(f64, f64)>,   // physical pixels
+    mouse_left_down: bool,
+    /// (start_origin_in_units, start_cursor_physical_pixels)
+    dragging: Option<(Point<FBig, Units>, (f64, f64))>,
+    got_scroll: bool,    // did we receive scroll events since last about_to_wait?
+    scrolling: bool,     // were we scrolling last about_to_wait?
+    modifiers: ModifiersState,
 
-    let mut iterations = 2048;
+    // Queued update from key events; processed in about_to_wait.
+    pending_update: UpdateKind,
+}
 
-    let mut drawer = Drawer::new(width, height, coords.clone(), iterations);
-
-    let mut dragging = None::<Point<FBig, Pixels>>;
-
-    while window.is_open() {
-        let mut zoomed = false;
-        let mut dragged = false;
-
-        // mouse position in pixels with the top-left corner of the window as the origin
-        let cursor_rel = window
-            .get_mouse_pos(MouseMode::Discard)
-            .map(|(x, y)| Point::<_, Pixels>::new(x, y));
-        let cursor_rel_fbig = cursor_rel.map(|p| p.cast(|f| f.to_fbig()));
-
-        if let Some(cursor_rel) = &cursor_rel_fbig {
-            let view_fbig = coords.view.cast(move |f| f.to_fbig());
-
-            if window.get_mouse_down(MouseButton::Left) {
-                if dragging.is_none() {
-                    trace!("start dragging");
-                }
-
-                if let Some(last) = dragging {
-                    dragged = true;
-
-                    let drag = cursor_rel - &last;
-                    coords.origin -= &(&drag * &view_fbig);
-                    // coords.origin = (
-                    // &coords.origin.0 - &drag_px.0 * &view_bf_px2un,
-                    // &coords.origin.1 - &drag_px.1 * &view_bf_px2un,
-                    // );
-                }
-                dragging = Some(cursor_rel.clone());
-            } else {
-                if dragging.is_some() {
-                    trace!("stop dragging");
-                    // perform an update on release
-                    dragged = true;
-                }
-
-                dragging = None;
-
-                // scroll wheel is only read outside of dragging
-                if let Some((_, scroll_y)) = window.get_scroll_wheel() {
-                    zoomed = true;
-
-                    let cursor_abs = &coords.origin + &(cursor_rel * &view_fbig);
-                    trace!(
-                        "zoomed at {:?} (abs)",
-                        cursor_abs.cast(|f| f.to_f64().value())
-                    );
-                    let multiplier = 1.0 + (scroll_y as f64 / 100.0).clamp(-0.2, 0.2);
-
-                    coords.origin =
-                        &cursor_abs + &(&(&coords.origin - &cursor_abs) / &multiplier.to_fbig());
-                    coords.view = View::new(coords.view.inner / multiplier);
-
-                    // the zoom level is just the width of the screen in units
-                    let width = Length::<_, Pixels>::new(width as f64) * coords.view;
-                    info!("zoom level: 10^{}", -width.inner.log10());
-                }
-            }
+impl App {
+    fn new() -> Self {
+        let precision = 100;
+        let (toggle, use_gpu) = Toggle::new(Gpu(Arc::new(GpuState::new())));
+        let exact = |f: f64| FBig::try_from(f).unwrap().with_precision(precision).value();
+        Self {
+            window: None,
+            compositor: None,
+            drawer: None,
+            backend: Arc::new(toggle),
+            use_gpu,
+            phys_width: 0,
+            phys_height: 0,
+            coords: CoordinatesBox {
+                // Temporary origin; recentered on (-0.5, 0) in resumed() once
+                // the physical window size (and thus HiDPI scale) is known.
+                origin: Point::new(exact(-0.5), exact(0.0)),
+                view: View::new(1.0 / 600.0),
+            },
+            iterations: 2048,
+            cursor_pos: None,
+            mouse_left_down: false,
+            dragging: None,
+            got_scroll: false,
+            scrolling: false,
+            modifiers: ModifiersState::empty(),
+            pending_update: UpdateKind::No,
         }
-
-        enum UpdateDrawer {
-            AroundCursor,
-            AroundCenter,
-            No,
-        }
-
-        let update_drawer = {
-            if dragged || zoomed {
-                trace!("send update to drawer");
-                UpdateDrawer::AroundCursor
-            } else if window.is_key_pressed(Key::Up, KeyRepeat::No) {
-                iterations *= 2;
-                info!("iterations: {iterations}");
-                UpdateDrawer::AroundCursor
-            } else if window.is_key_pressed(Key::Down, KeyRepeat::No) && iterations > 1 {
-                iterations /= 2;
-                info!("iterations: {iterations}");
-                UpdateDrawer::AroundCursor
-            } else if (window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl))
-                && window.is_key_pressed(Key::C, KeyRepeat::No)
-            {
-                let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
-                let data = ClipBoardData {
-                    coords: Cow::Borrowed(&coords),
-                    iterations,
-                };
-                ctx.set_contents(data.to_string()).unwrap();
-                info!("copied coords to clipboard");
-                UpdateDrawer::No
-            } else if (window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl))
-                && window.is_key_pressed(Key::V, KeyRepeat::No)
-            {
-                let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
-                if let Ok(new_data) = ctx.get_contents().unwrap().parse::<ClipBoardData>() {
-                    coords = new_data.coords.into_owned();
-                    iterations = new_data.iterations;
-                    info!("pasted coords from clipboard");
-                    UpdateDrawer::AroundCenter
-                } else {
-                    warn!("tried to paste with invalid clipboard");
-                    UpdateDrawer::No
-                }
-            }
-            // for debug
-            // else if window.is_key_pressed(Key::Left, KeyRepeat::No) {
-            //     // set vertical center to 0
-            //     coords.origin.y = -(height as f64 / 2.0 * coords.view.inner).to_fbig();
-            //     UpdateDrawer::AroundCenter
-            // }
-            //
-            // else if window.is_key_pressed(Key::Right, KeyRepeat::No) {
-            //     {
-            //         let width = Length::<_, Pixels>::new(width as f64) * coords.view;
-            //         println!(
-            //             "enter new zoom level (exponent), current: 10^{}",
-            //             -width.inner.log10()
-            //         );
-            //     }
-
-            //     if let Ok(Some(ans)) = read_line_stdin()
-            //         && let Ok(ans) = ans.parse::<i32>()
-            //     {
-            //         let new_view = Scale::new(10_f64.powi(-ans) / width as f64);
-
-            //         // adjust origin
-            //         let center_window =
-            //             Point::<_, Pixels>::new(width, height).cast(|l| *l as f64) / 2.0;
-            //         let center_abs =
-            //             &coords.origin + &(center_window * coords.view).cast(|f| f.to_fbig());
-            //         let new_origin =
-            //             &center_abs - &(center_window * new_view).cast(|f| f.to_fbig());
-
-            //         coords.origin = new_origin;
-            //         coords.view = new_view;
-            //     }
-            // }
-            //
-            else {
-                UpdateDrawer::No
-            }
-        };
-
-        match update_drawer {
-            UpdateDrawer::AroundCursor => {
-                let cursor_rel_usize = cursor_rel.map(|p| p.cast(|f| *f as usize));
-                drawer.update(coords.clone(), iterations, cursor_rel_usize.as_ref());
-            }
-            UpdateDrawer::AroundCenter => {
-                let center = Point::new(width / 2, height / 2);
-                drawer.update(coords.clone(), iterations, Some(&center));
-            }
-            UpdateDrawer::No => {}
-        };
-
-        drawer.update_display_buf();
-        if drawer.try_cache_buf() {
-            trace!("updated cache buffer");
-        }
-
-        window
-            .update_with_buffer(drawer.display_buf(), width, height)
-            .unwrap();
     }
 
-    drawer.stop().unwrap();
+    fn resize(&mut self, phys_width: u32, phys_height: u32) {
+        if phys_width == 0 || phys_height == 0 {
+            return;
+        }
+        self.phys_width = phys_width;
+        self.phys_height = phys_height;
+
+        if let Some(compositor) = &mut self.compositor {
+            compositor.resize(phys_width, phys_height);
+        }
+        if let Some(drawer) = &mut self.drawer {
+            drawer.resize(phys_width as usize, phys_height as usize, self.iterations);
+        }
+    }
+
+    fn bump_precision(&mut self) {
+        let needed_bits = (96.0 - self.coords.view.inner.log2().min(0.0)) as usize;
+        if self.coords.origin.x.precision() < needed_bits
+            || self.coords.origin.y.precision() < needed_bits
+        {
+            self.coords.origin = self.coords.origin.cast(|f| {
+                if f.precision() < needed_bits {
+                    f.clone().with_precision(needed_bits).value()
+                } else {
+                    f.clone()
+                }
+            });
+        }
+    }
+
+    fn apply_scroll_zoom(&mut self, delta_y: f64) {
+        let multiplier = 1.0 + (delta_y / 100.0).clamp(-0.2, 0.2);
+        let old_view = self.coords.view.inner;
+        let new_view = old_view / multiplier;
+
+        if let Some((cx, cy)) = self.cursor_pos {
+            let exact = |f: f64| FBig::try_from(f).unwrap();
+            self.coords.origin.x =
+                &(&self.coords.origin.x + &exact(cx * old_view)) - &exact(cx * new_view);
+            self.coords.origin.y =
+                &(&self.coords.origin.y + &exact(cy * old_view)) - &exact(cy * new_view);
+        }
+        self.coords.view = View::new(new_view);
+    }
+
+    fn call_drawer_update(&mut self) {
+        let coords = self.coords.clone();
+        let iters = self.iterations;
+        let cursor = self.cursor_usize();
+        if let Some(drawer) = &mut self.drawer {
+            drawer.update(coords, iters, cursor.as_ref());
+        }
+    }
+
+    fn do_request_redraw(&self) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn cursor_usize(&self) -> Option<Point<usize, Pixels>> {
+        self.cursor_pos
+            .map(|(x, y)| Point::new(x as usize, y as usize))
+    }
+
+    fn center(&self) -> Point<usize, Pixels> {
+        Point::new(self.phys_width as usize / 2, self.phys_height as usize / 2)
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("Mandelbrot")
+                        .with_inner_size(LogicalSize::new(1500u32, 1000u32))
+                        .with_resizable(true),
+                )
+                .unwrap(),
+        );
+
+        let PhysicalSize { width, height } = window.inner_size();
+
+        // Center the view on (-0.5, 0) using the actual physical size.
+        let view = self.coords.view.inner;
+        let exact = |f: f64| FBig::try_from(f).unwrap();
+        self.coords.origin = Point::new(
+            exact(-0.5 - (width as f64 / 2.0) * view),
+            exact(0.0  - (height as f64 / 2.0) * view),
+        );
+
+        let compositor = GpuCompositor::new(window.clone());
+        let drawer = Drawer::new(
+            width as usize,
+            height as usize,
+            self.coords.clone(),
+            self.iterations,
+            self.backend.clone(),
+        );
+
+        self.window = Some(window);
+        self.compositor = Some(compositor);
+        self.drawer = Some(drawer);
+
+        self.resize(width, height);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => {
+                if let Some(drawer) = self.drawer.take() {
+                    drawer.stop().unwrap();
+                }
+                event_loop.exit();
+            }
+
+            WindowEvent::Resized(PhysicalSize { width, height }) => {
+                self.resize(width, height);
+            }
+
+            WindowEvent::RedrawRequested => {
+                let (Some(compositor), Some(drawer)) =
+                    (&mut self.compositor, &self.drawer)
+                else {
+                    return;
+                };
+                compositor.render(
+                    drawer.store(),
+                    &self.coords,
+                    self.phys_width,
+                    self.phys_height,
+                );
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = Some((position.x, position.y));
+
+                // Update drag coords immediately on every cursor move.
+                if self.mouse_left_down {
+                    if let Some((start_origin, start_cursor)) = self.dragging.clone() {
+                        let dx = position.x - start_cursor.0;
+                        let dy = position.y - start_cursor.1;
+                        let view = self.coords.view.inner;
+                        let exact = |f: f64| FBig::try_from(f).unwrap();
+                        self.coords.origin = Point::new(
+                            &start_origin.x - &exact(dx * view),
+                            &start_origin.y - &exact(dy * view),
+                        );
+                        self.call_drawer_update();
+                        self.do_request_redraw();
+                    }
+                }
+            }
+
+            WindowEvent::MouseInput {
+                button: MouseButton::Left,
+                state,
+                ..
+            } => match state {
+                ElementState::Pressed => {
+                    self.mouse_left_down = true;
+                    if let Some(cursor) = self.cursor_pos {
+                        trace!("start dragging");
+                        self.dragging = Some((self.coords.origin.clone(), cursor));
+                    }
+                }
+                ElementState::Released => {
+                    self.mouse_left_down = false;
+                    if self.dragging.take().is_some() {
+                        trace!("stop dragging");
+                    }
+                }
+            },
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Only zoom when not dragging (matches old behaviour).
+                if !self.mouse_left_down {
+                    let y = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y as f64 * 2.5,
+                        MouseScrollDelta::PixelDelta(pos) => pos.y / 4.0,
+                    };
+                    self.apply_scroll_zoom(y);
+                    self.bump_precision();
+                    self.call_drawer_update();
+                    self.do_request_redraw();
+                    self.scrolling = true;
+                    self.got_scroll = true;
+                }
+            }
+
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods.state();
+            }
+
+            WindowEvent::KeyboardInput {
+                event:
+                    winit::event::KeyEvent {
+                        physical_key: PhysicalKey::Code(code),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                let ctrl = self.modifiers.control_key() || self.modifiers.super_key();
+                match code {
+                    KeyCode::Space => {
+                        info!("reset (spacebar)");
+                        self.pending_update = UpdateKind::Reset;
+                    }
+                    KeyCode::Escape => {
+                        let now_gpu = !self.use_gpu.load(std::sync::atomic::Ordering::Relaxed);
+                        self.use_gpu.store(now_gpu, std::sync::atomic::Ordering::Relaxed);
+                        info!("backend: {}", if now_gpu { "GPU" } else { "CPU" });
+                        self.pending_update = UpdateKind::Reset;
+                    }
+                    KeyCode::ArrowUp => {
+                        self.iterations *= 2;
+                        info!("iterations: {}", self.iterations);
+                        self.pending_update =
+                            self.pending_update.max(UpdateKind::AroundCursor);
+                    }
+                    KeyCode::ArrowDown if self.iterations > 1 => {
+                        self.iterations /= 2;
+                        info!("iterations: {}", self.iterations);
+                        self.pending_update =
+                            self.pending_update.max(UpdateKind::AroundCursor);
+                    }
+                    KeyCode::KeyC if ctrl => {
+                        let data = ClipBoardData {
+                            coords: Cow::Borrowed(&self.coords),
+                            iterations: self.iterations,
+                        };
+                        let s = data.to_string();
+                        info!("COPIED: {s}");
+                        match ClipboardProvider::new()
+                            .and_then(|mut ctx: ClipboardContext| ctx.set_contents(s))
+                        {
+                            Ok(()) => {}
+                            Err(e) => warn!("clipboard copy failed: {e}"),
+                        }
+                    }
+                    KeyCode::KeyV if ctrl => {
+                        let mut ctx: ClipboardContext =
+                            ClipboardProvider::new().unwrap();
+                        let contents = ctx.get_contents().unwrap_or_default();
+                        if let Ok(new_data) = contents.parse::<ClipBoardData>() {
+                            self.coords = new_data.coords.into_owned();
+                            self.iterations = new_data.iterations;
+                            info!("PASTED: {}", contents.trim());
+                            self.pending_update =
+                                self.pending_update.max(UpdateKind::AroundCenter);
+                        } else {
+                            warn!(
+                                "PASTE FAILED: invalid clipboard contents: {contents:?}"
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Detect scroll-end: got_scroll is set by each MouseWheel event.
+        // When it's false for a whole about_to_wait cycle, the gesture ended.
+        if std::mem::take(&mut self.got_scroll) {
+            // Scroll in progress — zoom already applied per event, log zoom level.
+            let w = Length::<_, Pixels>::new(self.phys_width as f64) * self.coords.view;
+            info!("zoom level: 10^{}", -w.inner.log10());
+        } else if self.scrolling {
+            self.scrolling = false;
+            // Final update once the scroll gesture ends.
+            self.pending_update = self.pending_update.max(UpdateKind::AroundCursor);
+        }
+
+        self.bump_precision();
+
+        // Apply pending drawer update.
+        let update = std::mem::take(&mut self.pending_update);
+        let cursor = self.cursor_usize();
+        let center = self.center();
+        let coords = self.coords.clone();
+        let iters = self.iterations;
+        if let Some(drawer) = &mut self.drawer {
+            match update {
+                UpdateKind::No => {}
+                UpdateKind::AroundCursor => {
+                    drawer.update(coords, iters, cursor.as_ref());
+                }
+                UpdateKind::AroundCenter => {
+                    drawer.update(coords, iters, Some(&center));
+                }
+                UpdateKind::Reset => {
+                    drawer.reset(coords, iters, Some(&center));
+                }
+            }
+        }
+
+        // Pace to ~60 fps and request a redraw every frame so rendering
+        // progress is shown continuously.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(16),
+        ));
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+}
+
+fn main() {
+    env_logger::init();
+    let event_loop = EventLoop::new().unwrap();
+    let mut app = App::new();
+    event_loop.run_app(&mut app).unwrap();
 }

@@ -7,16 +7,33 @@ pub struct MaybePixel(u32);
 impl MaybePixel {
     const FLAG_BIT: u32 = 1 << 31;
 
+    /// raw representation of a `None` pixel
+    pub const NONE_RAW: u32 = Self::FLAG_BIT;
+
     pub fn none() -> Self {
         MaybePixel(Self::FLAG_BIT)
     }
 
     pub fn set_none(&mut self) {
-        self.0 |= Self::FLAG_BIT
+        self.0 = Self::FLAG_BIT
     }
 
     pub fn get(self) -> Option<u32> {
         (self.0 & Self::FLAG_BIT == 0).then_some(self.0)
+    }
+
+    pub fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub fn to_raw(self) -> u32 {
+        self.0
+    }
+}
+
+impl Default for MaybePixel {
+    fn default() -> Self {
+        Self::none()
     }
 }
 
