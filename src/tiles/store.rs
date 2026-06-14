@@ -43,11 +43,6 @@ pub const GROUP_TILES: usize = 1 << GROUP_POW;
 pub const MEMORY_BUDGET_BYTES: usize = 1 << 30; // 1 GiB ~ 16k tiles
 const TILE_BYTES: usize = TILE_LEN * size_of::<u32>();
 
-/// 2^e as an exact FBig (works far outside the f64 exponent range)
-pub fn pow2(e: i64) -> FBig {
-    FBig::from_parts(IBig::from(1), 0) << e as isize
-}
-
 /// log2 of units per pixel at a given depth
 fn upp_log2(depth: i64) -> i64 {
     DEPTH_0_TILE_SPAN_LOG2 - TILE_POW as i64 - depth
@@ -57,11 +52,6 @@ fn upp_log2(depth: i64) -> i64 {
 /// same as `View`)
 pub fn units_per_pixel(depth: i64) -> f64 {
     (upp_log2(depth) as f64).exp2()
-}
-
-/// units per pixel at a given depth, exact
-pub fn units_per_pixel_fbig(depth: i64) -> FBig {
-    pow2(upp_log2(depth))
 }
 
 /// Working precision (bits) for reference-orbit base points at a given depth.
@@ -169,15 +159,6 @@ impl TileKey {
         )
     }
 
-    /// the child tile at sub-position (cx, cy), cx and cy each 0 or 1
-    pub fn child(&self, cx: u64, cy: u64) -> TileKey {
-        let two = IBig::from(2);
-        TileKey {
-            depth: self.depth + 1,
-            x: &self.x * &two + IBig::from(cx),
-            y: &self.y * &two + IBig::from(cy),
-        }
-    }
 }
 
 /// A single rendered (or partially rendered) tile.
@@ -217,10 +198,6 @@ impl Tile {
 
     pub fn store(&self, idx: usize, px: MaybePixel) {
         unsafe { (*self.pixels.get())[idx] = px.to_raw() }
-    }
-
-    pub fn pixels_raw(&self) -> *const [u32] {
-        unsafe { &**self.pixels.get() }
     }
 
     pub fn passes_done(&self) -> u8 {
@@ -409,19 +386,9 @@ mod tests {
             y: IBig::from(7),
         };
         let (bx, by) = key.parent_offset();
-        assert_eq!(key.parent().child(bx, by), key);
         // -5 = 2 * (-3) + 1
         assert_eq!(key.parent().x, IBig::from(-3));
         assert_eq!(bx, 1);
         assert_eq!(by, 1);
-    }
-
-    #[test]
-    fn test_pow2() {
-        assert_eq!(pow2(3).to_f64().value(), 8.0);
-        assert_eq!(pow2(-2).to_f64().value(), 0.25);
-        // far outside the f64 range, must stay exact
-        let tiny = pow2(-2000);
-        assert_eq!((tiny << 2000).to_f64().value(), 1.0);
     }
 }

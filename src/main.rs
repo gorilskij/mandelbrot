@@ -10,7 +10,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clipboard::{ClipboardContext, ClipboardProvider};
+use arboard::Clipboard;
 use dashu::float::FBig;
 use log::{info, trace, warn};
 use winit::application::ApplicationHandler;
@@ -23,7 +23,7 @@ use winit::window::{Window, WindowId};
 use crate::drawing::Drawer;
 use crate::gpu_compositor::{GpuCompositor, RenderThread};
 use crate::rendering::*;
-use crate::support::{Length, Point, ToFBig};
+use crate::support::{Length, Point};
 use crate::tiles::perturb::{Perturbator, Toggle, gpu::{Gpu, GpuState}};
 
 struct ClipBoardData<'a> {
@@ -363,17 +363,15 @@ impl ApplicationHandler for App {
                         };
                         let s = data.to_string();
                         info!("COPIED: {s}");
-                        match ClipboardProvider::new()
-                            .and_then(|mut ctx: ClipboardContext| ctx.set_contents(s))
-                        {
+                        match Clipboard::new().and_then(|mut cb| cb.set_text(s)) {
                             Ok(()) => {}
                             Err(e) => warn!("clipboard copy failed: {e}"),
                         }
                     }
                     KeyCode::KeyV if ctrl => {
-                        let mut ctx: ClipboardContext =
-                            ClipboardProvider::new().unwrap();
-                        let contents = ctx.get_contents().unwrap_or_default();
+                        let contents = Clipboard::new()
+                            .and_then(|mut cb| cb.get_text())
+                            .unwrap_or_default();
                         if let Ok(new_data) = contents.parse::<ClipBoardData>() {
                             self.coords = new_data.coords.into_owned();
                             self.iterations = new_data.iterations;

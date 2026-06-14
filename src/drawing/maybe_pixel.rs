@@ -10,14 +10,6 @@ impl MaybePixel {
     /// raw representation of a `None` pixel
     pub const NONE_RAW: u32 = Self::FLAG_BIT;
 
-    pub fn none() -> Self {
-        MaybePixel(Self::FLAG_BIT)
-    }
-
-    pub fn set_none(&mut self) {
-        self.0 = Self::FLAG_BIT
-    }
-
     pub fn get(self) -> Option<u32> {
         (self.0 & Self::FLAG_BIT == 0).then_some(self.0)
     }
@@ -28,12 +20,6 @@ impl MaybePixel {
 
     pub fn to_raw(self) -> u32 {
         self.0
-    }
-}
-
-impl Default for MaybePixel {
-    fn default() -> Self {
-        Self::none()
     }
 }
 

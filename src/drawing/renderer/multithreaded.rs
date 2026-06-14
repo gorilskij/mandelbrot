@@ -18,7 +18,6 @@ pub type Message = (
 );
 
 pub struct Handle {
-    handle: thread::JoinHandle<()>,
     sender: wi::Sender<Message>,
 }
 
@@ -55,7 +54,9 @@ pub fn spawn(
 
     let tp = ThreadPoolBuilder::new().num_threads(12).build().unwrap();
 
-    let handle = thread::spawn(move || {
+    // Detached: the thread is reclaimed at process exit. `terminate()` only
+    // signals it to stop; we never join (see `Handle::terminate`).
+    thread::spawn(move || {
         // memoized per-group shared reference lists; persists across
         // generations and is dropped only when the iteration count changes
         let group_cache = Mutex::new(GroupCache::new());
@@ -80,5 +81,5 @@ pub fn spawn(
         );
     });
 
-    Handle { handle, sender }
+    Handle { sender }
 }

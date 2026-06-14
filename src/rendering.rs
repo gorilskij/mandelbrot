@@ -1,11 +1,8 @@
-use crate::drawing::maybe_pixel::MaybePixel;
 use crate::support::{Point, Scale};
 use dashu::float::{DBig, FBig};
 use hsl::HSL;
 use itertools::Itertools;
 use num::Complex;
-use palette::rgb::Rgb;
-use palette::{Mix, Srgb, rgb};
 use std::fmt::Display;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
@@ -175,36 +172,3 @@ pub fn val_to_color(val: Option<NonZeroUsize>) -> u32 {
     }
 }
 
-pub fn interpolate(
-    color_tl: MaybePixel, // top left
-    color_tr: MaybePixel, // top right
-    color_bl: MaybePixel, // bottom left
-    color_br: MaybePixel, // bottom right
-    /* (y, x) where tl is (0, 0) */
-    location: (f64, f64),
-) -> MaybePixel {
-    let Some(color_tl) = color_tl.get() else {
-        return MaybePixel::none();
-    };
-    let Some(color_tr) = color_tr.get() else {
-        return MaybePixel::none();
-    };
-    let Some(color_bl) = color_bl.get() else {
-        return MaybePixel::none();
-    };
-    let Some(color_br) = color_br.get() else {
-        return MaybePixel::none();
-    };
-
-    let color_tl = Rgb::<Srgb, _>::from(color_tl).into_format();
-    let color_tr = Rgb::<Srgb, _>::from(color_tr).into_format();
-    let color_bl = Rgb::<Srgb, _>::from(color_bl).into_format();
-    let color_br = Rgb::<Srgb, _>::from(color_br).into_format();
-
-    let top = color_tl.mix(color_tr, location.1);
-    let bottom = color_bl.mix(color_br, location.1);
-
-    let color = top.mix(bottom, location.0).into_format();
-
-    color.into_u32::<rgb::channels::Argb>().into()
-}

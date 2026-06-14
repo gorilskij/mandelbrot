@@ -1,5 +1,4 @@
 use crate::rendering::CoordinatesBox;
-use crate::tiles::compose::MAX_CLIMB;
 use crate::tiles::store::{
     NUM_PASSES, PASS_STRIDES, TILE_SIZE, TileKey, TileStore, depth_for_view, tile_index,
     units_per_pixel,
@@ -54,6 +53,10 @@ fn fs(v: VOut) -> @location(0) vec4<f32> {
 const PROGRESS_BAR: bool = true;
 const BAR_HEIGHT_PX: u32 = 10;
 
+/// How many parent levels to climb looking for a coarser tile to upscale when
+/// the target tile has no data yet (the preview while a fresh view renders).
+const MAX_CLIMB: usize = 40;
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Vertex {
@@ -70,7 +73,6 @@ struct BarVertex {
 
 struct TileEntry {
     texture: wgpu::Texture,
-    view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
     tex_size: u32,
     passes_done: u8,
@@ -429,7 +431,7 @@ impl GpuCompositor {
                 });
                 if PROGRESS_BAR {
                 if let Some((fill, bg_gray, fill_gray)) = bar_progress(store, depth, &x0, &y0, nx, ny) {
-                    let bar_verts = bar_vertices(width, height, fill, bg_gray, fill_gray);
+                    let bar_verts = bar_vertices(height, fill, bg_gray, fill_gray);
                     let bar_vbuf =
                         self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                             label: None,
@@ -478,7 +480,7 @@ impl GpuCompositor {
             // Progress bar overlay.
             if PROGRESS_BAR {
             if let Some((fill, bg_gray, fill_gray)) = bar_progress(store, depth, &x0, &y0, nx, ny) {
-                let bar_verts = bar_vertices(width, height, fill, bg_gray, fill_gray);
+                let bar_verts = bar_vertices(height, fill, bg_gray, fill_gray);
                 let bar_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
                     contents: bytemuck::cast_slice(&bar_verts),
@@ -565,7 +567,7 @@ impl GpuCompositor {
                 },
             ],
         });
-        self.tiles.insert(key.clone(), TileEntry { texture, view, bind_group, tex_size, passes_done });
+        self.tiles.insert(key.clone(), TileEntry { texture, bind_group, tex_size, passes_done });
     }
 
     /// Sample the stride grid from tile pixels into an Rgba8Unorm buffer.
@@ -629,7 +631,7 @@ fn bar_progress(
 
 /// Build bar quad vertices: background (last completed pass color) + colored
 /// fill (current pass color), both covering the bottom BAR_HEIGHT_PX pixels.
-fn bar_vertices(width: u32, height: u32, fill: f32, bg_gray: f32, fill_gray: f32) -> [BarVertex; 12] {
+fn bar_vertices(height: u32, fill: f32, bg_gray: f32, fill_gray: f32) -> [BarVertex; 12] {
     let h = height as f32;
 
     // Clip-space y coords for the bar (bottom strip).
