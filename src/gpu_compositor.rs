@@ -1,7 +1,8 @@
 use crate::rendering::CoordinatesBox;
 use crate::tiles::compose::MAX_CLIMB;
 use crate::tiles::store::{
-    PASS_STRIDES, TILE_SIZE, TileKey, TileStore, depth_for_view, tile_index, units_per_pixel,
+    NUM_PASSES, PASS_STRIDES, TILE_SIZE, TileKey, TileStore, depth_for_view, tile_index,
+    units_per_pixel,
 };
 use bytemuck::{Pod, Zeroable};
 use dashu::integer::IBig;
@@ -31,11 +32,38 @@ fn fs(v: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+const BAR_SHADER: &str = r#"
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+}
+
+@vertex
+fn vs(@location(0) pos: vec2<f32>, @location(1) color: vec4<f32>) -> VOut {
+    return VOut(vec4<f32>(pos, 0.0, 1.0), color);
+}
+
+@fragment
+fn fs(v: VOut) -> @location(0) vec4<f32> {
+    return v.color;
+}
+"#;
+
+const PROGRESS_BAR: bool = true;
+const BAR_HEIGHT_PX: u32 = 10;
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Vertex {
     pos: [f32; 2],
     uv: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct BarVertex {
+    pos: [f32; 2],
+    color: [f32; 4],
 }
 
 struct TileEntry {
@@ -52,6 +80,7 @@ pub struct GpuCompositor {
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    bar_pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
     bgl: wgpu::BindGroupLayout,
     tiles: HashMap<TileKey, TileEntry>,
@@ -176,12 +205,63 @@ impl GpuCompositor {
                 ..Default::default()
             });
 
+            let bar_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Wgsl(BAR_SHADER.into()),
+            });
+            let bar_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[],
+                immediate_size: 0,
+            });
+            let bar_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&bar_layout),
+                vertex: wgpu::VertexState {
+                    module: &bar_shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: size_of::<BarVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 8,
+                                shader_location: 1,
+                            },
+                        ],
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &bar_shader,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
             GpuCompositor {
                 device,
                 queue,
                 surface,
                 surface_config,
                 pipeline,
+                bar_pipeline,
                 sampler,
                 bgl,
                 tiles: HashMap::new(),
@@ -300,18 +380,34 @@ impl GpuCompositor {
         let mut enc = self.device.create_command_encoder(&Default::default());
 
         if verts.is_empty() {
-            let _ = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &frame_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &frame_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+                if PROGRESS_BAR {
+                if let Some((fill, bg_gray, fill_gray)) = bar_progress(store, depth, &x0, &y0, nx, ny) {
+                    let bar_verts = bar_vertices(width, height, fill, bg_gray, fill_gray);
+                    let bar_vbuf =
+                        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None,
+                            contents: bytemuck::cast_slice(&bar_verts),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+                    pass.set_pipeline(&self.bar_pipeline);
+                    pass.set_vertex_buffer(0, bar_vbuf.slice(..));
+                    pass.draw(0..bar_verts.len() as u32, 0..1);
+                }
+                } // PROGRESS_BAR
+            }
             self.queue.submit([enc.finish()]);
             frame.present();
             return;
@@ -344,6 +440,21 @@ impl GpuCompositor {
                     pass.draw(*base..*base + 6, 0..1);
                 }
             }
+
+            // Progress bar overlay.
+            if PROGRESS_BAR {
+            if let Some((fill, bg_gray, fill_gray)) = bar_progress(store, depth, &x0, &y0, nx, ny) {
+                let bar_verts = bar_vertices(width, height, fill, bg_gray, fill_gray);
+                let bar_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&bar_verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                pass.set_pipeline(&self.bar_pipeline);
+                pass.set_vertex_buffer(0, bar_vbuf.slice(..));
+                pass.draw(0..bar_verts.len() as u32, 0..1);
+            }
+            } // PROGRESS_BAR
         }
 
         self.queue.submit([enc.finish()]);
@@ -440,4 +551,74 @@ impl GpuCompositor {
         }
         data
     }
+}
+
+/// Returns (fill 0..1, bg_gray 0..1, fill_gray 0..1) for the progress bar,
+/// or None if all tiles have finished all passes (bar should be hidden).
+///
+/// bg_gray = color of the last fully-completed pass (0 = black if none).
+/// fill_gray = color of the pass currently being filled in.
+fn bar_progress(
+    store: &TileStore,
+    depth: i64,
+    x0: &IBig,
+    y0: &IBig,
+    nx: i64,
+    ny: i64,
+) -> Option<(f32, f32, f32)> {
+    let total = (nx * ny) as u32;
+    if total == 0 {
+        return None;
+    }
+
+    // counts[p] = number of tiles with passes_done >= p+1
+    let mut counts = [0u32; NUM_PASSES as usize];
+    for (i, j) in iproduct!(0..nx, 0..ny) {
+        let key = TileKey { depth, x: x0 + IBig::from(i), y: y0 + IBig::from(j) };
+        let pd = store.get(&key).map_or(0, |t| t.passes_done()) as usize;
+        for p in 0..pd.min(NUM_PASSES as usize) {
+            counts[p] += 1;
+        }
+    }
+
+    // Find the lowest pass that isn't yet complete for all tiles.
+    for p in 0..NUM_PASSES as usize {
+        if counts[p] < total {
+            let fill = counts[p] as f32 / total as f32;
+            let bg_gray = p as f32 / NUM_PASSES as f32;       // prev pass color (0 = black)
+            let fill_gray = (p + 1) as f32 / NUM_PASSES as f32; // current pass color
+            return Some((fill, bg_gray, fill_gray));
+        }
+    }
+    None
+}
+
+/// Build bar quad vertices: background (last completed pass color) + colored
+/// fill (current pass color), both covering the bottom BAR_HEIGHT_PX pixels.
+fn bar_vertices(width: u32, height: u32, fill: f32, bg_gray: f32, fill_gray: f32) -> [BarVertex; 12] {
+    let h = height as f32;
+
+    // Clip-space y coords for the bar (bottom strip).
+    let y0 = 1.0 - ((height - BAR_HEIGHT_PX) as f32 / h) * 2.0;
+    let y1 = -1.0_f32;
+
+    let bg_color = [bg_gray, bg_gray, bg_gray, 1.0];
+    let fill_color = [fill_gray, fill_gray, fill_gray, 1.0];
+
+    // Background: full width, color of last completed pass.
+    let bg = quad([-1.0, y0, 1.0, y1], bg_color);
+
+    // Fill: left to fill fraction, color of current pass.
+    let x1 = -1.0 + fill * 2.0;
+    let fg = quad([-1.0, y0, x1, y1], fill_color);
+
+    let mut out = [BarVertex { pos: [0.0; 2], color: [0.0; 4] }; 12];
+    out[..6].copy_from_slice(&bg);
+    out[6..].copy_from_slice(&fg);
+    out
+}
+
+fn quad([x0, y0, x1, y1]: [f32; 4], color: [f32; 4]) -> [BarVertex; 6] {
+    let v = |x, y| BarVertex { pos: [x, y], color };
+    [v(x0,y0), v(x1,y0), v(x0,y1), v(x1,y0), v(x1,y1), v(x0,y1)]
 }

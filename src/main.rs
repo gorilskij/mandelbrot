@@ -94,6 +94,7 @@ impl App {
     fn new() -> Self {
         let precision = 100;
         let (toggle, use_gpu) = Toggle::new(Gpu(Arc::new(GpuState::new())));
+        let exact = |f: f64| FBig::try_from(f).unwrap().with_precision(precision).value();
         Self {
             window: None,
             compositor: None,
@@ -103,11 +104,10 @@ impl App {
             phys_width: 0,
             phys_height: 0,
             coords: CoordinatesBox {
-                origin: Point::new(
-                    (-2.5_f64).to_fbig_with_precision(precision),
-                    (-1.0_f64).to_fbig_with_precision(precision),
-                ),
-                view: View::new(1.0 / 300.0),
+                // Temporary origin; recentered on (-0.5, 0) in resumed() once
+                // the physical window size (and thus HiDPI scale) is known.
+                origin: Point::new(exact(-0.5), exact(0.0)),
+                view: View::new(1.0 / 600.0),
             },
             iterations: 2048,
             cursor_pos: None,
@@ -204,6 +204,14 @@ impl ApplicationHandler for App {
         );
 
         let PhysicalSize { width, height } = window.inner_size();
+
+        // Center the view on (-0.5, 0) using the actual physical size.
+        let view = self.coords.view.inner;
+        let exact = |f: f64| FBig::try_from(f).unwrap();
+        self.coords.origin = Point::new(
+            exact(-0.5 - (width as f64 / 2.0) * view),
+            exact(0.0  - (height as f64 / 2.0) * view),
+        );
 
         let compositor = GpuCompositor::new(window.clone());
         let drawer = Drawer::new(
