@@ -8,7 +8,9 @@ use bytemuck::{Pod, Zeroable};
 use dashu::integer::IBig;
 use itertools::iproduct;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -653,4 +655,155 @@ fn bar_vertices(width: u32, height: u32, fill: f32, bg_gray: f32, fill_gray: f32
 fn quad([x0, y0, x1, y1]: [f32; 4], color: [f32; 4]) -> [BarVertex; 6] {
     let v = |x, y| BarVertex { pos: [x, y], color };
     [v(x0,y0), v(x1,y0), v(x0,y1), v(x1,y0), v(x1,y1), v(x0,y1)]
+}
+
+// ---------------------------------------------------------------------------
+// Render thread
+//
+// The compositor owns the wgpu surface, and the only blocking call in the
+// whole app — `surface.get_current_texture()` waiting on vsync — lives inside
+// `render()`. Running that on the main thread couples frame production to the
+// winit event loop: while the main thread is blocked in present, the OS can't
+// deliver window-drag/resize events, so dragging stutters whenever the GPU is
+// busy.
+//
+// Moving rendering to its own thread decouples the two. The main thread only
+// pumps input and writes the latest view into `Shared`; this thread reads the
+// latest view at the top of each loop and draws it. Because it always reads
+// *current* state, intermediate frames produced faster than it can draw are
+// never encoded — "newest wins", same effect as a Mailbox swapchain but under
+// our control and independent of platform support.
+// ---------------------------------------------------------------------------
+
+struct Inner {
+    coords: CoordinatesBox,
+    width: u32,
+    height: u32,
+    /// bumped whenever the view (coords/size) changes; lets the render thread
+    /// tell "nothing changed, park" from "new view, redraw".
+    generation: u64,
+    /// pending surface reconfigure; only the render thread may touch the surface
+    resize: Option<(u32, u32)>,
+    exit: bool,
+}
+
+struct Shared {
+    inner: Mutex<Inner>,
+    cv: Condvar,
+}
+
+/// Handle to the render thread. The main thread keeps this; the compositor and
+/// the actual draw loop live on the spawned thread.
+pub struct RenderThread {
+    shared: Arc<Shared>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RenderThread {
+    pub fn spawn(
+        mut compositor: GpuCompositor,
+        store: Arc<TileStore>,
+        coords: CoordinatesBox,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let shared = Arc::new(Shared {
+            inner: Mutex::new(Inner {
+                coords,
+                width,
+                height,
+                generation: 0,
+                resize: None,
+                exit: false,
+            }),
+            cv: Condvar::new(),
+        });
+
+        let s = shared.clone();
+        let handle = thread::Builder::new()
+            .name("render".into())
+            .spawn(move || {
+                // Compile pipelines up front so the first real frame doesn't stall.
+                compositor.warmup();
+
+                loop {
+                    // Snapshot the latest view under the lock, then release it
+                    // before the (potentially vsync-blocking) render.
+                    let (coords, w, h, resize, exit, generation) = {
+                        let mut g = s.inner.lock().unwrap();
+                        let resize = g.resize.take();
+                        (g.coords.clone(), g.width, g.height, resize, g.exit, g.generation)
+                    };
+                    if exit {
+                        break;
+                    }
+                    if let Some((rw, rh)) = resize {
+                        compositor.resize(rw, rh);
+                    }
+
+                    // Progress is read *before* rendering: any tiles completed
+                    // during the render show up as a change on the next pass and
+                    // keep us looping at vsync rate while computation is active.
+                    let progress = store.progress();
+                    compositor.render(&store, &coords, w, h);
+                    let last_gen = generation;
+                    let last_progress = progress;
+
+                    // Park until the view changes, a resize is queued, exit is
+                    // requested, or computation makes further progress. The
+                    // timeout is a safety net for progress bumped asynchronously
+                    // by the compute threads (which don't signal the condvar).
+                    let mut g = s.inner.lock().unwrap();
+                    while !g.exit
+                        && g.generation == last_gen
+                        && g.resize.is_none()
+                        && store.progress() == last_progress
+                    {
+                        g = s.cv.wait_timeout(g, Duration::from_millis(100)).unwrap().0;
+                    }
+                }
+            })
+            .expect("spawn render thread");
+
+        RenderThread { shared, handle: Some(handle) }
+    }
+
+    /// Publish a new view for the render thread to draw on its next loop.
+    pub fn set_view(&self, coords: CoordinatesBox, width: u32, height: u32) {
+        {
+            let mut g = self.shared.inner.lock().unwrap();
+            g.coords = coords;
+            g.width = width;
+            g.height = height;
+            g.generation = g.generation.wrapping_add(1);
+        }
+        self.shared.cv.notify_one();
+    }
+
+    /// Queue a surface reconfigure (the render thread owns the surface).
+    pub fn resize(&self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        {
+            let mut g = self.shared.inner.lock().unwrap();
+            g.width = width;
+            g.height = height;
+            g.resize = Some((width, height));
+            g.generation = g.generation.wrapping_add(1);
+        }
+        self.shared.cv.notify_one();
+    }
+
+    /// Signal the render thread to stop and wait for it to drop the surface.
+    pub fn stop(&mut self) {
+        {
+            let mut g = self.shared.inner.lock().unwrap();
+            g.exit = true;
+        }
+        self.shared.cv.notify_one();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
