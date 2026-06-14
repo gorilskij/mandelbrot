@@ -1,3 +1,4 @@
+use crate::gpu_compute::GpuCompute;
 use crate::rendering::CoordinatesBox;
 use crate::tiles::store::{
     NUM_PASSES, PASS_STRIDES, TILE_SIZE, TileKey, TileStore, depth_for_view, tile_index,
@@ -7,7 +8,7 @@ use bytemuck::{Pod, Zeroable};
 use dashu::integer::IBig;
 use itertools::iproduct;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use wgpu::util::DeviceExt;
@@ -78,6 +79,14 @@ struct TileEntry {
     passes_done: u8,
 }
 
+/// Cached fullscreen texture for the GPU compute path.
+struct GpuFrameTarget {
+    texture:    wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    width:      u32,
+    height:     u32,
+}
+
 pub struct GpuCompositor {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -88,6 +97,7 @@ pub struct GpuCompositor {
     sampler: wgpu::Sampler,
     bgl: wgpu::BindGroupLayout,
     tiles: HashMap<TileKey, TileEntry>,
+    gpu_frame: Option<GpuFrameTarget>,
 }
 
 impl GpuCompositor {
@@ -269,6 +279,7 @@ impl GpuCompositor {
                 sampler,
                 bgl,
                 tiles: HashMap::new(),
+                gpu_frame: None,
             }
         })
     }
@@ -312,6 +323,119 @@ impl GpuCompositor {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
+        // Invalidate cached GPU frame — it's the wrong size now.
+        if self.gpu_frame.as_ref().map_or(false, |f| f.width != width || f.height != height) {
+            self.gpu_frame = None;
+        }
+    }
+
+    /// Display a fullscreen pixel buffer produced by `GpuCompute::compute_frame`.
+    /// `pixels` is one `0x00RRGGBB` value per pixel, row-major.
+    pub fn render_pixels(&mut self, pixels: &[u32], width: u32, height: u32) {
+        if width == 0 || height == 0 || pixels.is_empty() {
+            return;
+        }
+
+        // (Re-)create texture when the resolution changes.
+        let need_new = self.gpu_frame.as_ref()
+            .map_or(true, |f| f.width != width || f.height != height);
+
+        if need_new {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label:           None,
+                size:            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count:    1,
+                dimension:       wgpu::TextureDimension::D2,
+                format:          wgpu::TextureFormat::Rgba8Unorm,
+                usage:           wgpu::TextureUsages::TEXTURE_BINDING
+                                 | wgpu::TextureUsages::COPY_DST,
+                view_formats:    &[],
+            });
+            let view = texture.create_view(&Default::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label:   None,
+                layout:  &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding:  0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding:  1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            self.gpu_frame = Some(GpuFrameTarget { texture, bind_group, width, height });
+        }
+
+        // Convert 0x00RRGGBB → Rgba8Unorm (little-endian: R | G<<8 | B<<16 | A<<24).
+        let rgba: Vec<u32> = pixels
+            .iter()
+            .map(|&p| {
+                let r = (p >> 16) & 0xFF;
+                let g = (p >>  8) & 0xFF;
+                let b =  p        & 0xFF;
+                r | (g << 8) | (b << 16) | (0xFF << 24)
+            })
+            .collect();
+
+        let frame_target = self.gpu_frame.as_ref().unwrap();
+        self.queue.write_texture(
+            frame_target.texture.as_image_copy(),
+            bytemuck::cast_slice(&rgba),
+            wgpu::TexelCopyBufferLayout {
+                offset:         0,
+                bytes_per_row:  Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            _ => return,
+        };
+        let frame_view = frame.texture.create_view(&Default::default());
+
+        // Fullscreen quad: clip-space corners, UV (0,0)=top-left → (1,1)=bottom-right.
+        let verts = [
+            Vertex { pos: [-1.0,  1.0], uv: [0.0, 0.0] },
+            Vertex { pos: [ 1.0,  1.0], uv: [1.0, 0.0] },
+            Vertex { pos: [-1.0, -1.0], uv: [0.0, 1.0] },
+            Vertex { pos: [ 1.0,  1.0], uv: [1.0, 0.0] },
+            Vertex { pos: [ 1.0, -1.0], uv: [1.0, 1.0] },
+            Vertex { pos: [-1.0, -1.0], uv: [0.0, 1.0] },
+        ];
+        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    None,
+            contents: bytemuck::cast_slice(&verts),
+            usage:    wgpu::BufferUsages::VERTEX,
+        });
+
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view:           &frame_view,
+                    resolve_target: None,
+                    depth_slice:    None,
+                    ops: wgpu::Operations {
+                        load:  wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_vertex_buffer(0, vbuf.slice(..));
+            pass.set_bind_group(0, &self.gpu_frame.as_ref().unwrap().bind_group, &[]);
+            pass.draw(0..6, 0..1);
+        }
+        self.queue.submit([enc.finish()]);
+        frame.present();
     }
 
     pub fn render(&mut self, store: &TileStore, coords: &CoordinatesBox, width: u32, height: u32) {
@@ -678,11 +802,12 @@ fn quad([x0, y0, x1, y1]: [f32; 4], color: [f32; 4]) -> [BarVertex; 6] {
 // ---------------------------------------------------------------------------
 
 struct Inner {
-    coords: CoordinatesBox,
-    width: u32,
-    height: u32,
-    /// bumped whenever the view (coords/size) changes; lets the render thread
-    /// tell "nothing changed, park" from "new view, redraw".
+    coords:     CoordinatesBox,
+    width:      u32,
+    height:     u32,
+    iterations: usize,
+    /// bumped whenever the view (coords/size/iterations) changes; lets the
+    /// render thread tell "nothing changed, park" from "new view, redraw".
     generation: u64,
     /// pending surface reconfigure; only the render thread may touch the surface
     resize: Option<(u32, u32)>,
@@ -705,15 +830,19 @@ impl RenderThread {
     pub fn spawn(
         mut compositor: GpuCompositor,
         store: Arc<TileStore>,
+        gpu_compute: GpuCompute,
+        use_gpu: Arc<AtomicBool>,
         coords: CoordinatesBox,
         width: u32,
         height: u32,
+        iterations: usize,
     ) -> Self {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 coords,
                 width,
                 height,
+                iterations,
                 generation: 0,
                 resize: None,
                 exit: false,
@@ -730,38 +859,49 @@ impl RenderThread {
 
                 loop {
                     // Snapshot the latest view under the lock, then release it
-                    // before the (potentially vsync-blocking) render.
-                    let (coords, w, h, resize, exit, generation) = {
+                    // before the (potentially blocking) render.
+                    let (coords, w, h, resize, exit, generation, iterations) = {
                         let mut g = s.inner.lock().unwrap();
                         let resize = g.resize.take();
-                        (g.coords.clone(), g.width, g.height, resize, g.exit, g.generation)
+                        (
+                            g.coords.clone(), g.width, g.height,
+                            resize, g.exit, g.generation, g.iterations,
+                        )
                     };
-                    if exit {
-                        break;
-                    }
+                    if exit { break; }
                     if let Some((rw, rh)) = resize {
                         compositor.resize(rw, rh);
                     }
 
-                    // Progress is read *before* rendering: any tiles completed
-                    // during the render show up as a change on the next pass and
-                    // keep us looping at vsync rate while computation is active.
-                    let progress = store.progress();
-                    compositor.render(&store, &coords, w, h);
-                    let last_gen = generation;
-                    let last_progress = progress;
+                    if use_gpu.load(Ordering::Relaxed) {
+                        // GPU path: compute a full frame and display it.
+                        let pixels = gpu_compute.compute_frame(&coords, w, h, iterations);
+                        compositor.render_pixels(&pixels, w, h);
 
-                    // Park until the view changes, a resize is queued, exit is
-                    // requested, or computation makes further progress. The
-                    // timeout is a safety net for progress bumped asynchronously
-                    // by the compute threads (which don't signal the condvar).
-                    let mut g = s.inner.lock().unwrap();
-                    while !g.exit
-                        && g.generation == last_gen
-                        && g.resize.is_none()
-                        && store.progress() == last_progress
-                    {
-                        g = s.cv.wait_timeout(g, Duration::from_millis(100)).unwrap().0;
+                        // Park until view/iterations/exit changes.
+                        let mut g = s.inner.lock().unwrap();
+                        while !g.exit && g.generation == generation && g.resize.is_none() {
+                            g = s.cv.wait(g).unwrap();
+                        }
+                    } else {
+                        // CPU path: display whatever tiles are ready.
+                        // Read progress *before* rendering so tiles finished
+                        // during the render show up as a change on the next pass.
+                        let progress = store.progress();
+                        compositor.render(&store, &coords, w, h);
+
+                        // Park until view changes, a resize is queued, exit is
+                        // requested, or tile computation makes progress. The
+                        // timeout is a safety net for progress bumped by compute
+                        // threads (which don't signal the condvar).
+                        let mut g = s.inner.lock().unwrap();
+                        while !g.exit
+                            && g.generation == generation
+                            && g.resize.is_none()
+                            && store.progress() == progress
+                        {
+                            g = s.cv.wait_timeout(g, Duration::from_millis(100)).unwrap().0;
+                        }
                     }
                 }
             })
@@ -771,12 +911,13 @@ impl RenderThread {
     }
 
     /// Publish a new view for the render thread to draw on its next loop.
-    pub fn set_view(&self, coords: CoordinatesBox, width: u32, height: u32) {
+    pub fn set_view(&self, coords: CoordinatesBox, width: u32, height: u32, iterations: usize) {
         {
             let mut g = self.shared.inner.lock().unwrap();
             g.coords = coords;
             g.width = width;
             g.height = height;
+            g.iterations = iterations;
             g.generation = g.generation.wrapping_add(1);
         }
         self.shared.cv.notify_one();

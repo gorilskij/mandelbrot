@@ -1,4 +1,5 @@
 mod drawing;
+mod gpu_compute;
 mod gpu_compositor;
 mod rendering;
 mod support;
@@ -21,10 +22,11 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::drawing::Drawer;
+use crate::gpu_compute::GpuCompute;
 use crate::gpu_compositor::{GpuCompositor, RenderThread};
 use crate::rendering::*;
 use crate::support::{Length, Point};
-use crate::tiles::perturb::{Perturbator, Toggle, gpu::{Gpu, GpuState}};
+use crate::tiles::perturb::{Perturbator, cpu::Cpu};
 
 struct ClipBoardData<'a> {
     coords: Cow<'a, CoordinatesBox>,
@@ -66,6 +68,7 @@ struct App {
     window: Option<Arc<Window>>,
     render_thread: Option<RenderThread>,
     drawer: Option<Drawer>,
+    gpu_compute: Option<GpuCompute>,
     backend: Arc<dyn Perturbator + Send + Sync>,
     use_gpu: Arc<std::sync::atomic::AtomicBool>,
 
@@ -97,13 +100,14 @@ struct App {
 impl App {
     fn new() -> Self {
         let precision = 100;
-        let (toggle, use_gpu) = Toggle::new(Gpu(Arc::new(GpuState::new())));
+        let use_gpu = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let exact = |f: f64| FBig::try_from(f).unwrap().with_precision(precision).value();
         Self {
             window: None,
             render_thread: None,
             drawer: None,
-            backend: Arc::new(toggle),
+            gpu_compute: Some(GpuCompute::new()),
+            backend: Arc::new(Cpu),
             use_gpu,
             phys_width: 0,
             phys_height: 0,
@@ -230,7 +234,7 @@ impl App {
     /// main thread no longer renders.
     fn publish_view(&self) {
         if let Some(rt) = &self.render_thread {
-            rt.set_view(self.coords.clone(), self.phys_width, self.phys_height);
+            rt.set_view(self.coords.clone(), self.phys_width, self.phys_height, self.iterations);
         }
     }
 
@@ -284,12 +288,16 @@ impl ApplicationHandler for App {
 
         // Hand the compositor and a store handle to the render thread; it owns
         // the surface and draws independently of the main event loop from here.
+        let gpu_compute = self.gpu_compute.take().expect("GpuCompute already moved");
         let render_thread = RenderThread::spawn(
             compositor,
             drawer.store().clone(),
+            gpu_compute,
+            self.use_gpu.clone(),
             self.coords.clone(),
             width,
             height,
+            self.iterations,
         );
 
         self.window = Some(window);
