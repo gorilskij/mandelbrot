@@ -88,6 +88,10 @@ struct App {
 
     // Queued update from key events; processed in about_to_wait.
     pending_update: UpdateKind,
+
+    // (left, top, right, bottom) in Mandelbrot units — the initial view rectangle.
+    // Nothing outside this rect is ever allowed to be visible.
+    bounds: Option<(f64, f64, f64, f64)>,
 }
 
 impl App {
@@ -117,6 +121,7 @@ impl App {
             scrolling: false,
             modifiers: ModifiersState::empty(),
             pending_update: UpdateKind::No,
+            bounds: None,
         }
     }
 
@@ -153,7 +158,27 @@ impl App {
     fn apply_scroll_zoom(&mut self, delta_y: f64) {
         let multiplier = 1.0 + (delta_y / 100.0).clamp(-0.2, 0.2);
         let old_view = self.coords.view.inner;
-        let new_view = old_view / multiplier;
+        // Clamp new_view against the zoom-out limit *before* computing the
+        // origin shift so the cursor is anchored to the view that will actually
+        // be applied.  If we clamped only after, the origin would be computed
+        // for a view that's then discarded, sending the image in the wrong
+        // direction regardless of cursor position.
+        let new_view = {
+            let raw = old_view / multiplier;
+            if let Some((bl, bt, br, bb)) = self.bounds {
+                if self.phys_width > 0 && self.phys_height > 0 {
+                    let max_view = f64::min(
+                        (br - bl) / self.phys_width as f64,
+                        (bb - bt) / self.phys_height as f64,
+                    );
+                    raw.min(max_view)
+                } else {
+                    raw
+                }
+            } else {
+                raw
+            }
+        };
 
         if let Some((cx, cy)) = self.cursor_pos {
             let exact = |f: f64| FBig::try_from(f).unwrap();
@@ -163,6 +188,41 @@ impl App {
                 &(&self.coords.origin.y + &exact(cy * old_view)) - &exact(cy * new_view);
         }
         self.coords.view = View::new(new_view);
+        self.clamp_to_bounds(); // still needed to clamp origin within bounds
+    }
+
+    /// Clamp view scale and origin so the visible rect stays inside the initial
+    /// bounding rectangle. Edges that hit the boundary stay fixed; the opposite
+    /// side continues until the full initial view is restored.
+    fn clamp_to_bounds(&mut self) {
+        let Some((bl, bt, br, bb)) = self.bounds else { return };
+        if self.phys_width == 0 || self.phys_height == 0 { return }
+        let bw = br - bl;
+        let bh = bb - bt;
+        let pw = self.phys_width as f64;
+        let ph = self.phys_height as f64;
+
+        // Zoom-out limit: visible area must not exceed the bounding rect.
+        let max_view = f64::min(bw / pw, bh / ph);
+        if self.coords.view.inner > max_view {
+            self.coords.view = View::new(max_view);
+        }
+
+        let view = self.coords.view.inner;
+        let vw = pw * view;
+        let vh = ph * view;
+
+        let cur_x = self.coords.origin.x.to_f64().value();
+        let new_x = cur_x.clamp(bl, br - vw);
+        if new_x != cur_x {
+            self.coords.origin.x = FBig::try_from(new_x).unwrap();
+        }
+
+        let cur_y = self.coords.origin.y.to_f64().value();
+        let new_y = cur_y.clamp(bt, bb - vh);
+        if new_y != cur_y {
+            self.coords.origin.y = FBig::try_from(new_y).unwrap();
+        }
     }
 
     /// Publish the current view to the render thread, which redraws it on its
@@ -206,6 +266,12 @@ impl ApplicationHandler for App {
             exact(-0.5 - (width as f64 / 2.0) * view),
             exact(0.0  - (height as f64 / 2.0) * view),
         );
+
+        // Record the initial bounding rectangle. Zoom-out and pan are clamped
+        // so this rect is always the maximum visible area.
+        let ox = self.coords.origin.x.to_f64().value();
+        let oy = self.coords.origin.y.to_f64().value();
+        self.bounds = Some((ox, oy, ox + width as f64 * view, oy + height as f64 * view));
 
         let compositor = GpuCompositor::new(window.clone());
         let drawer = Drawer::new(
@@ -254,6 +320,8 @@ impl ApplicationHandler for App {
 
             WindowEvent::Resized(PhysicalSize { width, height }) => {
                 self.resize(width, height);
+                self.clamp_to_bounds();
+                self.publish_view();
             }
 
             // Rendering is driven by the render thread, not RedrawRequested.
@@ -273,6 +341,7 @@ impl ApplicationHandler for App {
                             &start_origin.x - &exact(dx * view),
                             &start_origin.y - &exact(dy * view),
                         );
+                        self.clamp_to_bounds();
                         self.pending_update = self.pending_update.max(UpdateKind::AroundCursor);
                         self.publish_view();
                     }
