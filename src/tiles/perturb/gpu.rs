@@ -231,7 +231,7 @@ fn render_tile_pass_gpu(
 
     // collect pixels to compute this pass
     let mut pixel_indices: Vec<u32> = Vec::new();
-    let mut pixel_deltas: Vec<[f32; 2]> = Vec::new();
+    let mut pixel_deltas: Vec<[Pf; 2]> = Vec::new();
     for r in (0..TILE_SIZE).step_by(stride) {
         for c in (0..TILE_SIZE).step_by(stride) {
             if let Some(cs) = coarser_stride {
@@ -263,16 +263,17 @@ fn render_tile_pass_gpu(
     // use only the most recent reference — the front of the list
     let front = refs.iter().next().expect("ref list is never empty");
     let ref_meta = RefMetaGpu {
-        delta_corr_re: front.delta_corr.re,
-        delta_corr_im: front.delta_corr.im,
+        delta_corr_re: front.delta_corr.re as f32,
+        delta_corr_im: front.delta_corr.im as f32,
         is_full: front.orbit.is_full as u32,
         orbit_len: front.orbit.orbit.len() as u32,
         orbit_offset: 0,
         _pad: [0; 3],
     };
-    let orbit_data: Vec<[f32; 2]> = front.orbit.orbit.iter().map(|c| [c.re, c.im]).collect();
+    let orbit_data: Vec<[f32; 2]> = front.orbit.orbit.iter().map(|c| [c.re as f32, c.im as f32]).collect();
+    let pixel_deltas_f32: Vec<[f32; 2]> = pixel_deltas.iter().map(|d| [d[0] as f32, d[1] as f32]).collect();
 
-    let counts = gpu_dispatch(state, &pixel_deltas, &[ref_meta], &orbit_data);
+    let counts = gpu_dispatch(state, &pixel_deltas_f32, &[ref_meta], &orbit_data);
 
     for (i, &tile_idx) in pixel_indices.iter().enumerate() {
         let count = counts[i];

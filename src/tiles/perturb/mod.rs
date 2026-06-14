@@ -44,7 +44,7 @@ pub struct Toggle {
 
 impl Toggle {
     pub fn new(gpu: Gpu) -> (Self, Arc<AtomicBool>) {
-        let use_gpu = Arc::new(AtomicBool::new(true));
+        let use_gpu = Arc::new(AtomicBool::new(false));
         let toggle = Toggle { cpu: Cpu, gpu, use_gpu: use_gpu.clone() };
         (toggle, use_gpu)
     }

@@ -71,7 +71,7 @@ fn is_bad_value(v: &Complex<FBig>) -> bool {
 /// Working float type for perturbation (reference projection + delta
 /// iteration). Set to f32 for GPU-precision testing; flip back to f64 to
 /// restore full CPU precision.
-pub type Pf = f32;
+pub type Pf = f64;
 
 pub struct Orbit<F> {
     pub is_full: bool,
@@ -95,8 +95,8 @@ pub fn calculate_orbit(x_0: Complex<FBig>, iterations: usize) -> (Orbit<FBig>, O
     let out_pf = out
         .iter()
         .map(|c| Complex {
-            re: c.re.to_f32().value(),
-            im: c.im.to_f32().value(),
+            re: c.re.to_f64().value(),
+            im: c.im.to_f64().value(),
         })
         .collect_vec()
         .into_boxed_slice();
