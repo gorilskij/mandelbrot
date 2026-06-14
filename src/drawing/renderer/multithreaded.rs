@@ -4,7 +4,6 @@ use crate::tiles::perturb::Perturbator;
 use crate::tiles::render::{GroupCache, run_generation};
 use crate::tiles::store::TileStore;
 use parking_lot::Mutex;
-use rayon::ThreadPoolBuilder;
 use std::sync::Arc;
 use std::thread;
 use waker_interrupter as wi;
@@ -47,18 +46,12 @@ impl Handle {
 }
 
 pub fn spawn(
-    store: Arc<TileStore>,
+    store:   Arc<TileStore>,
     backend: Arc<dyn Perturbator + Send + Sync>,
 ) -> Handle {
     let (sender, receiver) = wi::channel();
 
-    let tp = ThreadPoolBuilder::new().num_threads(12).build().unwrap();
-
-    // Detached: the thread is reclaimed at process exit. `terminate()` only
-    // signals it to stop; we never join (see `Handle::terminate`).
     thread::spawn(move || {
-        // memoized per-group shared reference lists; persists across
-        // generations and is dropped only when the iteration count changes
         let group_cache = Mutex::new(GroupCache::new());
 
         receiver.run_multithreaded(
@@ -74,7 +67,6 @@ pub fn spawn(
                     iterations,
                     cursor,
                     int,
-                    &tp,
                     backend.as_ref(),
                 );
             },

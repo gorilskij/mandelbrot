@@ -1,44 +1,95 @@
 //! Perturbation backends.
 //!
-//! The orchestration in `tiles::render` enumerates the visible tiles, manages
-//! the per-group reference lists, and drives the progressive passes. The
-//! actual per-pixel perturbation evaluation is delegated to a `Perturbator`
-//! backend. There are two sister implementations, each a unit struct:
-//!   - [`cpu::Cpu`]  — f32 perturbation on the CPU (rayon).
-//!   - [`gpu::Gpu`]  — wgpu compute.
+//! `tiles::render` enumerates the visible tiles, manages the per-group
+//! reference lists, and drives the progressive passes.  For each pass it
+//! hands the full set of tiles needing that pass to `Perturbator::render_pass_batch`.
 //!
-//! Reference *base points* are always high-precision FBig and computed on the
-//! CPU (GPUs have no bignum); a backend only ever sees the projected `Pf`
-//! orbits and f32 deltas.
+//! Two implementations:
+//!   - [`cpu::Cpu`]  — f32 perturbation on the CPU, parallelised with rayon.
+//!   - [`gpu::Gpu`]  — wgpu compute; batches all tiles in a pass into a single
+//!                     GPU dispatch with iterative glitch-correction passes.
 
 pub mod cpu;
 pub mod gpu;
 
-use crate::rendering::{Orbit, Pf};
+use crate::rendering::{CoordinatesBox, Orbit, Pf};
 use crate::support::append_only::List as AOList;
 use crate::tiles::store::Tile;
 use cpu::Cpu;
+use dashu::integer::IBig;
 use gpu::Gpu;
 use num::Complex;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use waker_interrupter::MultiInterrupter;
 
 /// A reference orbit (projected to `Pf`) together with its base point's delta
 /// from the group anchor.
 pub struct RefOrbit {
     pub delta_corr: Complex<Pf>,
-    pub orbit: Orbit<Pf>,
+    pub orbit:      Orbit<Pf>,
 }
 
-/// A group's shared, growable reference list (lock-free append-only). All
-/// tiles in a group read from it and promote new references into it.
+/// A group's shared, growable reference list (lock-free append-only).
 pub type RefList = AOList<RefOrbit>;
 
-/// Delegates to either [`Cpu`] or [`Gpu`] depending on a shared flag.
-/// The flag is flipped from the main thread (e.g. Escape key).
+// ---------------------------------------------------------------------------
+// Batch context
+// ---------------------------------------------------------------------------
+
+/// Per-pass context shared across all tiles in a `render_pass_batch` call.
+pub struct PassBatchCtx {
+    pub coords:     CoordinatesBox,
+    /// Tile-grid depth.
+    pub depth:      i64,
+    /// Tile-grid origin (top-left tile index at this depth).
+    pub x0:         IBig,
+    pub y0:         IBig,
+    /// Screen-pixel offset of the tile-grid origin (may be negative).
+    pub sx0:        f64,
+    pub sy0:        f64,
+    pub width:      usize,
+    pub height:     usize,
+    pub iterations: usize,
+}
+
+/// One tile's entry in a batch.
+pub struct TileItem {
+    pub tile:      Arc<Tile>,
+    /// CPU uses this to look up existing reference orbits.
+    pub refs:      RefList,
+    /// CPU uses this — pixel offset of the group anchor within the group.
+    pub anchor_px: (i64, i64),
+}
+
+// ---------------------------------------------------------------------------
+// Trait
+// ---------------------------------------------------------------------------
+
+/// Renders a batch of tiles for one progressive pass.
+///
+/// The tile store is updated in place; `finish_pass` is called on each tile
+/// upon completion (backends may skip it if interrupted mid-batch).
+pub trait Perturbator: Sync {
+    fn render_pass_batch(
+        &self,
+        ctx:   &PassBatchCtx,
+        tiles: &[TileItem],
+        pass:  u8,
+        int:   &MultiInterrupter,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Toggle
+// ---------------------------------------------------------------------------
+
+/// Delegates to either [`Cpu`] or [`Gpu`] based on a shared atomic flag.
 pub struct Toggle {
-    pub cpu: Cpu,
-    pub gpu: Gpu,
+    pub cpu:     Cpu,
+    pub gpu:     Gpu,
     pub use_gpu: Arc<AtomicBool>,
 }
 
@@ -51,38 +102,17 @@ impl Toggle {
 }
 
 impl Perturbator for Toggle {
-    fn render_tile_pass(
+    fn render_pass_batch(
         &self,
-        tile: &Tile,
-        refs: &RefList,
-        anchor_px: (i64, i64),
-        pass: u8,
-        iterations: usize,
-        int: &MultiInterrupter,
-    ) -> bool {
+        ctx:   &PassBatchCtx,
+        tiles: &[TileItem],
+        pass:  u8,
+        int:   &MultiInterrupter,
+    ) {
         if self.use_gpu.load(Ordering::Relaxed) {
-            self.gpu.render_tile_pass(tile, refs, anchor_px, pass, iterations, int)
+            self.gpu.render_pass_batch(ctx, tiles, pass, int)
         } else {
-            self.cpu.render_tile_pass(tile, refs, anchor_px, pass, iterations, int)
+            self.cpu.render_pass_batch(ctx, tiles, pass, int)
         }
     }
-}
-
-/// Evaluates a tile's progressive pass against a group's reference list.
-/// Implemented by the `cpu` and `gpu` sister modules.
-pub trait Perturbator: Sync {
-    /// Render one progressive pass of `tile` against `refs`, promoting new
-    /// references for pixels that no existing reference can resolve.
-    /// `anchor_px` is the group anchor's pixel offset within the group (deltas
-    /// are measured from there). Returns `false` if interrupted (partial
-    /// per-pixel progress is kept and skipped on retry).
-    fn render_tile_pass(
-        &self,
-        tile: &Tile,
-        refs: &RefList,
-        anchor_px: (i64, i64),
-        pass: u8,
-        iterations: usize,
-        int: &MultiInterrupter,
-    ) -> bool;
 }

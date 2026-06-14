@@ -1,18 +1,35 @@
-//! GPU perturbation backend (wgpu compute).
+//! GPU perturbation backend.
 //!
-//! The reference orbits (projected to Pf = f32) are packed into GPU storage
-//! buffers. A compute shader runs the delta iteration per pixel, writing raw
-//! iteration counts (0 = black/non-divergent, u32::MAX = glitch sentinel).
-//! Glitched pixels are resolved on the CPU by computing their own high-
-//! precision orbit and storing the result directly.
+//! For each progressive pass all visible tiles that still need it are batched
+//! into a single GPU compute dispatch.  Pixels that the perturbation
+//! approximation cannot resolve (glitches) are re-dispatched in subsequent
+//! passes with a new high-precision reference orbit, up to MAX_GLITCH_PASSES
+//! times.  Residual glitches are stored as black.
+//!
+//! Coordinate math
+//! ---------------
+//! The initial reference point is the screen centre.  Its Mandelbrot
+//! coordinate is computed at arbitrary precision on the CPU.  For every other
+//! pixel, the delta from the reference is:
+//!
+//!   δx = (col * units_per_pixel(depth) + offset_x)  [f32]
+//!
+//! where `col = tile_i * TILE_SIZE + c` is the pixel's integer position in
+//! the depth-level grid (relative to the tile-grid origin x0), and
+//!
+//!   offset_x = (sx0 − width/2) * view
+//!
+//! is a constant per pass that shifts from "grid pixels" to "Mandelbrot units
+//! centred on the screen".  The computation is done in f64 and then cast to
+//! f32.  No large-number cancellation occurs because both operands are small
+//! (a few thousand pixels, a small sub-pixel offset), so f32 precision is
+//! adequate for the initial delta.
 
-use super::{Perturbator, RefList, RefOrbit};
-use crate::rendering::{Pf, calculate_orbit, check_orbit, val_to_color};
-use crate::tiles::store::{
-    GROUP_POW, GROUP_TILES, PASS_STRIDES, TILE_SIZE, Tile, floor_div_pow2, pixel_to_coord,
-    units_per_pixel, working_precision,
-};
+use super::{PassBatchCtx, Perturbator, TileItem};
+use crate::rendering::{calculate_orbit, val_to_color};
+use crate::tiles::store::{PASS_STRIDES, TILE_SIZE, pixel_to_coord, units_per_pixel, working_precision};
 use bytemuck::{Pod, Zeroable};
+use dashu::float::FBig;
 use dashu::integer::IBig;
 use num::Complex;
 use std::num::NonZeroUsize;
@@ -20,101 +37,93 @@ use std::sync::Arc;
 use waker_interrupter::MultiInterrupter;
 use wgpu::util::DeviceExt;
 
+// ---------------------------------------------------------------------------
+// WGSL shader
+// ---------------------------------------------------------------------------
+
 const SHADER_SRC: &str = r#"
 struct Uniforms {
-    pixel_count: u32,
-    ref_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    pixel_count : u32,
+    orbit_len   : u32,
+    is_full     : u32,
+    dispatch_w  : u32,
 }
 
-// 32 bytes, all f32/u32 (align 4), array stride = 32
-struct RefMeta {
-    delta_corr_re: f32,
-    delta_corr_im: f32,
-    is_full: u32,
-    orbit_len: u32,
-    orbit_offset: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
-}
+@group(0) @binding(0) var<uniform>             uniforms     : Uniforms;
+@group(0) @binding(1) var<storage, read>       pixel_deltas : array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read>       orbit_data   : array<vec2<f32>>;
+@group(0) @binding(3) var<storage, read_write> output       : array<u32>;
 
-@group(0) @binding(0) var<uniform>             uniforms:     Uniforms;
-@group(0) @binding(1) var<storage, read>       pixel_deltas: array<vec2<f32>>;
-@group(0) @binding(2) var<storage, read>       ref_metas:    array<RefMeta>;
-@group(0) @binding(3) var<storage, read>       orbit_data:   array<vec2<f32>>;
-@group(0) @binding(4) var<storage, read_write> output:       array<u32>;
-
-const GLITCH: u32 = 0xFFFFFFFFu;
+// Bit 31 set means glitched; low 31 bits carry the iteration when detected.
+const GLITCH_BIT : u32 = 0x80000000u;
+// |δ|² > ε² |X+δ|²  with ε = 1e-3 marks the approximation as broken.
+const EPSILON_SQ : f32 = 1e-6;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    let idx = gid.y * uniforms.dispatch_w + gid.x;
     if idx >= uniforms.pixel_count { return; }
 
-    let delta_0 = pixel_deltas[idx];
+    let d0    = pixel_deltas[idx];
+    var delta = d0;
 
-    for (var ri = 0u; ri < uniforms.ref_count; ri++) {
-        let rm = ref_metas[ri];
-        let corr = vec2<f32>(rm.delta_corr_re, rm.delta_corr_im);
-        var delta = delta_0 - corr;
-        let d0 = delta;
+    for (var i = 0u; i < uniforms.orbit_len; i++) {
+        let c = orbit_data[i];
+        let x = c + delta;
 
-        for (var i = 0u; i < rm.orbit_len; i++) {
-            let c = orbit_data[rm.orbit_offset + i];
-            let x = c + delta;
-            if dot(x, x) > 4.0 {
-                output[idx] = i + 1u;
-                return;
-            }
-            // delta_{n+1} = 2*c_n*delta_n + delta_n^2 + delta_0
-            let re = 2.0 * c.x * delta.x - 2.0 * c.y * delta.y
-                   + delta.x * delta.x - delta.y * delta.y
-                   + d0.x;
-            let im = 2.0 * c.x * delta.y + 2.0 * c.y * delta.x
-                   + 2.0 * delta.x * delta.y
-                   + d0.y;
-            delta = vec2<f32>(re, im);
-        }
-
-        if rm.is_full != 0u {
-            output[idx] = 0u;
+        if dot(x, x) > 4.0 {
+            output[idx] = i + 1u;
             return;
         }
-        // glitched against this reference — try next
+
+        if dot(delta, delta) > EPSILON_SQ * dot(x, x) {
+            output[idx] = GLITCH_BIT | (i + 1u);
+            return;
+        }
+
+        // δ_{n+1} = 2 X_n δ_n + δ_n² + δ_0
+        let re = 2.0 * c.x * delta.x - 2.0 * c.y * delta.y
+               + delta.x * delta.x    - delta.y * delta.y
+               + d0.x;
+        let im = 2.0 * c.x * delta.y + 2.0 * c.y * delta.x
+               + 2.0 * delta.x * delta.y
+               + d0.y;
+        delta = vec2<f32>(re, im);
     }
 
-    output[idx] = GLITCH;
+    if uniforms.is_full != 0u {
+        output[idx] = 0u;
+    } else {
+        output[idx] = GLITCH_BIT | uniforms.orbit_len;
+    }
 }
 "#;
 
-/// GPU-side uniform block. Must match `Uniforms` in the shader exactly.
+// ---------------------------------------------------------------------------
+// CPU-side types
+// ---------------------------------------------------------------------------
+
+const GLITCH_BIT: u32 = 0x80000000;
+const MAX_GLITCH_PASSES: usize = 8;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniforms {
     pixel_count: u32,
-    ref_count: u32,
-    _pad: [u32; 2],
+    orbit_len:   u32,
+    is_full:     u32,
+    dispatch_w:  u32,
 }
 
-/// GPU-side reference metadata. Must match `RefMeta` in the shader exactly.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct RefMetaGpu {
-    delta_corr_re: f32,
-    delta_corr_im: f32,
-    is_full: u32,
-    orbit_len: u32,
-    orbit_offset: u32,
-    _pad: [u32; 3],
-}
+// ---------------------------------------------------------------------------
+// GpuState — owns the wgpu device / pipeline
+// ---------------------------------------------------------------------------
 
 pub struct GpuState {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device:   wgpu::Device,
+    queue:    wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
-    bgl: wgpu::BindGroupLayout,
+    bgl:      wgpu::BindGroupLayout,
 }
 
 impl GpuState {
@@ -135,40 +144,122 @@ impl GpuState {
                 .expect("failed to create GPU device");
 
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("perturbation"),
+                label:  Some("perturbation"),
                 source: wgpu::ShaderSource::Wgsl(SHADER_SRC.into()),
             });
 
             let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("perturbation_bgl"),
+                label:   Some("perturbation_bgl"),
                 entries: &[
                     bgl_entry(0, wgpu::BufferBindingType::Uniform),
                     bgl_entry(1, wgpu::BufferBindingType::Storage { read_only: true }),
                     bgl_entry(2, wgpu::BufferBindingType::Storage { read_only: true }),
-                    bgl_entry(3, wgpu::BufferBindingType::Storage { read_only: true }),
-                    bgl_entry(4, wgpu::BufferBindingType::Storage { read_only: false }),
+                    bgl_entry(3, wgpu::BufferBindingType::Storage { read_only: false }),
                 ],
             });
 
-            let pipeline_layout =
-                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("perturbation_pl"),
-                    bind_group_layouts: &[Some(&bgl)],
-                    immediate_size: 0,
-                });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label:                Some("perturbation_pl"),
+                bind_group_layouts:   &[Some(&bgl)],
+                immediate_size:       0,
+            });
 
-            let pipeline =
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("perturbation"),
-                    layout: Some(&pipeline_layout),
-                    module: &shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label:               Some("perturbation"),
+                layout:              Some(&layout),
+                module:              &shader,
+                entry_point:         Some("main"),
+                compilation_options: Default::default(),
+                cache:               None,
+            });
 
             GpuState { device, queue, pipeline, bgl }
         })
+    }
+
+    /// Upload deltas + orbit, dispatch, and read back raw results.
+    /// Each result: `0` = in-set, `n` = escaped at iteration n,
+    /// `GLITCH_BIT | n` = glitched at iteration n.
+    fn dispatch(&self, deltas: &[[f32; 2]], orbit_data: &[[f32; 2]], is_full: bool) -> Vec<u32> {
+        let n = deltas.len() as u32;
+        if n == 0 { return Vec::new(); }
+
+        let device = &self.device;
+        let queue  = &self.queue;
+
+        let groups     = (n + 63) / 64;
+        let gx         = groups.min(65535);
+        let gy         = (groups + 65534) / 65535;
+        let dispatch_w = gx * 64;
+
+        let uniforms_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    None,
+            contents: bytemuck::bytes_of(&Uniforms {
+                pixel_count: n,
+                orbit_len:   orbit_data.len() as u32,
+                is_full:     is_full as u32,
+                dispatch_w,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let deltas_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    None,
+            contents: bytemuck::cast_slice(deltas),
+            usage:    wgpu::BufferUsages::STORAGE,
+        });
+        let orbit_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    None,
+            contents: bytemuck::cast_slice(orbit_data),
+            usage:    wgpu::BufferUsages::STORAGE,
+        });
+
+        let output_size = n as u64 * 4;
+        let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              None,
+            size:               output_size,
+            usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              None,
+            size:               output_size,
+            usage:              wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label:   None,
+            layout:  &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniforms_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: deltas_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: orbit_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: output_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(gx, gy, 1);
+        }
+        enc.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
+        queue.submit([enc.finish()]);
+
+        let slice = staging_buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+        let data = slice.get_mapped_range();
+        let results: Vec<u32> = data
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        drop(data);
+        staging_buf.unmap();
+        results
     }
 }
 
@@ -179,223 +270,175 @@ fn bgl_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayout
         ty: wgpu::BindingType::Buffer {
             ty,
             has_dynamic_offset: false,
-            min_binding_size: None,
+            min_binding_size:   None,
         },
         count: None,
     }
 }
 
-/// wgpu perturbation backend.
+// ---------------------------------------------------------------------------
+// Gpu — the public backend struct
+// ---------------------------------------------------------------------------
+
 pub struct Gpu(pub Arc<GpuState>);
 
-impl Perturbator for Gpu {
-    fn render_tile_pass(
-        &self,
-        tile: &Tile,
-        refs: &RefList,
-        anchor_px: (i64, i64),
-        pass: u8,
-        iterations: usize,
-        int: &MultiInterrupter,
-    ) -> bool {
-        render_tile_pass_gpu(&self.0, tile, refs, anchor_px, pass, iterations, int)
-    }
+// Maps one flat result index back to the tile + pixel that produced it.
+struct PixelRef {
+    tile_idx:  usize,  // index into the `tiles` slice
+    pixel_idx: usize,  // flat tile index: r * TILE_SIZE + c
+    col:       i64,    // depth-grid col  = tile_i * TILE_SIZE + c  (relative to x0)
+    row:       i64,    // depth-grid row  = tile_j * TILE_SIZE + r
 }
 
-fn render_tile_pass_gpu(
-    state: &GpuState,
-    tile: &Tile,
-    refs: &RefList,
-    anchor_px: (i64, i64),
-    pass: u8,
-    iterations: usize,
-    int: &MultiInterrupter,
-) -> bool {
-    let stride = PASS_STRIDES[pass as usize];
-    let coarser_stride = (pass > 0).then(|| PASS_STRIDES[pass as usize - 1]);
+impl Perturbator for Gpu {
+    fn render_pass_batch(
+        &self,
+        ctx:   &PassBatchCtx,
+        tiles: &[TileItem],
+        pass:  u8,
+        int:   &MultiInterrupter,
+    ) {
+        if tiles.is_empty() || int.interrupted() { return; }
 
-    let gx = floor_div_pow2(&tile.key.x, GROUP_POW);
-    let gy = floor_div_pow2(&tile.key.y, GROUP_POW);
-    let local_x = i64::try_from(&(&tile.key.x - &gx * IBig::from(GROUP_TILES as u64)))
-        .expect("tile-in-group offset fits i64");
-    let local_y = i64::try_from(&(&tile.key.y - &gy * IBig::from(GROUP_TILES as u64)))
-        .expect("tile-in-group offset fits i64");
-    let depth = tile.key.depth;
-    let upp = units_per_pixel(depth) as Pf;
-    let anchor_dx = local_x * TILE_SIZE as i64 - anchor_px.0;
-    let anchor_dy = local_y * TILE_SIZE as i64 - anchor_px.1;
-    let tile_size_ibig = IBig::from(TILE_SIZE as u64);
-    let tile_px0_x = &tile.key.x * &tile_size_ibig;
-    let tile_px0_y = &tile.key.y * &tile_size_ibig;
-    let prec = working_precision(depth);
+        let state   = &*self.0;
+        let stride  = PASS_STRIDES[pass as usize];
+        let coarser = (pass > 0).then(|| PASS_STRIDES[pass as usize - 1]);
+        let scale   = units_per_pixel(ctx.depth); // Mandelbrot units per depth pixel
+        let view    = ctx.coords.view.inner;
 
-    // collect pixels to compute this pass
-    let mut pixel_indices: Vec<u32> = Vec::new();
-    let mut pixel_deltas: Vec<[Pf; 2]> = Vec::new();
-    for r in (0..TILE_SIZE).step_by(stride) {
-        for c in (0..TILE_SIZE).step_by(stride) {
-            if let Some(cs) = coarser_stride {
-                if r % cs == 0 && c % cs == 0 {
-                    continue;
+        // Constants that turn depth-grid column numbers into f32 deltas from
+        // the screen centre (see module-level docs).
+        let offset_x = (ctx.sx0 - ctx.width  as f64 / 2.0) * view;
+        let offset_y = (ctx.sy0 - ctx.height as f64 / 2.0) * view;
+
+        // ----------------------------------------------------------------
+        // Collect all pixels that need computing this pass.
+        // ----------------------------------------------------------------
+        let mut pixel_refs: Vec<PixelRef> = Vec::new();
+        let mut deltas:     Vec<[f32; 2]> = Vec::new();
+
+        for (ti, item) in tiles.iter().enumerate() {
+            let tile   = &item.tile;
+            let tile_i = i64::try_from(&(&tile.key.x - &ctx.x0))
+                .expect("tile grid offset fits i64");
+            let tile_j = i64::try_from(&(&tile.key.y - &ctx.y0))
+                .expect("tile grid offset fits i64");
+
+            for r in (0..TILE_SIZE).step_by(stride) {
+                for c in (0..TILE_SIZE).step_by(stride) {
+                    if let Some(cs) = coarser {
+                        if r % cs == 0 && c % cs == 0 { continue; } // done by coarser pass
+                    }
+                    let pixel_idx = r * TILE_SIZE + c;
+                    if tile.load(pixel_idx).get().is_some() { continue; } // already computed
+
+                    let col = tile_i * TILE_SIZE as i64 + c as i64;
+                    let row = tile_j * TILE_SIZE as i64 + r as i64;
+                    deltas.push([
+                        (col as f64 * scale + offset_x) as f32,
+                        (row as f64 * scale + offset_y) as f32,
+                    ]);
+                    pixel_refs.push(PixelRef { tile_idx: ti, pixel_idx, col, row });
                 }
             }
-            let idx = r * TILE_SIZE + c;
-            if tile.load(idx).get().is_some() {
-                continue;
+        }
+
+        // All pixels already computed (e.g. retrying after an interrupt).
+        if deltas.is_empty() {
+            for item in tiles { item.tile.finish_pass(pass + 1); }
+            return;
+        }
+
+        // ----------------------------------------------------------------
+        // Initial dispatch against the screen-centre reference orbit.
+        // ----------------------------------------------------------------
+        let ref_x = &ctx.coords.origin.x
+            + &FBig::try_from(ctx.width  as f64 / 2.0 * view).unwrap();
+        let ref_y = &ctx.coords.origin.y
+            + &FBig::try_from(ctx.height as f64 / 2.0 * view).unwrap();
+        let (_, ref_orbit) = calculate_orbit(
+            Complex { re: ref_x, im: ref_y },
+            ctx.iterations,
+        );
+        let orbit_data: Vec<[f32; 2]> = ref_orbit.orbit.iter()
+            .map(|c| [c.re as f32, c.im as f32])
+            .collect();
+
+        let mut raw = state.dispatch(&deltas, &orbit_data, ref_orbit.is_full);
+
+        // ----------------------------------------------------------------
+        // Glitch-correction passes.
+        // ----------------------------------------------------------------
+        for _ in 0..MAX_GLITCH_PASSES {
+            if int.interrupted() { break; }
+
+            let mut glitch_indices: Vec<usize> = Vec::new();
+            let mut best_flat = 0usize;
+            let mut best_itr  = 0u32;
+
+            for (i, &r) in raw.iter().enumerate() {
+                if r & GLITCH_BIT != 0 {
+                    let itr = r & !GLITCH_BIT;
+                    if itr > best_itr { best_itr = itr; best_flat = i; }
+                    glitch_indices.push(i);
+                }
             }
-            pixel_indices.push(idx as u32);
-            pixel_deltas.push([
-                (anchor_dx + c as i64) as Pf * upp,
-                (anchor_dy + r as i64) as Pf * upp,
-            ]);
+            if glitch_indices.is_empty() { break; }
+
+            // New reference: the glitch pixel with the longest path before
+            // detection (best proxy for a point close to the set boundary).
+            let pr       = &pixel_refs[best_flat];
+            let ref_tile = &tiles[pr.tile_idx].tile;
+            let ref_c    = pr.pixel_idx % TILE_SIZE;
+            let ref_r    = pr.pixel_idx / TILE_SIZE;
+            let ts       = IBig::from(TILE_SIZE as u64);
+            let prec     = working_precision(ctx.depth);
+            let (_, new_orbit) = calculate_orbit(
+                Complex {
+                    re: pixel_to_coord(&ref_tile.key.x * &ts + IBig::from(ref_c as u64), ctx.depth, prec),
+                    im: pixel_to_coord(&ref_tile.key.y * &ts + IBig::from(ref_r as u64), ctx.depth, prec),
+                },
+                ctx.iterations,
+            );
+            let new_orbit_data: Vec<[f32; 2]> = new_orbit.orbit.iter()
+                .map(|c| [c.re as f32, c.im as f32])
+                .collect();
+
+            // Deltas of glitched pixels from the new reference.
+            let ref_col = pr.col;
+            let ref_row = pr.row;
+            let new_deltas: Vec<[f32; 2]> = glitch_indices.iter().map(|&gi| {
+                let pr = &pixel_refs[gi];
+                [
+                    ((pr.col - ref_col) as f64 * scale) as f32,
+                    ((pr.row - ref_row) as f64 * scale) as f32,
+                ]
+            }).collect();
+
+            let new_raw = state.dispatch(&new_deltas, &new_orbit_data, new_orbit.is_full);
+            for (j, &gi) in glitch_indices.iter().enumerate() {
+                raw[gi] = new_raw[j];
+            }
         }
-    }
 
-    if pixel_indices.is_empty() {
-        tile.finish_pass(pass + 1);
-        return true;
-    }
-
-    if int.interrupted() {
-        return false;
-    }
-
-    // use only the most recent reference — the front of the list
-    let front = refs.iter().next().expect("ref list is never empty");
-    let ref_meta = RefMetaGpu {
-        delta_corr_re: front.delta_corr.re as f32,
-        delta_corr_im: front.delta_corr.im as f32,
-        is_full: front.orbit.is_full as u32,
-        orbit_len: front.orbit.orbit.len() as u32,
-        orbit_offset: 0,
-        _pad: [0; 3],
-    };
-    let orbit_data: Vec<[f32; 2]> = front.orbit.orbit.iter().map(|c| [c.re as f32, c.im as f32]).collect();
-    let pixel_deltas_f32: Vec<[f32; 2]> = pixel_deltas.iter().map(|d| [d[0] as f32, d[1] as f32]).collect();
-
-    let counts = gpu_dispatch(state, &pixel_deltas_f32, &[ref_meta], &orbit_data);
-
-    for (i, &tile_idx) in pixel_indices.iter().enumerate() {
-        let count = counts[i];
-        if count == u32::MAX {
-            // glitch: compute true orbit at high precision
-            let r = tile_idx as usize / TILE_SIZE;
-            let c = tile_idx as usize % TILE_SIZE;
-            let x_0 = Complex {
-                re: pixel_to_coord(
-                    &tile_px0_x + IBig::from(c as u64),
-                    depth,
-                    prec,
-                ),
-                im: pixel_to_coord(
-                    &tile_px0_y + IBig::from(r as u64),
-                    depth,
-                    prec,
-                ),
+        // ----------------------------------------------------------------
+        // Scatter results into tile pixel stores.
+        // ----------------------------------------------------------------
+        for (i, pr) in pixel_refs.iter().enumerate() {
+            let r = raw[i];
+            let color = if r & GLITCH_BIT != 0 {
+                0 // residual glitch → black
+            } else {
+                val_to_color(NonZeroUsize::new(r as usize))
             };
-            let (_, new_orbit) = calculate_orbit(x_0, iterations);
-            let val = check_orbit(&new_orbit).unwrap();
-            tile.store(tile_idx as usize, val_to_color(val).into());
-            refs.push_front(RefOrbit {
-                delta_corr: Complex { re: pixel_deltas[i][0], im: pixel_deltas[i][1] },
-                orbit: new_orbit,
-            });
-        } else {
-            let val = NonZeroUsize::new(count as usize);
-            tile.store(tile_idx as usize, val_to_color(val).into());
+            tiles[pr.tile_idx].tile.store(pr.pixel_idx, color.into());
+        }
+
+        // Only advance pass counters if we weren't interrupted mid-glitch-loop.
+        if !int.interrupted() {
+            for item in tiles {
+                item.tile.finish_pass(pass + 1);
+            }
         }
     }
-
-    tile.finish_pass(pass + 1);
-    true
-}
-
-/// Dispatch the compute shader; returns raw iteration counts per pixel.
-/// 0 = non-divergent, u32::MAX = glitch, other = escape iteration index.
-fn gpu_dispatch(
-    state: &GpuState,
-    pixel_deltas: &[[f32; 2]],
-    ref_metas: &[RefMetaGpu],
-    orbit_data: &[[f32; 2]],
-) -> Vec<u32> {
-    let n = pixel_deltas.len() as u32;
-    let device = &state.device;
-    let queue = &state.queue;
-
-    let uniforms_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: None,
-        contents: bytemuck::bytes_of(&Uniforms {
-            pixel_count: n,
-            ref_count: ref_metas.len() as u32,
-            _pad: [0; 2],
-        }),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
-    let deltas_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: None,
-        contents: bytemuck::cast_slice(pixel_deltas),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let metas_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: None,
-        contents: bytemuck::cast_slice(ref_metas),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let orbit_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: None,
-        contents: bytemuck::cast_slice(orbit_data),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-
-    let output_size = (n as u64) * 4;
-    let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: output_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: output_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &state.bgl,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: uniforms_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: deltas_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: metas_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: orbit_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: output_buf.as_entire_binding() },
-        ],
-    });
-
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    {
-        let mut pass =
-            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-        pass.set_pipeline(&state.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
-        pass.dispatch_workgroups((n + 63) / 64, 1, 1);
-    }
-    encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
-    queue.submit([encoder.finish()]);
-
-    let slice = staging_buf.slice(..);
-    slice.map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-
-    let data = slice.get_mapped_range();
-    let results: Vec<u32> = data
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-    drop(data);
-    staging_buf.unmap();
-
-    results
 }

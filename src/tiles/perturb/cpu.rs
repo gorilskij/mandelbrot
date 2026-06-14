@@ -3,7 +3,7 @@
 //! its own high-precision orbit, projects it, and pushes it into the shared
 //! group list so later pixels reuse it.
 
-use super::{Perturbator, RefList, RefOrbit};
+use super::{PassBatchCtx, Perturbator, RefList, RefOrbit, TileItem};
 use crate::rendering::{Pf, calculate_orbit, check_divergence_delta, check_orbit, val_to_color};
 use crate::tiles::store::{
     GROUP_POW, GROUP_TILES, NUM_PASSES, PASS_STRIDES, TILE_SIZE, Tile, floor_div_pow2,
@@ -12,25 +12,45 @@ use crate::tiles::store::{
 use dashu::integer::IBig;
 use itertools::iproduct;
 use num::Complex;
+use rayon::prelude::*;
 use std::num::NonZeroUsize;
 use waker_interrupter::MultiInterrupter;
+
+/// When true, render tiles sequentially in a fixed order (reproducible output).
+const DETERMINISTIC: bool = false;
 
 /// CPU perturbation backend.
 pub struct Cpu;
 
 impl Perturbator for Cpu {
-    fn render_tile_pass(
+    fn render_pass_batch(
         &self,
-        tile: &Tile,
-        refs: &RefList,
-        anchor_px: (i64, i64),
-        pass: u8,
-        iterations: usize,
-        int: &MultiInterrupter,
-    ) -> bool {
-        render_tile_pass(tile, refs, anchor_px, pass, iterations, int)
+        _ctx:  &PassBatchCtx,
+        tiles: &[TileItem],
+        pass:  u8,
+        int:   &MultiInterrupter,
+    ) {
+        if DETERMINISTIC {
+            for item in tiles {
+                if int.interrupted() { return; }
+                render_tile_pass(&item.tile, &item.refs, item.anchor_px, pass, _ctx.iterations, int);
+            }
+        } else {
+            tiles.par_iter().for_each(|item| {
+                if !int.interrupted() {
+                    render_tile_pass(
+                        &item.tile, &item.refs, item.anchor_px,
+                        pass, _ctx.iterations, int,
+                    );
+                }
+            });
+        }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Per-tile implementation (unchanged from original)
+// ---------------------------------------------------------------------------
 
 /// Everything fixed about a tile for the duration of a render pass.
 struct TileCtx<'a> {
@@ -38,37 +58,29 @@ struct TileCtx<'a> {
     refs: &'a RefList,
     /// units per tile pixel
     upp: f64,
-    /// pixel offset of this tile's (0, 0) pixel from the group anchor, in the
-    /// depth's exact integer pixel grid (small: |.| < group size)
+    /// pixel offset of this tile's (0,0) pixel from the group anchor
     anchor_dx: i64,
     anchor_dy: i64,
-    /// global pixel coordinate of this tile's (0, 0) pixel, and the depth /
-    /// precision, for building fresh reference orbits at high precision when a
-    /// pixel promotes its own orbit
+    /// global pixel coordinate of this tile's (0,0) pixel
     tile_px0_x: IBig,
     tile_px0_y: IBig,
     depth: i64,
-    prec: usize,
+    prec:  usize,
 }
 
-/// Render one pixel of a tile (or skip it if a previous, interrupted run
-/// already computed it). Returns whether the pixel is black (non-divergent).
+/// Render one pixel (or skip if already computed). Returns true if black.
 fn render_pixel(ctx: &TileCtx, c: usize, r: usize, iterations: usize) -> bool {
     let idx = r * TILE_SIZE + c;
 
     if let Some(raw) = ctx.tile.load(idx).get() {
-        // already computed by an earlier (interrupted) run
         return raw == 0;
     }
 
-    // delta of this pixel from the group anchor, computed in exact integer
-    // pixel units first (so no precision is lost at deep zoom) then scaled
     let delta = Complex {
         re: (ctx.anchor_dx + c as i64) as Pf * ctx.upp as Pf,
         im: (ctx.anchor_dy + r as i64) as Pf * ctx.upp as Pf,
     };
 
-    // try existing references, newest first (the list is push_front ordered)
     let val: Option<NonZeroUsize> = ctx
         .refs
         .iter()
@@ -76,22 +88,13 @@ fn render_pixel(ctx: &TileCtx, c: usize, r: usize, iterations: usize) -> bool {
             check_divergence_delta(&ref_orbit.orbit, delta - ref_orbit.delta_corr).ok()
         })
         .unwrap_or_else(|| {
-            // no usable reference: compute this pixel's own orbit at high
-            // precision and add it to the shared list so later pixels (in any
-            // tile of the group) reuse it
             let x_0 = Complex {
                 re: pixel_to_coord(&ctx.tile_px0_x + IBig::from(c as u64), ctx.depth, ctx.prec),
                 im: pixel_to_coord(&ctx.tile_px0_y + IBig::from(r as u64), ctx.depth, ctx.prec),
             };
             let (_, new_orbit) = calculate_orbit(x_0, iterations);
-            // guaranteed Ok(_): new_orbit is the true orbit of this point
             let val = check_orbit(&new_orbit).unwrap();
-
-            ctx.refs.push_front(RefOrbit {
-                delta_corr: delta,
-                orbit: new_orbit,
-            });
-
+            ctx.refs.push_front(RefOrbit { delta_corr: delta, orbit: new_orbit });
             val
         });
 
@@ -99,21 +102,18 @@ fn render_pixel(ctx: &TileCtx, c: usize, r: usize, iterations: usize) -> bool {
     val.is_none()
 }
 
-/// Run one progressive pass over a tile. Returns true if the pass ran to
-/// completion (false = interrupted; partial pixels stay in the tile and are
-/// skipped when the pass is retried).
+/// Run one progressive pass over a tile.
 fn render_tile_pass(
-    tile: &Tile,
-    refs: &RefList,
+    tile:      &Tile,
+    refs:      &RefList,
     anchor_px: (i64, i64),
-    pass: u8,
+    pass:      u8,
     iterations: usize,
-    int: &MultiInterrupter,
+    int:       &MultiInterrupter,
 ) -> bool {
     let stride = PASS_STRIDES[pass as usize];
     let coarser_stride = (pass > 0).then(|| PASS_STRIDES[pass as usize - 1]);
 
-    // tile offset within its group (small integer)
     let gx = floor_div_pow2(&tile.key.x, GROUP_POW);
     let gy = floor_div_pow2(&tile.key.y, GROUP_POW);
     let local_x = i64::try_from(&(&tile.key.x - &gx * IBig::from(GROUP_TILES as u64)))
@@ -137,30 +137,21 @@ fn render_tile_pass(
 
     let mut all_black = true;
     for r in (0..TILE_SIZE).step_by(stride) {
-        if int.interrupted() {
-            return false;
-        }
+        if int.interrupted() { return false; }
         for c in (0..TILE_SIZE).step_by(stride) {
             if let Some(cs) = coarser_stride {
-                if r % cs == 0 && c % cs == 0 {
-                    // already computed by a coarser pass
-                    continue;
-                }
+                if r % cs == 0 && c % cs == 0 { continue; }
             }
             all_black &= render_pixel(&ctx, c, r, iterations);
         }
     }
 
-    // Black-fill optimization: black (non-divergent) pixels are the most
-    // expensive to compute. If the entire coarse pass-0 grid is black, render
-    // the full-resolution perimeter; if that is black too, assume the whole
-    // tile is black and fill it in one go.
+    // Black-fill: if all coarse samples are black, check the perimeter;
+    // if that is also black, fill the whole tile and skip remaining passes.
     if pass == 0 && all_black {
         let mut perimeter_black = true;
         for r in 0..TILE_SIZE {
-            if int.interrupted() {
-                return false;
-            }
+            if int.interrupted() { return false; }
             if r == 0 || r == TILE_SIZE - 1 {
                 for c in 0..TILE_SIZE {
                     perimeter_black &= render_pixel(&ctx, c, r, iterations);
@@ -171,7 +162,6 @@ fn render_tile_pass(
                 }
             }
         }
-
         if perimeter_black {
             for (r, c) in iproduct!(1..TILE_SIZE - 1, 1..TILE_SIZE - 1) {
                 let idx = r * TILE_SIZE + c;
