@@ -1,13 +1,12 @@
 use crate::rendering::CoordinatesBox;
 use crate::tiles::compose::MAX_CLIMB;
 use crate::tiles::store::{
-    NUM_PASSES, PASS_STRIDES, TILE_SIZE, TileKey, TileStore, depth_for_view, tile_index,
+    NUM_PASSES, PASS_STRIDES, TILE_SIZE, Tile, TileKey, TileStore, depth_for_view, tile_index,
     units_per_pixel,
 };
 use bytemuck::{Pod, Zeroable};
 use dashu::integer::IBig;
 use itertools::iproduct;
-use std::collections::HashMap;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -66,14 +65,6 @@ struct BarVertex {
     color: [f32; 4],
 }
 
-struct TileEntry {
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    bind_group: wgpu::BindGroup,
-    tex_size: u32,
-    passes_done: u8,
-}
-
 pub struct GpuCompositor {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -83,7 +74,10 @@ pub struct GpuCompositor {
     bar_pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
     bgl: wgpu::BindGroupLayout,
-    tiles: HashMap<TileKey, TileEntry>,
+    // Single composite sample-grid texture (all visible tiles in one texture).
+    grid_tex: Option<wgpu::Texture>,
+    grid_bg: Option<wgpu::BindGroup>,
+    grid_dims: (u32, u32),
 }
 
 impl GpuCompositor {
@@ -202,6 +196,8 @@ impl GpuCompositor {
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
                 ..Default::default()
             });
 
@@ -264,7 +260,9 @@ impl GpuCompositor {
                 bar_pipeline,
                 sampler,
                 bgl,
-                tiles: HashMap::new(),
+                grid_tex: None,
+                grid_bg: None,
+                grid_dims: (0, 0),
             }
         })
     }
@@ -276,16 +274,14 @@ impl GpuCompositor {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
+        // Force grid recreation on next render.
+        self.grid_tex = None;
+        self.grid_bg = None;
+        self.grid_dims = (0, 0);
     }
 
     pub fn render(&mut self, store: &TileStore, coords: &CoordinatesBox, width: u32, height: u32) {
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            _ => return,
-        };
-        let frame_view = frame.texture.create_view(&Default::default());
-
-        let store_frame = store.next_frame();
+        // Phase 1: layout
         let view = coords.view.inner;
         let depth = depth_for_view(view);
         let tile_px = TILE_SIZE as f64 * (units_per_pixel(depth) / view);
@@ -298,126 +294,96 @@ impl GpuCompositor {
         let nx = ((width as f64 - base_sx) / tile_px).ceil().max(1.0) as i64;
         let ny = ((height as f64 - base_sy) / tile_px).ceil().max(1.0) as i64;
 
-        struct Pending {
-            src: TileKey,
-            px0: f32, py0: f32, px1: f32, py1: f32,
-            u0: f32, v0: f32, u1: f32, v1: f32,
-        }
+        // Phase 3: rebuild sample grid every frame (tiles complete asynchronously).
+        {
+            let store_frame = store.next_frame();
 
-        let mut pending: Vec<Pending> = Vec::new();
-
-        for (i, j) in iproduct!(0..nx, 0..ny) {
-            let key = TileKey {
-                depth,
-                x: &x0 + IBig::from(i),
-                y: &y0 + IBig::from(j),
+            // Use the minimum passes_done of visible tiles to set the grid resolution.
+            // Each sample becomes one texel; the GPU bilinearly magnifies to screen.
+            let mut min_passes = NUM_PASSES as usize + 1;
+            for (i, j) in iproduct!(0..nx, 0..ny) {
+                let key = TileKey { depth, x: &x0 + IBig::from(i), y: &y0 + IBig::from(j) };
+                let pd = store.get(&key).map_or(0, |t| t.passes_done()) as usize;
+                if pd > 0 {
+                    min_passes = min_passes.min(pd);
+                }
+            }
+            // Fall back to finest resolution if no tile has data yet (ancestor path).
+            let grid_tex_size = if min_passes <= NUM_PASSES as usize {
+                TILE_SIZE / PASS_STRIDES[min_passes - 1]
+            } else {
+                TILE_SIZE / PASS_STRIDES[0]
             };
-            let px0 = (base_sx + i as f64 * tile_px) as f32;
-            let py0 = (base_sy + j as f64 * tile_px) as f32;
-            let px1 = px0 + tile_px as f32;
-            let py1 = py0 + tile_px as f32;
 
-            // Climb ancestors to find best available source.
-            let mut candidate = key;
-            let mut u0 = 0.0_f32;
-            let mut v0 = 0.0_f32;
-            let mut frac = 1.0_f32;
+            let grid_w = nx as u32 * grid_tex_size as u32;
+            let grid_h = ny as u32 * grid_tex_size as u32;
+            let mut buf = vec![0u32; (grid_w * grid_h) as usize];
 
-            for _ in 0..=MAX_CLIMB {
-                if let Some(tile) = store.get(&candidate) {
-                    if tile.completed_stride().is_some() {
-                        tile.touch(store_frame);
-                        pending.push(Pending {
-                            src: candidate,
-                            px0, py0, px1, py1,
-                            u0, v0, u1: u0 + frac, v1: v0 + frac,
-                        });
-                        break;
-                    }
-                }
-                let (bx, by) = candidate.parent_offset();
-                u0 = u0 / 2.0 + bx as f32 * 0.5;
-                v0 = v0 / 2.0 + by as f32 * 0.5;
-                frac /= 2.0;
-                candidate = candidate.parent();
+            for (i, j) in iproduct!(0..nx, 0..ny) {
+                let key = TileKey { depth, x: &x0 + IBig::from(i), y: &y0 + IBig::from(j) };
+                fill_slot(&mut buf, grid_w, i, j, grid_tex_size, &key, store, store_frame);
             }
-        }
 
-        // Upload any stale tile textures before recording the render pass.
-        for p in &pending {
-            self.ensure_texture(&p.src, store);
-        }
+            let raw: &[u8] = bytemuck::cast_slice(&buf);
 
-        // Build one vertex buffer with all quads (6 verts each).
-        let w = width as f32;
-        let h = height as f32;
-        let to_clip = |px: f32, py: f32| -> [f32; 2] {
-            [px / w * 2.0 - 1.0, 1.0 - py / h * 2.0]
-        };
-
-        let mut verts: Vec<Vertex> = Vec::with_capacity(pending.len() * 6);
-        let mut draw_keys: Vec<(&TileKey, u32)> = Vec::with_capacity(pending.len());
-
-        for p in &pending {
-            if !self.tiles.contains_key(&p.src) {
-                continue;
-            }
-            let base = verts.len() as u32;
-            let [x0, y0] = to_clip(p.px0, p.py0);
-            let [x1, y1] = to_clip(p.px1, p.py1);
-            let (u0, v0, u1, v1) = (p.u0, p.v0, p.u1, p.v1);
-            verts.extend_from_slice(&[
-                Vertex { pos: [x0, y0], uv: [u0, v0] },
-                Vertex { pos: [x1, y0], uv: [u1, v0] },
-                Vertex { pos: [x0, y1], uv: [u0, v1] },
-                Vertex { pos: [x1, y0], uv: [u1, v0] },
-                Vertex { pos: [x1, y1], uv: [u1, v1] },
-                Vertex { pos: [x0, y1], uv: [u0, v1] },
-            ]);
-            draw_keys.push((&p.src, base));
-        }
-
-        let mut enc = self.device.create_command_encoder(&Default::default());
-
-        if verts.is_empty() {
-            {
-                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &frame_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
+            if self.grid_dims == (grid_w, grid_h) {
+                // Same size: overwrite in-place.
+                self.queue.write_texture(
+                    self.grid_tex.as_ref().unwrap().as_image_copy(),
+                    raw,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(grid_w * 4),
+                        rows_per_image: Some(grid_h),
+                    },
+                    wgpu::Extent3d { width: grid_w, height: grid_h, depth_or_array_layers: 1 },
+                );
+            } else {
+                // New size: recreate texture and bind group.
+                let tex = self.device.create_texture_with_data(
+                    &self.queue,
+                    &wgpu::TextureDescriptor {
+                        label: None,
+                        size: wgpu::Extent3d { width: grid_w, height: grid_h, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    },
+                    wgpu::util::TextureDataOrder::LayerMajor,
+                    raw,
+                );
+                let tex_view = tex.create_view(&Default::default());
+                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&tex_view),
                         },
-                    })],
-                    ..Default::default()
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
                 });
-                if PROGRESS_BAR {
-                if let Some((fill, bg_gray, fill_gray)) = bar_progress(store, depth, &x0, &y0, nx, ny) {
-                    let bar_verts = bar_vertices(width, height, fill, bg_gray, fill_gray);
-                    let bar_vbuf =
-                        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: None,
-                            contents: bytemuck::cast_slice(&bar_verts),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
-                    pass.set_pipeline(&self.bar_pipeline);
-                    pass.set_vertex_buffer(0, bar_vbuf.slice(..));
-                    pass.draw(0..bar_verts.len() as u32, 0..1);
-                }
-                } // PROGRESS_BAR
+                self.grid_tex = Some(tex);
+                self.grid_bg = Some(bg);
+                self.grid_dims = (grid_w, grid_h);
             }
-            self.queue.submit([enc.finish()]);
-            frame.present();
-            return;
+
         }
 
-        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&verts),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        // Phase 4: draw
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            _ => return,
+        };
+        let frame_view = frame.texture.create_view(&Default::default());
+        let mut enc = self.device.create_command_encoder(&Default::default());
 
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -432,125 +398,137 @@ impl GpuCompositor {
                 })],
                 ..Default::default()
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_vertex_buffer(0, vbuf.slice(..));
-            for (key, base) in &draw_keys {
-                if let Some(entry) = self.tiles.get(*key) {
-                    pass.set_bind_group(0, &entry.bind_group, &[]);
-                    pass.draw(*base..*base + 6, 0..1);
-                }
+
+            if let Some(bg) = &self.grid_bg {
+                // Fullscreen quad with UV mapping into the sample grid.
+                let u0 = (-base_sx / (nx as f64 * tile_px)) as f32;
+                let u1 = ((width as f64 - base_sx) / (nx as f64 * tile_px)) as f32;
+                let v0 = (-base_sy / (ny as f64 * tile_px)) as f32;
+                let v1 = ((height as f64 - base_sy) / (ny as f64 * tile_px)) as f32;
+
+                let verts = [
+                    Vertex { pos: [-1.0,  1.0], uv: [u0, v0] },
+                    Vertex { pos: [ 1.0,  1.0], uv: [u1, v0] },
+                    Vertex { pos: [-1.0, -1.0], uv: [u0, v1] },
+                    Vertex { pos: [ 1.0,  1.0], uv: [u1, v0] },
+                    Vertex { pos: [ 1.0, -1.0], uv: [u1, v1] },
+                    Vertex { pos: [-1.0, -1.0], uv: [u0, v1] },
+                ];
+                let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, bg, &[]);
+                pass.set_vertex_buffer(0, vbuf.slice(..));
+                pass.draw(0..6, 0..1);
             }
 
             // Progress bar overlay.
             if PROGRESS_BAR {
-            if let Some((fill, bg_gray, fill_gray)) = bar_progress(store, depth, &x0, &y0, nx, ny) {
-                let bar_verts = bar_vertices(width, height, fill, bg_gray, fill_gray);
-                let bar_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: bytemuck::cast_slice(&bar_verts),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                pass.set_pipeline(&self.bar_pipeline);
-                pass.set_vertex_buffer(0, bar_vbuf.slice(..));
-                pass.draw(0..bar_verts.len() as u32, 0..1);
+                if let Some((fill, bg_gray, fill_gray)) = bar_progress(store, depth, &x0, &y0, nx, ny) {
+                    let bar_verts = bar_vertices(width, height, fill, bg_gray, fill_gray);
+                    let bar_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytemuck::cast_slice(&bar_verts),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                    pass.set_pipeline(&self.bar_pipeline);
+                    pass.set_vertex_buffer(0, bar_vbuf.slice(..));
+                    pass.draw(0..bar_verts.len() as u32, 0..1);
+                }
             }
-            } // PROGRESS_BAR
         }
 
         self.queue.submit([enc.finish()]);
         frame.present();
-
-        // Drop GPU textures for tiles that have been evicted from the CPU store.
-        self.tiles.retain(|key, _| store.get(key).is_some());
     }
+}
 
-    fn ensure_texture(&mut self, key: &TileKey, store: &TileStore) {
-        let tile = match store.get(key) {
-            Some(t) => t,
-            None => return,
-        };
-        let passes_done = tile.passes_done();
-        if passes_done == 0 {
-            return;
-        }
-
-        let stride = PASS_STRIDES[(passes_done - 1).min(PASS_STRIDES.len() as u8 - 1) as usize];
-        let tex_size = (TILE_SIZE / stride) as u32;
-
-        if let Some(entry) = self.tiles.get(key) {
-            if entry.passes_done == passes_done {
-                return;
-            }
-            if entry.tex_size == tex_size {
-                // Same resolution — overwrite pixels in-place.
-                let data = Self::sample_pixels(&tile, stride, tex_size);
-                self.queue.write_texture(
-                    entry.texture.as_image_copy(),
-                    bytemuck::cast_slice(&data),
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(tex_size * 4),
-                        rows_per_image: Some(tex_size),
-                    },
-                    wgpu::Extent3d { width: tex_size, height: tex_size, depth_or_array_layers: 1 },
-                );
-                self.tiles.get_mut(key).unwrap().passes_done = passes_done;
+/// Fill one slot of `grid_tex_size × grid_tex_size` texels in the sample-grid
+/// buffer for tile `key`. One texel per sample point; the GPU bilinearly
+/// magnifies the grid to screen resolution. Data races are intentional.
+fn fill_slot(
+    buf: &mut [u32],
+    grid_w: u32,
+    slot_i: i64,
+    slot_j: i64,
+    grid_tex_size: usize,
+    key: &TileKey,
+    store: &TileStore,
+    frame: u64,
+) {
+    let mut candidate = key.clone();
+    for climb in 0..=MAX_CLIMB {
+        if let Some(tile) = store.get(&candidate) {
+            let pd = tile.passes_done();
+            if pd > 0 {
+                tile.touch(frame);
+                let stride = PASS_STRIDES[(pd - 1) as usize];
+                write_slot(buf, grid_w, slot_i, slot_j, grid_tex_size, &tile, stride, climb, key, &candidate);
                 return;
             }
         }
-
-        // Create a new texture (first upload or size changed due to new pass).
-        let data = Self::sample_pixels(&tile, stride, tex_size);
-        let texture = self.device.create_texture_with_data(
-            &self.queue,
-            &wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d { width: tex_size, height: tex_size, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            bytemuck::cast_slice(&data),
-        );
-        let view = texture.create_view(&Default::default());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-        self.tiles.insert(key.clone(), TileEntry { texture, view, bind_group, tex_size, passes_done });
+        candidate = candidate.parent();
     }
+    // No data available; slot stays black (buf is zero-initialized).
+}
 
-    /// Sample the stride grid from tile pixels into an Rgba8Unorm buffer.
-    /// Data races are intentional — see store.rs.
-    fn sample_pixels(tile: &crate::tiles::store::Tile, stride: usize, tex_size: u32) -> Vec<u32> {
-        let n = tex_size as usize;
-        let mut data = vec![0u32; n * n];
-        for row in 0..n {
-            for col in 0..n {
-                let raw = tile.load(row * stride * TILE_SIZE + col * stride).to_raw();
-                // 0x00RRGGBB → Rgba8Unorm [R, G, B, 255] as little-endian u32
-                let b = raw & 0xFF;
-                let g = (raw >> 8) & 0xFF;
-                let r = (raw >> 16) & 0xFF;
-                data[row * n + col] = r | (g << 8) | (b << 16) | (0xFF << 24);
+/// Write tile data into a `grid_tex_size × grid_tex_size` slot of the
+/// sample-grid buffer, optionally extracting an ancestor's sub-region when
+/// `climb > 0`. Each output texel maps to the nearest sample point.
+fn write_slot(
+    buf: &mut [u32],
+    grid_w: u32,
+    slot_i: i64,
+    slot_j: i64,
+    grid_tex_size: usize,
+    tile: &Tile,
+    stride: usize,
+    climb: usize,
+    key: &TileKey,
+    ancestor: &TileKey,
+) {
+    let n = TILE_SIZE / stride; // tile/ancestor sample count per dimension
+    let ts = grid_tex_size as u32;
+    let base_row = slot_j as u32 * ts;
+    let base_col = slot_i as u32 * ts;
+
+    if climb == 0 {
+        for row in 0..ts {
+            for col in 0..ts {
+                let src_row = row as usize * n / grid_tex_size;
+                let src_col = col as usize * n / grid_tex_size;
+                let pixel_idx = src_row * stride * TILE_SIZE + src_col * stride;
+                let raw = tile.load(pixel_idx).to_raw();
+                buf[((base_row + row) * grid_w + base_col + col) as usize] = raw_to_rgba(raw);
             }
         }
-        data
+    } else {
+        let scale = 1usize << climb;
+        let ox = usize::try_from(&(&key.x - &ancestor.x * IBig::from(scale as u64))).unwrap();
+        let oy = usize::try_from(&(&key.y - &ancestor.y * IBig::from(scale as u64))).unwrap();
+        let sub = (n / scale).max(1);
+        for row in 0..ts {
+            for col in 0..ts {
+                let src_row = (oy * sub + row as usize * sub / grid_tex_size).min(n - 1);
+                let src_col = (ox * sub + col as usize * sub / grid_tex_size).min(n - 1);
+                let pixel_idx = src_row * stride * TILE_SIZE + src_col * stride;
+                let raw = tile.load(pixel_idx).to_raw();
+                buf[((base_row + row) * grid_w + base_col + col) as usize] = raw_to_rgba(raw);
+            }
+        }
     }
+}
+
+#[inline]
+fn raw_to_rgba(raw: u32) -> u32 {
+    // 0x00RRGGBB → Rgba8Unorm [R, G, B, 255] as little-endian u32
+    let b = raw & 0xFF;
+    let g = (raw >> 8) & 0xFF;
+    let r = (raw >> 16) & 0xFF;
+    r | (g << 8) | (b << 16) | (0xFF << 24)
 }
 
 /// Returns (fill 0..1, bg_gray 0..1, fill_gray 0..1) for the progress bar,
@@ -585,8 +563,8 @@ fn bar_progress(
     for p in 0..NUM_PASSES as usize {
         if counts[p] < total {
             let fill = counts[p] as f32 / total as f32;
-            let bg_gray = p as f32 / NUM_PASSES as f32;       // prev pass color (0 = black)
-            let fill_gray = (p + 1) as f32 / NUM_PASSES as f32; // current pass color
+            let bg_gray = p as f32 / NUM_PASSES as f32;
+            let fill_gray = (p + 1) as f32 / NUM_PASSES as f32;
             return Some((fill, bg_gray, fill_gray));
         }
     }
@@ -598,17 +576,13 @@ fn bar_progress(
 fn bar_vertices(width: u32, height: u32, fill: f32, bg_gray: f32, fill_gray: f32) -> [BarVertex; 12] {
     let h = height as f32;
 
-    // Clip-space y coords for the bar (bottom strip).
     let y0 = 1.0 - ((height - BAR_HEIGHT_PX) as f32 / h) * 2.0;
     let y1 = -1.0_f32;
 
     let bg_color = [bg_gray, bg_gray, bg_gray, 1.0];
     let fill_color = [fill_gray, fill_gray, fill_gray, 1.0];
 
-    // Background: full width, color of last completed pass.
     let bg = quad([-1.0, y0, 1.0, y1], bg_color);
-
-    // Fill: left to fill fraction, color of current pass.
     let x1 = -1.0 + fill * 2.0;
     let fg = quad([-1.0, y0, x1, y1], fill_color);
 
