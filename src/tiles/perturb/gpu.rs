@@ -56,9 +56,12 @@ struct Uniforms {
 
 // Bit 31 set means glitched; low 31 bits carry the iteration when detected.
 const GLITCH_BIT : u32 = 0x80000000u;
-// |δ|² > ε² |X+δ|²  with ε = 1e-3 marks the approximation as broken.
-const EPSILON_SQ : f32 = 1e-6;
 
+// Perturbation is algebraically exact: X_n = ref_n + delta_n is the true orbit
+// value for any size of delta.  We therefore mirror the CPU's
+// `check_divergence_delta` exactly — no |delta|/|X| precision heuristic.  A
+// pixel is only "glitched" when the reference orbit ended early (is_full == 0)
+// and the pixel had not yet escaped; such pixels get a fresh reference.
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let idx = gid.y * uniforms.dispatch_w + gid.x;
@@ -73,11 +76,6 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 
         if dot(x, x) > 4.0 {
             output[idx] = i + 1u;
-            return;
-        }
-
-        if dot(delta, delta) > EPSILON_SQ * dot(x, x) {
-            output[idx] = GLITCH_BIT | (i + 1u);
             return;
         }
 
@@ -124,6 +122,9 @@ pub struct GpuState {
     queue:    wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bgl:      wgpu::BindGroupLayout,
+    /// Max pixels per dispatch so no storage buffer exceeds the device's
+    /// `max_storage_buffer_binding_size` (deltas are the largest at 8 B/px).
+    max_chunk: usize,
 }
 
 impl GpuState {
@@ -142,6 +143,11 @@ impl GpuState {
                 .request_device(&wgpu::DeviceDescriptor::default())
                 .await
                 .expect("failed to create GPU device");
+
+            // Deltas are 8 bytes/pixel and the largest storage binding; keep a
+            // safety margin under the limit.
+            let max_chunk =
+                (device.limits().max_storage_buffer_binding_size as usize / 8) * 9 / 10;
 
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label:  Some("perturbation"),
@@ -173,14 +179,30 @@ impl GpuState {
                 cache:               None,
             });
 
-            GpuState { device, queue, pipeline, bgl }
+            GpuState { device, queue, pipeline, bgl, max_chunk }
         })
     }
 
     /// Upload deltas + orbit, dispatch, and read back raw results.
     /// Each result: `0` = in-set, `n` = escaped at iteration n,
     /// `GLITCH_BIT | n` = glitched at iteration n.
+    ///
+    /// Large batches are split into chunks so no storage buffer exceeds the
+    /// device's `max_storage_buffer_binding_size`.
     fn dispatch(&self, deltas: &[[f32; 2]], orbit_data: &[[f32; 2]], is_full: bool) -> Vec<u32> {
+        if deltas.is_empty() { return Vec::new(); }
+        if deltas.len() <= self.max_chunk {
+            return self.dispatch_chunk(deltas, orbit_data, is_full);
+        }
+        let mut out = Vec::with_capacity(deltas.len());
+        for chunk in deltas.chunks(self.max_chunk) {
+            out.extend(self.dispatch_chunk(chunk, orbit_data, is_full));
+        }
+        out
+    }
+
+    /// One dispatch over a chunk small enough to fit the binding-size limit.
+    fn dispatch_chunk(&self, deltas: &[[f32; 2]], orbit_data: &[[f32; 2]], is_full: bool) -> Vec<u32> {
         let n = deltas.len() as u32;
         if n == 0 { return Vec::new(); }
 
