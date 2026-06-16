@@ -44,7 +44,7 @@ pub const MEMORY_BUDGET_BYTES: usize = 1 << 30; // 1 GiB ~ 16k tiles
 const TILE_BYTES: usize = TILE_LEN * size_of::<u32>();
 
 /// log2 of units per pixel at a given depth
-fn upp_log2(depth: i64) -> i64 {
+pub fn upp_log2(depth: i64) -> i64 {
     DEPTH_0_TILE_SPAN_LOG2 - TILE_POW as i64 - depth
 }
 
