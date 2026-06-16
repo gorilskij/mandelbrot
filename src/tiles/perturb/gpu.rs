@@ -26,7 +26,7 @@
 //! adequate for the initial delta.
 
 use super::{PassBatchCtx, Perturbator, TileItem};
-use crate::rendering::{calculate_orbit, val_to_color};
+use crate::rendering::{calculate_orbit, check_orbit, val_to_color};
 use crate::tiles::store::{
     PASS_STRIDES, TILE_SIZE, pixel_to_coord, units_per_pixel, upp_log2, working_precision,
 };
@@ -486,15 +486,42 @@ impl Perturbator for Gpu {
         }
 
         // ----------------------------------------------------------------
-        // Scatter results into tile pixel stores.
+        // Resolve any residual glitches exactly on the CPU.
+        //
+        // Skipped when interrupted: the glitch loop bailed early so there may
+        // be many, and the whole generation is being abandoned anyway.  When we
+        // *did* finish, residuals are rare (one in-set reference usually clears
+        // everything) and resolving them exactly makes every cached pixel
+        // correct regardless of which reference produced it — so partial,
+        // cross-generation tiles never disagree (the bug the CPU path avoids).
+        // ----------------------------------------------------------------
+        if !int.interrupted() {
+            let ts   = IBig::from(TILE_SIZE as u64);
+            let prec = working_precision(ctx.depth);
+            for (i, r) in raw.iter_mut().enumerate() {
+                if *r & GLITCH_BIT == 0 { continue; }
+                let pr   = &pixel_refs[i];
+                let tile = &tiles[pr.tile_idx].tile;
+                let c    = pr.pixel_idx % TILE_SIZE;
+                let rr   = pr.pixel_idx / TILE_SIZE;
+                let coord = Complex {
+                    re: pixel_to_coord(&tile.key.x * &ts + IBig::from(c as u64),  ctx.depth, prec),
+                    im: pixel_to_coord(&tile.key.y * &ts + IBig::from(rr as u64), ctx.depth, prec),
+                };
+                let (_, orbit) = calculate_orbit(coord, ctx.iterations);
+                *r = check_orbit(&orbit).unwrap().map_or(0, |n| n.get() as u32);
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Scatter results into tile pixel stores.  A pixel still carrying
+        // GLITCH_BIT here means we were interrupted before resolving it; leave
+        // it unstored so the next generation retries it (never cache a guess).
         // ----------------------------------------------------------------
         for (i, pr) in pixel_refs.iter().enumerate() {
             let r = raw[i];
-            let color = if r & GLITCH_BIT != 0 {
-                0 // residual glitch → black
-            } else {
-                val_to_color(NonZeroUsize::new(r as usize))
-            };
+            if r & GLITCH_BIT != 0 { continue; }
+            let color = val_to_color(NonZeroUsize::new(r as usize));
             tiles[pr.tile_idx].tile.store(pr.pixel_idx, color.into());
         }
 
