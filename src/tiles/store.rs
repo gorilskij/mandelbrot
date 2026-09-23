@@ -26,13 +26,37 @@ pub const TILE_LEN: usize = TILE_SIZE * TILE_SIZE;
 /// log2 of the span (in units) of a depth-0 tile
 pub const DEPTH_0_TILE_SPAN_LOG2: i64 = 2; // 4 units
 
-/// Strides of the progressive refinement passes. Pass 0 renders a coarse
-/// grid of every 16th pixel, each subsequent pass fills in the pixels needed
-/// to halve the stride. After pass p the grid of every PASS_STRIDES[p]-th
-/// pixel is fully computed, so the compositor can interpolate between those
-/// pixels and refinement looks like the resolution increasing.
-pub const PASS_STRIDES: [usize; 5] = [16, 8, 4, 2, 1];
-pub const NUM_PASSES: u8 = PASS_STRIDES.len() as u8;
+/// Strides of the square-grid refinement passes. Pass 0 renders a coarse
+/// grid of every 16th pixel, each subsequent grid pass fills in the pixels
+/// needed to halve the stride. After grid pass p the grid of every
+/// GRID_STRIDES[p]-th pixel is fully computed, so the compositor can
+/// interpolate between those pixels and refinement looks like the resolution
+/// increasing.
+pub const GRID_STRIDES: [usize; 4] = [16, 8, 4, 2];
+pub const NUM_GRID_PASSES: u8 = GRID_STRIDES.len() as u8;
+
+/// The last step, stride 2 → 1, is 75% of a tile's pixels, so it is split
+/// into three equal sub-passes over the stride-2 cells, given as (row, col)
+/// parity. The cell centres come first: that completes a quincunx lattice in
+/// which every remaining pixel has all four axis neighbours computed, so the
+/// compositor can fill it from them. Each later sub-pass keeps that property.
+const SUB_PASS_PARITY: [(usize, usize); 3] = [(1, 1), (0, 1), (1, 0)];
+
+pub const NUM_PASSES: u8 = NUM_GRID_PASSES + SUB_PASS_PARITY.len() as u8;
+
+/// (row, col) of the pixels that `pass` adds to a tile, in row-major order.
+pub fn pass_pixels(pass: u8) -> impl Iterator<Item = (usize, usize)> {
+    let p = pass as usize;
+    let (stride, coarser, (r0, c0)) = if p < GRID_STRIDES.len() {
+        (GRID_STRIDES[p], p.checked_sub(1).map(|q| GRID_STRIDES[q]), (0, 0))
+    } else {
+        (2, None, SUB_PASS_PARITY[p - GRID_STRIDES.len()])
+    };
+    (r0..TILE_SIZE).step_by(stride)
+        .flat_map(move |r| (c0..TILE_SIZE).step_by(stride).map(move |c| (r, c)))
+        // skip pixels a coarser grid pass already did
+        .filter(move |&(r, c)| coarser.is_none_or(|cs| r % cs != 0 || c % cs != 0))
+}
 
 /// tiles are bundled into GROUP_TILES x GROUP_TILES groups that share one
 /// reference-orbit list
@@ -214,10 +238,13 @@ impl Tile {
     }
 
     /// the finest fully-computed grid stride, None if nothing is computed yet
+    /// (during the sub-passes the stride-2 grid is complete, plus some of the
+    /// stride-1 pixels)
     pub fn completed_stride(&self) -> Option<usize> {
         match self.passes_done() {
             0 => None,
-            p => Some(PASS_STRIDES[(p - 1).min(NUM_PASSES - 1) as usize]),
+            p if p >= NUM_PASSES => Some(1),
+            p => Some(GRID_STRIDES[(p.min(NUM_GRID_PASSES) - 1) as usize]),
         }
     }
 
@@ -397,5 +424,51 @@ mod tests {
         assert_eq!(key.parent().x, IBig::from(-3));
         assert_eq!(bx, 1);
         assert_eq!(by, 1);
+    }
+}
+
+#[cfg(test)]
+mod pass_tests {
+    use super::*;
+
+    #[test]
+    fn passes_cover_every_pixel_once() {
+        let mut seen = vec![0u8; TILE_LEN];
+        for pass in 0..NUM_PASSES {
+            for (r, c) in pass_pixels(pass) {
+                seen[r * TILE_SIZE + c] += 1;
+            }
+        }
+        assert!(seen.iter().all(|&n| n == 1));
+    }
+
+    #[test]
+    fn pass_sizes() {
+        let sizes: Vec<usize> = (0..NUM_PASSES).map(|p| pass_pixels(p).count()).collect();
+        assert_eq!(sizes, [64, 192, 768, 3072, 4096, 4096, 4096]);
+    }
+
+    /// What `GpuCompositor::reconstruct` relies on: once any sub-pass is
+    /// done, every missing pixel has all its in-tile axis neighbours.
+    #[test]
+    fn sub_passes_leave_only_fully_surrounded_gaps() {
+        for done in NUM_GRID_PASSES + 1..NUM_PASSES {
+            let mut known = vec![false; TILE_LEN];
+            for pass in 0..done {
+                for (r, c) in pass_pixels(pass) { known[r * TILE_SIZE + c] = true; }
+            }
+            for r in 0..TILE_SIZE {
+                for c in 0..TILE_SIZE {
+                    if known[r * TILE_SIZE + c] { continue; }
+                    let n = TILE_SIZE as isize;
+                    for (dr, dc) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                        let (rr, cc) = (r as isize + dr, c as isize + dc);
+                        if (0..n).contains(&rr) && (0..n).contains(&cc) {
+                            assert!(known[(rr * n + cc) as usize], "pass {done}: ({r},{c}) lacks ({rr},{cc})");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

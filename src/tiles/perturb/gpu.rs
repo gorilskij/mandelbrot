@@ -35,7 +35,7 @@
 use super::nucleus::{MAX_REF_DIST, find_nucleus};
 use super::{PassBatchCtx, Perturbator, TileItem};
 use crate::rendering::{calculate_orbit, check_orbit, val_to_color};
-use crate::tiles::store::{PASS_STRIDES, TILE_SIZE, pixel_to_coord, upp_log2, working_precision};
+use crate::tiles::store::{TILE_SIZE, pass_pixels, pixel_to_coord, upp_log2, working_precision};
 use bytemuck::{Pod, Zeroable};
 use dashu::float::FBig;
 use dashu::integer::IBig;
@@ -602,8 +602,6 @@ impl Perturbator for Gpu {
         let state   = &*self.0;
         let t_pass  = std::time::Instant::now(); // DIAG
         let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3; // DIAG
-        let stride  = PASS_STRIDES[pass as usize];
-        let coarser = (pass > 0).then(|| PASS_STRIDES[pass as usize - 1]);
         let view    = ctx.coords.view.inner;
 
         // Beyond this depth the f32 seed underflows, so iterate the delta in
@@ -626,17 +624,13 @@ impl Perturbator for Gpu {
             let tile_j = i64::try_from(&(&tile.key.y - &ctx.y0))
                 .expect("tile grid offset fits i64");
 
-            for r in (0..TILE_SIZE).step_by(stride) {
-                for c in (0..TILE_SIZE).step_by(stride) {
-                    if let Some(cs) = coarser
-                        && r % cs == 0 && c % cs == 0 { continue; } // done by coarser pass
-                    let pixel_idx = r * TILE_SIZE + c;
-                    if tile.load(pixel_idx).get().is_some() { continue; } // already computed
+            for (r, c) in pass_pixels(pass) {
+                let pixel_idx = r * TILE_SIZE + c;
+                if tile.load(pixel_idx).get().is_some() { continue; } // already computed
 
-                    let col = tile_i * TILE_SIZE as i64 + c as i64;
-                    let row = tile_j * TILE_SIZE as i64 + r as i64;
-                    pixel_refs.push(PixelRef { tile_idx: ti, pixel_idx, col, row });
-                }
+                let col = tile_i * TILE_SIZE as i64 + c as i64;
+                let row = tile_j * TILE_SIZE as i64 + r as i64;
+                pixel_refs.push(PixelRef { tile_idx: ti, pixel_idx, col, row });
             }
         }
 

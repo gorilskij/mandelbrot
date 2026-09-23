@@ -6,7 +6,7 @@
 use super::{PassBatchCtx, Perturbator, RefList, RefOrbit, TileItem};
 use crate::rendering::{Pf, calculate_orbit, check_divergence_delta, check_orbit, val_to_color};
 use crate::tiles::store::{
-    GROUP_POW, GROUP_TILES, NUM_PASSES, PASS_STRIDES, TILE_SIZE, Tile, floor_div_pow2,
+    GROUP_POW, GROUP_TILES, NUM_PASSES, TILE_SIZE, Tile, floor_div_pow2, pass_pixels,
     pixel_to_coord, units_per_pixel, working_precision,
 };
 use dashu::integer::IBig;
@@ -111,9 +111,6 @@ fn render_tile_pass(
     iterations: usize,
     int:       &MultiInterrupter,
 ) -> bool {
-    let stride = PASS_STRIDES[pass as usize];
-    let coarser_stride = (pass > 0).then(|| PASS_STRIDES[pass as usize - 1]);
-
     let gx = floor_div_pow2(&tile.key.x, GROUP_POW);
     let gy = floor_div_pow2(&tile.key.y, GROUP_POW);
     let local_x = i64::try_from(&(&tile.key.x - &gx * IBig::from(GROUP_TILES as u64)))
@@ -136,13 +133,13 @@ fn render_tile_pass(
     };
 
     let mut all_black = true;
-    for r in (0..TILE_SIZE).step_by(stride) {
-        if int.interrupted() { return false; }
-        for c in (0..TILE_SIZE).step_by(stride) {
-            if let Some(cs) = coarser_stride
-                && r % cs == 0 && c % cs == 0 { continue; }
-            all_black &= render_pixel(&ctx, c, r, iterations);
+    let mut last_row = usize::MAX;
+    for (r, c) in pass_pixels(pass) {
+        if r != last_row {
+            if int.interrupted() { return false; }
+            last_row = r;
         }
+        all_black &= render_pixel(&ctx, c, r, iterations);
     }
 
     // Black-fill: if all coarse samples are black, check the perimeter;

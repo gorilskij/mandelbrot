@@ -1,6 +1,6 @@
 use crate::rendering::CoordinatesBox;
 use crate::tiles::store::{
-    NUM_PASSES, PASS_STRIDES, TILE_SIZE, TileKey, TileStore, depth_for_view, tile_index,
+    GRID_STRIDES, NUM_GRID_PASSES, NUM_PASSES, TILE_SIZE, TileKey, TileStore, depth_for_view, tile_index,
     units_per_pixel,
 };
 use bytemuck::{Pod, Zeroable};
@@ -511,7 +511,14 @@ impl GpuCompositor {
             return;
         }
 
-        let stride = PASS_STRIDES[(passes_done - 1).min(PASS_STRIDES.len() as u8 - 1) as usize];
+        // Grid passes: upload the finest complete grid and let the sampler
+        // interpolate. From the first sub-pass on: full resolution, with the
+        // missing pixels filled in from their neighbours (`reconstruct`).
+        let stride = if passes_done > NUM_GRID_PASSES {
+            1
+        } else {
+            GRID_STRIDES[passes_done as usize - 1]
+        };
         let tex_size = (TILE_SIZE / stride) as u32;
 
         if let Some(entry) = self.tiles.get(key) {
@@ -520,7 +527,7 @@ impl GpuCompositor {
             }
             if entry.tex_size == tex_size {
                 // Same resolution — overwrite pixels in-place.
-                let data = Self::sample_pixels(&tile, stride, tex_size);
+                let data = Self::texels(&tile, stride, tex_size);
                 self.queue.write_texture(
                     entry.texture.as_image_copy(),
                     bytemuck::cast_slice(&data),
@@ -537,7 +544,7 @@ impl GpuCompositor {
         }
 
         // Create a new texture (first upload or size changed due to new pass).
-        let data = Self::sample_pixels(&tile, stride, tex_size);
+        let data = Self::texels(&tile, stride, tex_size);
         let texture = self.device.create_texture_with_data(
             &self.queue,
             &wgpu::TextureDescriptor {
@@ -571,6 +578,12 @@ impl GpuCompositor {
         self.tiles.insert(key.clone(), TileEntry { texture, bind_group, tex_size, passes_done });
     }
 
+    /// Texels for a tile displayed at `stride`: the stride grid, or at
+    /// stride 1 the reconstructed full-resolution tile.
+    fn texels(tile: &crate::tiles::store::Tile, stride: usize, tex_size: u32) -> Vec<u32> {
+        if stride == 1 { Self::reconstruct(tile) } else { Self::sample_pixels(tile, stride, tex_size) }
+    }
+
     /// Sample the stride grid from tile pixels into an Rgba8Unorm buffer.
     /// Data races are intentional — see store.rs.
     fn sample_pixels(tile: &crate::tiles::store::Tile, stride: usize, tex_size: u32) -> Vec<u32> {
@@ -579,15 +592,51 @@ impl GpuCompositor {
         for row in 0..n {
             for col in 0..n {
                 let raw = tile.load(row * stride * TILE_SIZE + col * stride).to_raw();
-                // 0x00RRGGBB → Rgba8Unorm [R, G, B, 255] as little-endian u32
-                let b = raw & 0xFF;
-                let g = (raw >> 8) & 0xFF;
-                let r = (raw >> 16) & 0xFF;
-                data[row * n + col] = r | (g << 8) | (b << 16) | (0xFF << 24);
+                data[row * n + col] = rgb_to_rgba8(raw);
             }
         }
         data
     }
+
+    /// Full-resolution texels for a tile during (or after) the sub-passes:
+    /// computed pixels as they are, each missing one as the mean colour of
+    /// its computed axis neighbours. The sub-pass order guarantees all four
+    /// exist from the first sub-pass on (fewer at the tile edge).
+    fn reconstruct(tile: &crate::tiles::store::Tile) -> Vec<u32> {
+        let n = TILE_SIZE;
+        let px = |r: usize, c: usize| tile.load(r * n + c).get();
+        let mut data = vec![0u32; n * n];
+        for r in 0..n {
+            for c in 0..n {
+                let rgb = px(r, c).unwrap_or_else(|| {
+                    let neighbours = [
+                        (r > 0).then(|| px(r - 1, c)).flatten(),
+                        (r + 1 < n).then(|| px(r + 1, c)).flatten(),
+                        (c > 0).then(|| px(r, c - 1)).flatten(),
+                        (c + 1 < n).then(|| px(r, c + 1)).flatten(),
+                    ];
+                    let (mut sum, mut k) = ([0u32; 3], 0);
+                    for v in neighbours.into_iter().flatten() {
+                        for (i, s) in sum.iter_mut().enumerate() {
+                            *s += (v >> (8 * i)) & 0xFF;
+                        }
+                        k += 1;
+                    }
+                    if k == 0 { 0 } else { (0..3).map(|i| (sum[i] / k) << (8 * i)).sum() }
+                });
+                data[r * n + c] = rgb_to_rgba8(rgb);
+            }
+        }
+        data
+    }
+}
+
+/// 0x00RRGGBB → Rgba8Unorm [R, G, B, 255] as a little-endian u32.
+fn rgb_to_rgba8(raw: u32) -> u32 {
+    let b = raw & 0xFF;
+    let g = (raw >> 8) & 0xFF;
+    let r = (raw >> 16) & 0xFF;
+    r | (g << 8) | (b << 16) | (0xFF << 24)
 }
 
 /// Returns (fill 0..1, bg_gray 0..1, fill_gray 0..1) for the progress bar,
