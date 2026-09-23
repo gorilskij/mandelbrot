@@ -111,6 +111,16 @@ are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
 - **Binding-size chunking**: `dispatch()` splits batches so the delta buffer stays
   under `max_storage_buffer_binding_size` (128 MiB here). It takes an `elem`
   size: 8 B for f32 deltas, 16 B for floatexp seeds.
+- **Keep dispatches short: macOS kills long GPU command buffers** (seen at a
+  few hundred ms; a 65k-pixel dispatch beside a deep minibrot at 32768
+  iterations) and then drops some following ones, and wgpu reports neither.
+  The output would silently stay at its initial value. So: chunks are sized by
+  time (~30 ms, floor 1024 px, a 2048-px probe first in every pass), and the
+  output buffer is pre-filled with `NOT_RUN` (u32::MAX, never written by the
+  shaders); any `NOT_RUN` left is retried in halves, and pixels still not run
+  are not stored. Symptom when this breaks: black or partly black tiles that
+  change on every reset. Regressions: `dispatch_is_deterministic_even_when_killed`,
+  `view_2026_09_23b_pipeline_matches_exact` (both ignored, need a GPU).
 - **Never cache a guess**: a pixel that still carries `GLITCH_BIT` is *not
   stored*, so the next generation retries it. Leftover glitches are resolved
   exactly on the CPU (`calculate_orbit` + `check_orbit`), in parallel and

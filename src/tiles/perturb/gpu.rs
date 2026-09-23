@@ -71,13 +71,32 @@ const MAX_GLITCH_PASSES: usize = 8;
 const GLITCH_CANDIDATES: usize = 32;
 
 /// Target GPU time per dispatch.  In-flight work cannot be cancelled, so this
-/// bounds how long an interrupt waits; each dispatch also costs ~0.8 ms of
-/// fixed overhead, so much smaller chunks would waste GPU time.
+/// bounds how long an interrupt waits.  It must also stay well below the
+/// point where macOS kills a long-running command buffer (see NOT_RUN): at
+/// 2^-305 with 32768 iterations a 65k-pixel dispatch (~400 ms) was killed at
+/// random, 16k-pixel ones (~135 ms) never were.
 const TARGET_CHUNK_MS: f64 = 30.0;
 
-/// Floor on chunk size, so a bad cost estimate can never produce tiny,
-/// overhead-dominated dispatches.
-const MIN_CHUNK_PX: usize = 65_536;
+/// Floor on chunk size: each dispatch costs ~0.8 ms of fixed overhead, so
+/// fewer pixels would be overhead-dominated for cheap pixels (expensive
+/// pixels near a deep minibrot cost ~0.06 ms each, so even this is ~60 ms).
+const MIN_CHUNK_PX: usize = 1024;
+
+/// First chunk of every pass: a small probe that measures the cost of the
+/// pixels nearest the cursor (usually the most expensive) before sizing the
+/// rest; the previous pass ended far from the cursor, where pixels are cheap.
+const PROBE_CHUNK_PX: usize = 2048;
+
+/// Output-buffer fill value the shaders never write (they write 0, n, or
+/// GLITCH_BIT | n with n <= orbit_len).  Still present after a dispatch
+/// means the GPU did not run it (macOS kills command buffers that run too
+/// long, and drops some following ones while it recovers; wgpu reports
+/// neither).  Such pixels are retried in smaller dispatches, and if that
+/// fails too they are left uncomputed.
+const NOT_RUN: u32 = u32::MAX;
+
+/// Smallest dispatch a NOT_RUN chunk is split into when retrying.
+const MIN_RETRY_PX: usize = 256;
 
 /// Interior detection (with a nucleus reference of period p): every window of
 /// `p·ceil(INTERIOR_MIN_WINDOW/p)` iterations, compare log2|dz/dz₀|² with its
@@ -473,8 +492,35 @@ impl GpuState {
         out
     }
 
-    /// One dispatch over a chunk small enough to fit the binding-size limit.
+    /// One dispatch over a chunk small enough to fit the binding-size limit,
+    /// retrying pixels the GPU did not run (NOT_RUN) in halves down to
+    /// MIN_RETRY_PX.  Pixels still not run are returned as NOT_RUN.
     fn dispatch_chunk(
+        &self,
+        pipeline:    &wgpu::ComputePipeline,
+        delta_bytes: &[u8],
+        n_pixels:    usize,
+        r:           &Reference,
+    ) -> Vec<u32> {
+        let out = self.dispatch_once(pipeline, delta_bytes, n_pixels, r);
+        let missing = out.iter().filter(|&&v| v == NOT_RUN).count();
+        if missing == 0 {
+            return out;
+        }
+        log::warn!("GPU did not run {missing}/{n_pixels} px of a dispatch; retrying in halves");
+        if n_pixels <= MIN_RETRY_PX {
+            let retry = self.dispatch_once(pipeline, delta_bytes, n_pixels, r);
+            return out.into_iter().zip(retry).map(|(a, b)| if a == NOT_RUN { b } else { a }).collect();
+        }
+        let elem = delta_bytes.len() / n_pixels;
+        let half = n_pixels / 2;
+        let mut merged = self.dispatch_chunk(pipeline, &delta_bytes[..half * elem], half, r);
+        merged.extend(self.dispatch_chunk(pipeline, &delta_bytes[half * elem..], n_pixels - half, r));
+        out.into_iter().zip(merged).map(|(a, b)| if a == NOT_RUN { b } else { a }).collect()
+    }
+
+    /// A single dispatch; pixels the GPU did not run come back as NOT_RUN.
+    fn dispatch_once(
         &self,
         pipeline:    &wgpu::ComputePipeline,
         delta_bytes: &[u8],
@@ -520,11 +566,11 @@ impl GpuState {
         });
 
         let output_size = n as u64 * 4;
-        let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label:              None,
-            size:               output_size,
-            usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
+        // Pre-filled with NOT_RUN so a dispatch the GPU dropped is detectable.
+        let output_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    None,
+            contents: &vec![0xFFu8; output_size as usize],
+            usage:    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label:              None,
@@ -735,7 +781,8 @@ impl Perturbator for Gpu {
         let mut chunks = 0usize; // DIAG
         while pos < pixel_refs.len() {
             if int.interrupted() { break; }
-            let len   = state.chunk_len().min(pixel_refs.len() - pos);
+            let len   = if chunks == 0 { PROBE_CHUNK_PX } else { state.chunk_len() }
+                .min(pixel_refs.len() - pos);
             let chunk = pos..pos + len;
 
             let t_disp = std::time::Instant::now();
@@ -754,7 +801,7 @@ impl Perturbator for Gpu {
             for round in 0..MAX_GLITCH_PASSES {
                 if int.interrupted() { break; }
                 let glitched: Vec<usize> = raw.iter().enumerate()
-                    .filter(|&(_, &r)| r & GLITCH_BIT != 0)
+                    .filter(|&(_, &r)| r != NOT_RUN && r & GLITCH_BIT != 0)
                     .map(|(j, _)| j)
                     .collect();
                 if glitched.is_empty() { break; }
@@ -787,7 +834,7 @@ impl Perturbator for Gpu {
             // stored; the resolved ones are exact and safe to cache.
             if !int.interrupted() {
                 let residual: Vec<usize> = raw.iter().enumerate()
-                    .filter(|&(_, &r)| r & GLITCH_BIT != 0)
+                    .filter(|&(_, &r)| r != NOT_RUN && r & GLITCH_BIT != 0)
                     .map(|(j, _)| j)
                     .collect();
                 if !residual.is_empty() {
@@ -809,7 +856,8 @@ impl Perturbator for Gpu {
 
             // Store results, finish completed tiles, and tell the compositor.
             for (j, &r) in raw.iter().enumerate() {
-                if r & GLITCH_BIT != 0 { continue; }
+                // Never cache a guess: glitched or not run by the GPU.
+                if r == NOT_RUN || r & GLITCH_BIT != 0 { continue; }
                 let pr = &pixel_refs[pos + j];
                 tiles[pr.tile_idx].tile.store(pr.pixel_idx, r.into()); // escape iteration, 0 = in set
                 remaining[pr.tile_idx] -= 1;
@@ -1210,24 +1258,19 @@ mod tests {
         }
     }
 
-    /// Regression for the artifact view reported on 2026-09-23 (Cmd-C
-    /// string): black octagon and smeared streaks at 2^-220, 32768
-    /// iterations. The floatexp shader switched to f32 at δ ≈ 2^-100; at the
-    /// nucleus orbit's zero points δ ← δ² + δ₀ then underflowed to exactly 0
-    /// and pixels followed the reference forever. Renders a 150x100 sample of
-    /// the 3000x2000 view with the real shader on this machine's GPU and
-    /// compares with exact orbits (before the fix: 8461 wrong, 515 black;
-    /// after: 1184 wrong, all by f32 rounding, 0 black). Needs a GPU and
-    /// ~15 s: run with `--ignored`. With DIAG_OUT=dir it also writes the two
-    /// renders as raw RGB (150x100) for viewing.
-    #[test]
-    #[ignore]
-    fn artifact_view_2026_09_23_matches_exact() {
-        let clip = "0.36268061816918528044899172250760567988128488705999553580413024078293361870845608332075349484941,-0.64268799384608729642124986015130477562370908052480481690338843577039749867381572196329048271251|6.226537747227718e-67";
+    /// A reported view (Cmd-C string `x,y|view`) sampled on an `iw`x`ih`
+    /// grid over a `w`x`h` window: exact escape iterations, plus what's
+    /// needed to run the GPU on the same pixels.
+    struct ViewSample {
+        ctx:   PassBatchCtx,
+        geom:  ViewGeom,
+        /// depth-grid pixel (col, row) relative to x0, y0, per sample
+        pix:   Vec<(i64, i64)>,
+        exact: Vec<u32>,
+    }
+
+    fn sample_view(clip: &str, iters: usize, (w, h): (usize, usize), (iw, ih): (usize, usize)) -> ViewSample {
         let coords: CoordinatesBox = clip.parse().unwrap();
-        let iters = 32768;
-        let (w, h) = (3000usize, 2000usize); // 1500x1000 logical at 2x
-        let (iw, ih) = (150usize, 100usize);
         let view  = coords.view.inner;
         let depth = crate::tiles::store::depth_for_view(view);
         let prec  = working_precision(depth);
@@ -1236,13 +1279,10 @@ mod tests {
             x0: tile_index(&coords.origin.x, depth), y0: tile_index(&coords.origin.y, depth),
             width: w, height: h, iterations: iters, progress: Default::default(),
         };
-        let g = ViewGeom::new(&ctx);
-        let n = find_nucleus(&g.center, &g.radius, g.upp, iters, g.prec, &|| false).unwrap().expect("nucleus");
-        let r = Reference::new(n.c.clone(), iters, Some(n.period));
-        let (rx, ry) = ref_px(&r.c, &ctx);
+        let geom = ViewGeom::new(&ctx);
         let ts = IBig::from(TILE_SIZE as u64);
         let (gx0, gy0) = (&ctx.x0 * &ts, &ctx.y0 * &ts);
-        let ratio = view / (g.upp as f64).exp2();
+        let ratio = view / (geom.upp as f64).exp2();
         let o00 = crate::tiles::store::TileKey { depth, x: ctx.x0.clone(), y: ctx.y0.clone() }.origin();
         let sx0 = (&o00.x - &coords.origin.x).to_f64().value() / view;
         let sy0 = (&o00.y - &coords.origin.y).to_f64().value() / view;
@@ -1252,36 +1292,252 @@ mod tests {
                 let sy = (j as f64 + 0.5) * h as f64 / ih as f64;
                 (((sx - sx0) * ratio).round() as i64, ((sy - sy0) * ratio).round() as i64)
             }).collect();
-
-        let exact: Vec<u32> = pix.par_iter().map(|&(col, row)| {
+        let exact = pix.par_iter().map(|&(col, row)| {
             let c = Complex {
                 re: pixel_to_coord(&gx0 + IBig::from(col), depth, prec),
                 im: pixel_to_coord(&gy0 + IBig::from(row), depth, prec),
             };
             check_orbit(&calculate_orbit(c, iters).1).unwrap().map_or(0, |v| v.get() as u32)
         }).collect();
-        let offs: Vec<(f64, f64)> = pix.iter().map(|&(col, row)| (col as f64 - rx, row as f64 - ry)).collect();
-        let gpu = GpuState::new();
-        let real = gpu.dispatch_offsets(&offs, g.upp, &r);
+        ViewSample { ctx, geom, pix, exact }
+    }
 
-        let wrong = real.iter().zip(&exact).filter(|(a, b)| a != b).count();
-        let off50 = real.iter().zip(&exact).filter(|(a, b)| a.abs_diff(**b) > 50).count();
-        let black = real.iter().filter(|&&v| v == 0).count();
-        eprintln!("GPU vs exact over {} px: wrong {wrong}, off by >50 {off50}, black {black} (exact black {})",
-            real.len(), exact.iter().filter(|&&v| v == 0).count());
+    /// Run the real shader on the sample with the view's own nucleus.
+    fn gpu_on_sample(v: &ViewSample, gpu: &GpuState) -> (Reference, Vec<u32>) {
+        let g = &v.geom;
+        let n = find_nucleus(&g.center, &g.radius, g.upp, v.ctx.iterations, g.prec, &|| false).unwrap().expect("nucleus");
+        let r = Reference::new(n.c.clone(), v.ctx.iterations, Some(n.period));
+        let (rx, ry) = ref_px(&r.c, &v.ctx);
+        let offs: Vec<(f64, f64)> = v.pix.iter().map(|&(col, row)| (col as f64 - rx, row as f64 - ry)).collect();
+        let out = gpu.dispatch_offsets(&offs, g.upp, &r);
+        (r, out)
+    }
 
+    /// (wrong, off by >50 iterations, black) of `got` against the exact values.
+    fn score(got: &[u32], exact: &[u32]) -> (usize, usize, usize) {
+        (
+            got.iter().zip(exact).filter(|(a, b)| a != b).count(),
+            got.iter().zip(exact).filter(|(a, b)| a.abs_diff(**b) > 50).count(),
+            got.iter().filter(|&&v| v == 0).count(),
+        )
+    }
+
+    fn dump_rgb(name: &str, vals: &[u32]) {
         if let Ok(out) = std::env::var("DIAG_OUT") {
             let mut palette = vec![];
-            for (name, vals) in [("exact", &exact), ("gpu", &real)] {
-                let rgb: Vec<u8> = vals.iter().flat_map(|&v| {
-                    let c = crate::gpu_compositor::color_of_for_tests(v, &mut palette);
-                    [(c >> 16) as u8, (c >> 8) as u8, c as u8]
-                }).collect();
-                std::fs::write(format!("{out}/{name}.rgb"), rgb).unwrap();
+            let rgb: Vec<u8> = vals.iter().flat_map(|&v| {
+                let c = crate::gpu_compositor::color_of_for_tests(v, &mut palette);
+                [(c >> 16) as u8, (c >> 8) as u8, c as u8]
+            }).collect();
+            std::fs::write(format!("{out}/{name}.rgb"), rgb).unwrap();
+        }
+    }
+
+    /// Regression for the artifact view reported on 2026-09-23: black
+    /// octagon and smeared streaks at 2^-220, 32768 iterations. The floatexp
+    /// shader switched to f32 at δ ≈ 2^-100; at the nucleus orbit's zero
+    /// points δ ← δ² + δ₀ then underflowed to exactly 0 and pixels followed
+    /// the reference forever (before the fix: 8461 of 15000 wrong, 515
+    /// black; after: 1184, all f32 rounding, 0 black). Real shader on this
+    /// machine's GPU vs exact orbits; needs a GPU and ~15 s, so `--ignored`.
+    /// With DIAG_OUT=dir, writes both renders as raw RGB (150x100).
+    #[test]
+    #[ignore]
+    fn artifact_view_2026_09_23_matches_exact() {
+        let clip = "0.36268061816918528044899172250760567988128488705999553580413024078293361870845608332075349484941,-0.64268799384608729642124986015130477562370908052480481690338843577039749867381572196329048271251|6.226537747227718e-67";
+        let v = sample_view(clip, 32768, (3000, 2000), (150, 100));
+        let (_, got) = gpu_on_sample(&v, &GpuState::new());
+        let (wrong, off50, black) = score(&got, &v.exact);
+        eprintln!("GPU vs exact over {} px: wrong {wrong}, off by >50 {off50}, black {black}", got.len());
+        dump_rgb("a1_exact", &v.exact);
+        dump_rgb("a1_gpu", &got);
+        assert_eq!(black, 0, "pixels lost their delta and followed the reference");
+        assert!(wrong * 10 < got.len(), "{wrong} wrong: more than f32 rounding");
+        assert!(off50 * 100 < got.len(), "{off50} pixels off by >50 iterations");
+    }
+
+    /// `sample_view`, with the exact values cached in $DIAG_OUT/<name>.exact.
+    fn sample_view_cached(name: &str, clip: &str, iters: usize, win: (usize, usize), img: (usize, usize)) -> ViewSample {
+        let path = std::env::var("DIAG_OUT").ok().map(|d| format!("{d}/{name}.exact"));
+        if let Some(bytes) = path.as_ref().and_then(|p| std::fs::read(p).ok()) {
+            let mut v = sample_view_geometry(clip, iters, win, img);
+            v.exact = bytemuck::cast_slice(&bytes).to_vec();
+            return v;
+        }
+        let v = sample_view(clip, iters, win, img);
+        if let Some(p) = path { std::fs::write(p, bytemuck::cast_slice(&v.exact)).unwrap(); }
+        v
+    }
+
+    /// `sample_view` without the exact orbits.
+    fn sample_view_geometry(clip: &str, iters: usize, win: (usize, usize), img: (usize, usize)) -> ViewSample {
+        let mut v = sample_view(clip, 1, win, img);
+        v.ctx.iterations = iters;
+        v.exact.clear();
+        v
+    }
+
+    /// Run whole generations (tiles, passes, chunks, caches) with the real
+    /// GPU backend, then read the tiles back at the sample points. Returns
+    /// the values per generation; `None` = pixel not stored.
+    fn run_pipeline(v: &ViewSample, backend: &Gpu, store: &crate::tiles::store::TileStore, generations: usize) -> Vec<Vec<Option<u32>>> {
+        use crate::tiles::render::{GroupCache, run_generation};
+        let mut out = vec![];
+        for generation in 0..generations {
+            if generation > 0 { store.clear(); } // what Space does to the tiles
+            let group_cache = parking_lot::Mutex::new(GroupCache::new());
+            let (tx, rx) = waker_interrupter::channel::<()>();
+            tx.send(());
+            let mut tx = Some(tx);
+            rx.run_multithreaded(None, None, |(), int| {
+                run_generation(store, &group_cache, v.ctx.width, v.ctx.height, &v.ctx.coords,
+                    v.ctx.iterations, None, int, backend);
+                if let Some(tx) = tx.take() { tx.terminate(); }
+            });
+            let ts = TILE_SIZE as i64;
+            out.push(v.pix.iter().map(|&(col, row)| {
+                let key = crate::tiles::store::TileKey {
+                    depth: v.ctx.depth,
+                    x: &v.ctx.x0 + IBig::from(col.div_euclid(ts)),
+                    y: &v.ctx.y0 + IBig::from(row.div_euclid(ts)),
+                };
+                store.get(&key)?.load((row.rem_euclid(ts) * ts + col.rem_euclid(ts)) as usize).get()
+            }).collect());
+        }
+        out
+    }
+
+    /// Regression for the second view reported on 2026-09-23 (2^-305, 32768
+    /// iterations): black and partly black tiles, different on every reset.
+    /// Cause: 65k-pixel minimum chunks near a deep minibrot made dispatches
+    /// of several hundred ms, which macOS killed at random (and dropped
+    /// following ones), leaving the zero-initialised output = "in set".
+    /// Whole pipeline (tiles, passes, chunks, caches) with the real GPU
+    /// backend, fresh and after a Space-style reset; every generation must
+    /// match exact orbits up to f32 rounding (before: 1070, 5169, 6979 black
+    /// of 15000; after: 109, the exact count, every time). ~2 min per
+    /// generation (DIAG_GENS, default 2); exact values cached in $DIAG_OUT.
+    #[test]
+    #[ignore]
+    fn view_2026_09_23b_pipeline_matches_exact() {
+        let clip = "0.362680618169185280448991722507605679881284887059995535804130241675861432076423165340038916307547696001473666663642181909,-0.642687993846087296421249860151304775623709080524804816903388435265396126015520705061576074177687940915500836211594418175|1.7963169535192306e-92";
+        let _ = env_logger::builder().is_test(true).try_init();
+        let v = sample_view_cached("b", clip, 32768, (3000, 2000), (150, 100));
+        let backend = Gpu(Arc::new(GpuState::new()));
+        let store = crate::tiles::store::TileStore::new(crate::tiles::store::MEMORY_BUDGET_BYTES);
+        let t = std::time::Instant::now();
+        let n_gens = std::env::var("DIAG_GENS").ok().and_then(|g| g.parse().ok()).unwrap_or(2);
+        let gens = run_pipeline(&v, &backend, &store, n_gens);
+        eprintln!("{n_gens} generation(s) in {:?}", t.elapsed());
+        for (g, vals) in gens.iter().enumerate() {
+            let missing = vals.iter().filter(|x| x.is_none()).count();
+            let got: Vec<u32> = vals.iter().map(|x| x.unwrap_or(u32::MAX)).collect();
+            let (wrong, off50, black) = score(&got, &v.exact);
+            let exact_black = v.exact.iter().filter(|&&x| x == 0).count();
+            eprintln!("generation {g}: missing {missing}, wrong {wrong}, off by >50 {off50}, black {black} (exact black {exact_black})");
+            dump_rgb(&format!("b_pipe{g}"), &got.iter().map(|&x| if x == u32::MAX { 0 } else { x }).collect::<Vec<_>>());
+            assert_eq!(missing, 0, "generation {g}");
+            assert_eq!(black, exact_black, "generation {g}: in-set pixels that escape");
+            assert!(off50 * 100 < got.len(), "generation {g}: {off50} off by >50");
+        }
+        assert!(gens.windows(2).all(|w| w[0] == w[1]), "generations differ");
+    }
+
+    /// Same input dispatched repeatedly must give identical output, also as
+    /// one oversized dispatch (~400 ms of work) that macOS may kill: the
+    /// NOT_RUN sentinel + retry in `dispatch_chunk` must recover it. Needs a
+    /// GPU (~10 s).
+    #[test]
+    #[ignore]
+    fn dispatch_is_deterministic_even_when_killed() {
+        let clip = "0.362680618169185280448991722507605679881284887059995535804130241675861432076423165340038916307547696001473666663642181909,-0.642687993846087296421249860151304775623709080524804816903388435265396126015520705061576074177687940915500836211594418175|1.7963169535192306e-92";
+        let v = sample_view_geometry(clip, 32768, (3000, 2000), (1, 1));
+        let g = &v.geom;
+        let n = find_nucleus(&g.center, &g.radius, g.upp, 32768, g.prec, &|| false).unwrap().unwrap();
+        let r = Reference::new(n.c.clone(), 32768, Some(n.period));
+        let (rx, ry) = ref_px(&r.c, &v.ctx);
+        // 256x256 block of depth-grid pixels around the reference.
+        let offs: Vec<(f64, f64)> = (0..256).flat_map(|j| (0..256).map(move |i| (i as f64 - 128.0 + 0.3, j as f64 - 128.0 + 0.7)))
+            .map(|(dx, dy)| (dx * 3.0, dy * 3.0)).collect();
+        let _ = (rx, ry);
+        let gpu = GpuState::new();
+        let mut first: Option<Vec<u32>> = None;
+        for run in 0..6 {
+            let t = std::time::Instant::now();
+            let out = gpu.dispatch_offsets(&offs, g.upp, &r);
+            let zeros = out.iter().filter(|&&x| x == 0).count();
+            let diff = first.as_ref().map_or(0, |f| f.iter().zip(&out).filter(|(a, b)| a != b).count());
+            eprintln!("run {run}: {:?}, zeros {zeros}, differs from run 0 in {diff} px", t.elapsed());
+            assert_eq!(diff, 0, "run {run}");
+            first.get_or_insert(out);
+        }
+        // Same pixels, split into small dispatches.
+        for size in [1024usize, 4096, 16384] {
+            for run in 0..2 {
+                let t = std::time::Instant::now();
+                let mut out = vec![];
+                let mut worst = std::time::Duration::ZERO;
+                for chunk in offs.chunks(size) {
+                    let tc = std::time::Instant::now();
+                    out.extend(gpu.dispatch_offsets(chunk, g.upp, &r));
+                    worst = worst.max(tc.elapsed());
+                }
+                let zeros = out.iter().filter(|&&x| x == 0).count();
+                let diff = first.as_ref().map_or(0, |f| f.iter().zip(&out).filter(|(a, b)| a != b).count());
+                eprintln!("chunks of {size}, run {run}: total {:?}, slowest dispatch {worst:?}, zeros {zeros}, differs from first full run in {diff}",
+                    t.elapsed());
+                assert_eq!(diff, 0, "chunks of {size}");
             }
         }
-        assert_eq!(black, 0, "pixels lost their delta and followed the reference");
-        assert!(wrong * 10 < real.len(), "{wrong} wrong: more than f32 rounding");
-        assert!(off50 * 100 < real.len(), "{off50} pixels off by >50 iterations");
+    }
+
+    /// Measured 2026-09-23: with the fallback every threshold from 2^-60 to
+    /// 2^-110 is equally accurate (109 black, ~110 off by >50), and 2^-60 is
+    /// fastest (0.96 s vs 1.23 s at 2^-110 on the heavy block).
+    ///
+    /// A/B the floatexp -> f32 switch threshold (with the tiny-δ fallback):
+    /// accuracy on the second reported view's sample vs exact, and GPU time
+    /// on a heavy 256x256 block beside the minibrot. Needs the cached exact
+    /// values ($DIAG_OUT/b.exact from diag_view_2026_09_23b_*).
+    #[test]
+    #[ignore]
+    fn diag_switch_threshold() {
+        let clip = "0.362680618169185280448991722507605679881284887059995535804130241675861432076423165340038916307547696001473666663642181909,-0.642687993846087296421249860151304775623709080524804816903388435265396126015520705061576074177687940915500836211594418175|1.7963169535192306e-92";
+        let v = sample_view_cached("b", clip, 32768, (3000, 2000), (150, 100));
+        let g = &v.geom;
+        let n = find_nucleus(&g.center, &g.radius, g.upp, 32768, g.prec, &|| false).unwrap().unwrap();
+        let r = Reference::new(n.c.clone(), 32768, Some(n.period));
+        let (rx, ry) = ref_px(&r.c, &v.ctx);
+        let sample: Vec<[f32; 4]> = v.pix.iter().map(|&(c, w)| pack_fe(c as f64 - rx, w as f64 - ry, g.upp)).collect();
+        let block: Vec<[f32; 4]> = (0..256).flat_map(|j| (0..256).map(move |i| (i, j)))
+            .map(|(i, j)| pack_fe((i as f64 - 128.3) * 3.0, (j as f64 - 127.6) * 3.0, g.upp)).collect();
+        let gpu = GpuState::new();
+        let layout = gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[Some(&gpu.bgl)], immediate_size: 0,
+        });
+        let body = SHADER_FE_BODY;
+        for (sw, min_exp) in [(-60, -62), (-80, -82), (-90, -92), (-100, -102), (-110, -112)] {
+            let src = body
+                .replace("const F32_SWITCH_EXP : i32 = -60;", &format!("const F32_SWITCH_EXP : i32 = {sw};"))
+                .replace("const F32_MIN_DELTA : f32 = 2.168404344971009e-19;", &format!("const F32_MIN_DELTA : f32 = {:e};", (min_exp as f64).exp2()));
+            assert!(body.contains("const F32_SWITCH_EXP : i32 = -60;") && body.contains("const F32_MIN_DELTA : f32 = 2.168404344971009e-19;"));
+            let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: None, source: wgpu::ShaderSource::Wgsl(format!("{FE_HELPERS}\n{src}").into()),
+            });
+            let pipeline = gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None, layout: Some(&layout), module: &module, entry_point: Some("main"),
+                compilation_options: Default::default(), cache: None,
+            });
+            let run = |d: &[[f32; 4]]| -> Vec<u32> {
+                d.chunks(4096).flat_map(|c| gpu.dispatch(&pipeline, bytemuck::cast_slice(c), c.len(), 16, &r)).collect()
+            };
+            let got = run(&sample);
+            let (wrong, off50, black) = score(&got, &v.exact);
+            let _ = run(&block);
+            let t = std::time::Instant::now();
+            let _ = run(&block);
+            eprintln!("switch 2^{sw}, fallback below 2^{min_exp}: wrong {wrong}, off>50 {off50}, black {black} (exact 109) | heavy block {:?}",
+                t.elapsed());
+        }
     }
 }
