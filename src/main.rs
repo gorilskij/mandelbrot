@@ -30,6 +30,15 @@ use crate::rendering::*;
 use crate::support::{Length, Point};
 use crate::tiles::perturb::{Perturbator, Toggle, gpu::{Gpu, GpuState}};
 
+/// DIAG: ⌃⌥⇧⌘ for the held modifiers.
+fn mod_symbols(m: ModifiersState) -> String {
+    [(m.control_key(), "⌃"), (m.alt_key(), "⌥"), (m.shift_key(), "⇧"), (m.super_key(), "⌘")]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, s)| *s)
+        .collect()
+}
+
 struct ClipBoardData<'a> {
     coords: Cow<'a, CoordinatesBox>,
     iterations: usize,
@@ -93,6 +102,9 @@ struct App {
     // Queued update from key events; processed in about_to_wait.
     pending_update: UpdateKind,
 
+    /// DIAG: last key event and what it did, shown in the title.
+    key_debug: String,
+
     // (left, top, right, bottom) in Mandelbrot units — the initial view rectangle.
     // Nothing outside this rect is ever allowed to be visible.
     bounds: Option<(f64, f64, f64, f64)>,
@@ -125,6 +137,7 @@ impl App {
             scrolling: false,
             modifiers: ModifiersState::empty(),
             pending_update: UpdateKind::No,
+            key_debug: String::new(),
             bounds: None,
         }
     }
@@ -251,8 +264,10 @@ impl App {
             else { "f32" };
         let (cx, cy) = self.center_coord_f64();
         window.set_title(&format!(
-            "Mandelbrot | {} | view {:.4e} (2^{:.2}) | depth {} upp 2^{} | iters {} | centre {:.17}, {:.17}",
+            "Mandelbrot | {} | view {:.4e} (2^{:.2}) | depth {} upp 2^{} | iters {} | centre {:.17}, {:.17} \
+             | mods [{}] | key {}",
             pipe, view, view.log2(), depth, upp, self.iterations, cx, cy,
+            mod_symbols(self.modifiers), self.key_debug,
         ));
     }
 
@@ -264,6 +279,25 @@ impl App {
             (&self.coords.origin.x + &off(self.phys_width)).to_f64().value(),
             (&self.coords.origin.y + &off(self.phys_height)).to_f64().value(),
         )
+    }
+
+    /// DIAG: record a key event for the title and the log.
+    fn note_key(&mut self, e: &winit::event::KeyEvent) {
+        let key = match e.physical_key {
+            PhysicalKey::Code(c) => format!("{c:?}"),
+            other => format!("{other:?}"),
+        };
+        let dir = if e.state == ElementState::Pressed { "↓" } else { "↑" };
+        let rep = if e.repeat { " (repeat)" } else { "" };
+        self.key_debug = format!("{}{key} {dir}{rep}", mod_symbols(self.modifiers));
+        info!("[diag key] {} logical {:?}", self.key_debug, e.logical_key);
+    }
+
+    /// DIAG: append what the app did with the last key press.
+    fn note_action(&mut self, action: &str) {
+        self.key_debug.push_str(" → ");
+        self.key_debug.push_str(action);
+        info!("[diag key] → {action}");
     }
 
     fn cursor_usize(&self) -> Option<Point<usize, Pixels>> {
@@ -337,6 +371,9 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        if let WindowEvent::KeyboardInput { event: ref e, .. } = event {
+            self.note_key(e);
+        }
         match event {
             WindowEvent::CloseRequested => {
                 // Stop the render thread first so it releases the surface
@@ -421,6 +458,7 @@ impl ApplicationHandler for App {
 
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
+                info!("[diag key] modifiers [{}]", mod_symbols(self.modifiers));
             }
 
             WindowEvent::KeyboardInput {
@@ -438,24 +476,28 @@ impl ApplicationHandler for App {
                     KeyCode::Space => {
                         info!("reset (spacebar)");
                         self.pending_update = UpdateKind::Reset;
+                        self.note_action("reset");
                     }
                     KeyCode::Escape => {
                         let now_gpu = !self.use_gpu.load(std::sync::atomic::Ordering::Relaxed);
                         self.use_gpu.store(now_gpu, std::sync::atomic::Ordering::Relaxed);
                         info!("backend: {}", if now_gpu { "GPU" } else { "CPU" });
                         self.pending_update = UpdateKind::Reset;
+                        self.note_action(if now_gpu { "backend GPU" } else { "backend CPU" });
                     }
                     KeyCode::ArrowUp => {
                         self.iterations *= 2;
                         info!("iterations: {}", self.iterations);
                         self.pending_update =
                             self.pending_update.max(UpdateKind::AroundCursor);
+                        self.note_action("iterations ×2");
                     }
                     KeyCode::ArrowDown if self.iterations > 1 => {
                         self.iterations /= 2;
                         info!("iterations: {}", self.iterations);
                         self.pending_update =
                             self.pending_update.max(UpdateKind::AroundCursor);
+                        self.note_action("iterations ÷2");
                     }
                     KeyCode::KeyC if ctrl => {
                         let data = ClipBoardData {
@@ -465,8 +507,11 @@ impl ApplicationHandler for App {
                         let s = data.to_string();
                         info!("COPIED: {s}");
                         match Clipboard::new().and_then(|mut cb| cb.set_text(s)) {
-                            Ok(()) => {}
-                            Err(e) => warn!("clipboard copy failed: {e}"),
+                            Ok(()) => self.note_action("copied"),
+                            Err(e) => {
+                                warn!("clipboard copy failed: {e}");
+                                self.note_action("copy FAILED (clipboard error)");
+                            }
                         }
                     }
                     KeyCode::KeyV if ctrl => {
@@ -479,13 +524,15 @@ impl ApplicationHandler for App {
                             info!("PASTED: {}", contents.trim());
                             self.pending_update =
                                 self.pending_update.max(UpdateKind::AroundCenter);
+                            self.note_action("pasted");
                         } else {
                             warn!(
                                 "PASTE FAILED: invalid clipboard contents: {contents:?}"
                             );
+                            self.note_action("paste FAILED (not coordinates)");
                         }
                     }
-                    _ => {}
+                    _ => self.note_action("no action"),
                 }
             }
 
