@@ -74,6 +74,23 @@ pixel's orbit does not follow. The shaders track `n` (iterations, reported)
 and `m` (reference index) separately. `shaders_validate` checks the WGSL with
 naga, since it is otherwise only compiled at runtime.
 
+**BLA** (bilinear approximation, `bla.rs` + `shaders/perturb_common.wgsl`):
+while |δ| is tiny next to |2X| a step is linear, δ ← A·δ + B·δ₀, and blocks of
+2^k steps compose into one (A, B) with a validity radius R (relative error ≤
+2⁻²⁴). The table is a binary tree over the reference orbit (level k: blocks at
+multiples of 2^k), built on the CPU in a small floatexp (`Fx`; A overflows and
+R underflows f64 at depth) per pass and reference, with R bounded by the pass's
+max |δ₀|, and uploaded once per pass together with the orbit (`GpuRef`). The
+shaders search upwards from level 1 (a block's R ≤ its first half's, so the
+first invalid level ends the search) with exponential back-off after failed
+searches (reset on a jump or rebase), apply the block in floatexp, add log|A|²
+to the interior-detection derivative, and never jump across an interior
+window boundary or the iteration limit. `USE_BLA` switches it off for A/B.
+Measured: the 2⁻³⁰⁵ reported view went from ~2 min to ~1.5 s per generation,
+and became more accurate (fewer f32 rounding steps); shallow views ~5–10%
+slower. `BlaEntry` and WGSL `struct Bla` must keep the same layout (vec2s
+first; `entry_layout_matches_wgsl`).
+
 **Interior detection** (GPU, nucleus references only): the shaders track
 log2|dz/dz₀|² and, every window of ≥128 iterations (a whole number of the
 nucleus period p), compare it with the previous window; 2 consecutive windows

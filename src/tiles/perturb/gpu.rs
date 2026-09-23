@@ -32,6 +32,7 @@
 //! any depth.  The f32 pipeline multiplies by `2^upp`; the floatexp pipeline
 //! carries `2^upp` in the exponent (`pack_fe`).
 
+use super::bla::BlaTable;
 use super::nucleus::{MAX_REF_DIST, find_nucleus};
 use super::{PassBatchCtx, Perturbator, TileItem};
 use crate::rendering::{calculate_orbit, check_orbit};
@@ -58,6 +59,17 @@ const SHADER_SRC: &str = include_str!("shaders/perturbation.wgsl");
 const FE_HELPERS: &str = include_str!("shaders/floatexp.wgsl");
 /// Deep-zoom perturbation; iterates the delta in floatexp.
 const SHADER_FE_BODY: &str = include_str!("shaders/perturbation_floatexp.wgsl");
+/// Shared by both shaders: BLA table lookup/apply and interior detection.
+const COMMON: &str = include_str!("shaders/perturb_common.wgsl");
+
+/// Full source of a perturbation shader: floatexp helpers, the shared code,
+/// then `body`.
+fn shader_source(body: &str) -> String {
+    format!("{FE_HELPERS}\n{COMMON}\n{body}")
+}
+
+/// Use BLA (see bla.rs). Off = plain iteration, for A/B tests.
+const USE_BLA: bool = true;
 
 // ---------------------------------------------------------------------------
 // CPU-side types
@@ -145,7 +157,10 @@ struct Uniforms {
     interior_contraction: f32,
     /// Consecutive contracting windows needed.
     interior_windows:     u32,
-    _pad:                 u32,
+    /// BLA table: number of levels (0 disables BLA) and log2 of level 0's size.
+    bla_levels:           u32,
+    bla_log2_size:        u32,
+    _pad:                 [u32; 3],
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +171,9 @@ struct Uniforms {
 struct Reference {
     c:          Complex<FBig>,
     orbit:      Vec<[f32; 2]>,
+    /// The same orbit in f64, for building BLA tables (f64's range keeps
+    /// the tiny values near the orbit's zeros that f32 flushes to 0).
+    orbit64:    Vec<Complex<f64>>,
     is_full:    bool,
     iterations: usize,
     /// Period, when `c` is a nucleus found by Newton.
@@ -164,9 +182,12 @@ struct Reference {
 
 impl Reference {
     fn new(c: Complex<FBig>, iterations: usize, period: Option<usize>) -> Self {
-        let (_, orbit) = calculate_orbit(c.clone(), iterations);
+        let (exact, orbit) = calculate_orbit(c.clone(), iterations);
         Self {
             orbit: orbit.orbit.iter().map(|z| [z.re as f32, z.im as f32]).collect(),
+            orbit64: exact.orbit.iter()
+                .map(|z| Complex { re: z.re.to_f64().value(), im: z.im.to_f64().value() })
+                .collect(),
             is_full: orbit.is_full,
             c,
             iterations,
@@ -246,6 +267,25 @@ fn ref_px(c: &Complex<FBig>, ctx: &PassBatchCtx) -> (f64, f64) {
     (px(&c.re, &ctx.x0), px(&c.im, &ctx.y0))
 }
 
+/// A reference ready for dispatching: its orbit and BLA table uploaded once
+/// (shared by every chunk of a pass), plus the uniform values.
+struct GpuRef {
+    orbit_buf:     wgpu::Buffer,
+    bla_buf:       wgpu::Buffer,
+    orbit_len:     u32,
+    is_full:       bool,
+    interior:      (u32, f32),
+    bla_levels:    u32,
+    bla_log2_size: u32,
+}
+
+/// log2 of the largest |δ₀| among pixel offsets `offs` (pixel units at
+/// 2^upp), with half a bit of margin; bounds the BLA table's radii.
+fn log2_dc(offs: &[(f64, f64)], upp: i64) -> f64 {
+    let max = offs.iter().map(|&(x, y)| x.hypot(y)).fold(0.0, f64::max);
+    max.max(1.0).log2() + 0.5 + upp as f64
+}
+
 // ---------------------------------------------------------------------------
 // GpuState — owns the wgpu device / pipeline
 // ---------------------------------------------------------------------------
@@ -296,6 +336,7 @@ impl GpuState {
                     bgl_entry(1, wgpu::BufferBindingType::Storage { read_only: true }),
                     bgl_entry(2, wgpu::BufferBindingType::Storage { read_only: true }),
                     bgl_entry(3, wgpu::BufferBindingType::Storage { read_only: false }),
+                    bgl_entry(4, wgpu::BufferBindingType::Storage { read_only: true }),
                 ],
             });
 
@@ -320,11 +361,8 @@ impl GpuState {
                 })
             };
 
-            let pipeline    = make_pipeline("perturbation", SHADER_SRC.to_string());
-            let pipeline_fe = make_pipeline(
-                "perturbation_fe",
-                format!("{FE_HELPERS}\n{SHADER_FE_BODY}"),
-            );
+            let pipeline    = make_pipeline("perturbation", shader_source(SHADER_SRC));
+            let pipeline_fe = make_pipeline("perturbation_fe", shader_source(SHADER_FE_BODY));
 
             GpuState {
                 device, queue, pipeline, pipeline_fe, bgl, max_binding,
@@ -427,6 +465,27 @@ impl GpuState {
         r
     }
 
+    /// Upload `r` for dispatching pixels with |δ₀| ≤ 2^log2_dc.
+    fn prepare(&self, r: &Reference, log2_dc: f64) -> GpuRef {
+        self.prepare_with(r, log2_dc, USE_BLA)
+    }
+
+    fn prepare_with(&self, r: &Reference, log2_dc: f64, bla: bool) -> GpuRef {
+        let table = if bla { BlaTable::build(&r.orbit64, log2_dc) } else { BlaTable::disabled() };
+        let buf = |bytes: &[u8]| self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytes, usage: wgpu::BufferUsages::STORAGE,
+        });
+        GpuRef {
+            orbit_buf:     buf(bytemuck::cast_slice(&r.orbit)),
+            bla_buf:       buf(bytemuck::cast_slice(&table.entries)),
+            orbit_len:     r.orbit.len() as u32,
+            is_full:       r.is_full,
+            interior:      r.interior(),
+            bla_levels:    table.levels,
+            bla_log2_size: table.log2_size,
+        }
+    }
+
     /// Pixels for the next chunk, from the last measured cost.
     fn chunk_len(&self) -> usize {
         ((TARGET_CHUNK_MS / *self.ms_per_px.lock()) as usize).max(MIN_CHUNK_PX)
@@ -441,7 +500,7 @@ impl GpuState {
     }
 
     /// Dispatch pixels given as offsets from `r` in pixel units.
-    fn dispatch_offsets(&self, offs: &[(f64, f64)], upp: i64, r: &Reference) -> Vec<u32> {
+    fn dispatch_offsets(&self, offs: &[(f64, f64)], upp: i64, r: &GpuRef) -> Vec<u32> {
         if upp < FE_THRESHOLD {
             let d: Vec<[f32; 4]> = offs.iter().map(|&(x, y)| pack_fe(x, y, upp)).collect();
             self.dispatch_fe(&d, r)
@@ -456,12 +515,12 @@ impl GpuState {
     }
 
     /// Plain-f32 dispatch: one `[f32; 2]` delta per pixel.
-    fn dispatch_f32(&self, deltas: &[[f32; 2]], r: &Reference) -> Vec<u32> {
+    fn dispatch_f32(&self, deltas: &[[f32; 2]], r: &GpuRef) -> Vec<u32> {
         self.dispatch(&self.pipeline, bytemuck::cast_slice(deltas), deltas.len(), 8, r)
     }
 
     /// floatexp dispatch: one `[f32; 4]` seed per pixel (mantissa.xy, exp, _).
-    fn dispatch_fe(&self, deltas: &[[f32; 4]], r: &Reference) -> Vec<u32> {
+    fn dispatch_fe(&self, deltas: &[[f32; 4]], r: &GpuRef) -> Vec<u32> {
         self.dispatch(&self.pipeline_fe, bytemuck::cast_slice(deltas), deltas.len(), 16, r)
     }
 
@@ -478,7 +537,7 @@ impl GpuState {
         delta_bytes: &[u8],
         n:           usize,
         elem:        usize,
-        r:           &Reference,
+        r:           &GpuRef,
     ) -> Vec<u32> {
         if n == 0 { return Vec::new(); }
         let max_pixels = ((self.max_binding / elem) * 9 / 10).max(1);
@@ -500,7 +559,7 @@ impl GpuState {
         pipeline:    &wgpu::ComputePipeline,
         delta_bytes: &[u8],
         n_pixels:    usize,
-        r:           &Reference,
+        r:           &GpuRef,
     ) -> Vec<u32> {
         let out = self.dispatch_once(pipeline, delta_bytes, n_pixels, r);
         let missing = out.iter().filter(|&&v| v == NOT_RUN).count();
@@ -525,11 +584,10 @@ impl GpuState {
         pipeline:    &wgpu::ComputePipeline,
         delta_bytes: &[u8],
         n_pixels:    usize,
-        r:           &Reference,
+        r:           &GpuRef,
     ) -> Vec<u32> {
         let n = n_pixels as u32;
-        let orbit_data = &r.orbit;
-        let (interior_window, interior_contraction) = r.interior();
+        let (interior_window, interior_contraction) = r.interior;
         if n == 0 { return Vec::new(); }
 
         let device = &self.device;
@@ -544,24 +602,21 @@ impl GpuState {
             label:    None,
             contents: bytemuck::bytes_of(&Uniforms {
                 pixel_count: n,
-                orbit_len:   orbit_data.len() as u32,
+                orbit_len:   r.orbit_len,
                 is_full:     r.is_full as u32,
                 dispatch_w,
                 interior_window,
                 interior_contraction,
                 interior_windows: INTERIOR_WINDOWS,
-                _pad: 0,
+                bla_levels:    r.bla_levels,
+                bla_log2_size: r.bla_log2_size,
+                _pad: [0; 3],
             }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let deltas_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label:    None,
             contents: delta_bytes,
-            usage:    wgpu::BufferUsages::STORAGE,
-        });
-        let orbit_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label:    None,
-            contents: bytemuck::cast_slice(orbit_data),
             usage:    wgpu::BufferUsages::STORAGE,
         });
 
@@ -585,8 +640,9 @@ impl GpuState {
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: uniforms_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: deltas_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: orbit_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: r.orbit_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: output_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: r.bla_buf.as_entire_binding() },
             ],
         });
 
@@ -761,6 +817,17 @@ impl Perturbator for Gpu {
         // ----------------------------------------------------------------
         let t_ref = std::time::Instant::now(); // DIAG
         let Some(mut reference) = state.initial_reference(ctx, &geom, int) else { return };
+        // Bound on |δ₀| over the whole pass, for the BLA table's radii.
+        let pass_dc = |r: &Reference| {
+            let (rx, ry) = ref_px(&r.c, ctx);
+            let max = pixel_refs.iter()
+                .map(|pr| (pr.col as f64 - rx).hypot(pr.row as f64 - ry))
+                .fold(0.0, f64::max);
+            log2_dc(&[(max, 0.0)], upp)
+        };
+        let t_prep = std::time::Instant::now(); // DIAG
+        let mut gref = state.prepare(&reference, pass_dc(&reference));
+        log::info!("[diag gpu] pass {pass}: reference uploaded (BLA {} levels) in {:.1} ms", gref.bla_levels, ms(t_prep));
         // DIAG
         {
             let (rx, ry) = ref_px(&reference.c, ctx);
@@ -787,7 +854,7 @@ impl Perturbator for Gpu {
 
             let t_disp = std::time::Instant::now();
             let offs   = offsets(&mut chunk.clone(), &reference);
-            let mut raw = state.dispatch_offsets(&offs, upp, &reference);
+            let mut raw = state.dispatch_offsets(&offs, upp, &gref);
             let disp_ms = ms(t_disp);
             state.record_chunk(len, disp_ms);
             log::info!(
@@ -816,7 +883,8 @@ impl Perturbator for Gpu {
 
                 let t_gdisp = std::time::Instant::now(); // DIAG
                 let offs    = offsets(&mut glitched.iter().map(|&j| pos + j), &new_ref);
-                let new_raw = state.dispatch_offsets(&offs, upp, &new_ref);
+                let new_gref = state.prepare(&new_ref, log2_dc(&offs, upp));
+                let new_raw = state.dispatch_offsets(&offs, upp, &new_gref);
                 for (k, &j) in glitched.iter().enumerate() {
                     raw[j] = new_raw[k];
                 }
@@ -826,7 +894,10 @@ impl Perturbator for Gpu {
                     glitched.len(), new_ref.describe(), ms(t_gdisp), raw_stats(&new_raw),
                 );
                 // Later chunks start from the better reference.
-                if new_ref.beats(&reference) { reference = new_ref; }
+                if new_ref.beats(&reference) {
+                    reference = new_ref;
+                    gref = state.prepare(&reference, pass_dc(&reference));
+                }
             }
 
             // Residual glitches: resolve exactly on the CPU, in parallel and
@@ -885,8 +956,8 @@ mod tests {
     #[test]
     fn shaders_validate() {
         for (name, src) in [
-            ("perturbation", SHADER_SRC.to_string()),
-            ("perturbation_floatexp", format!("{FE_HELPERS}\n{SHADER_FE_BODY}")),
+            ("perturbation", shader_source(SHADER_SRC)),
+            ("perturbation_floatexp", shader_source(SHADER_FE_BODY)),
         ] {
             let module = naga::front::wgsl::parse_str(&src)
                 .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&src)));
@@ -1304,12 +1375,17 @@ mod tests {
 
     /// Run the real shader on the sample with the view's own nucleus.
     fn gpu_on_sample(v: &ViewSample, gpu: &GpuState) -> (Reference, Vec<u32>) {
+        gpu_on_sample_with(v, gpu, USE_BLA)
+    }
+
+    fn gpu_on_sample_with(v: &ViewSample, gpu: &GpuState, bla: bool) -> (Reference, Vec<u32>) {
         let g = &v.geom;
         let n = find_nucleus(&g.center, &g.radius, g.upp, v.ctx.iterations, g.prec, &|| false).unwrap().expect("nucleus");
         let r = Reference::new(n.c.clone(), v.ctx.iterations, Some(n.period));
         let (rx, ry) = ref_px(&r.c, &v.ctx);
         let offs: Vec<(f64, f64)> = v.pix.iter().map(|&(col, row)| (col as f64 - rx, row as f64 - ry)).collect();
-        let out = gpu.dispatch_offsets(&offs, g.upp, &r);
+        let gr = gpu.prepare_with(&r, log2_dc(&offs, g.upp), bla);
+        let out = gpu.dispatch_offsets(&offs, g.upp, &gr);
         (r, out)
     }
 
@@ -1416,7 +1492,8 @@ mod tests {
     /// backend, fresh and after a Space-style reset; every generation must
     /// match exact orbits up to f32 rounding (before: 1070, 5169, 6979 black
     /// of 15000; after: 109, the exact count, every time). ~2 min per
-    /// generation (DIAG_GENS, default 2); exact values cached in $DIAG_OUT.
+    /// generation without BLA, ~1.5 s with it (DIAG_GENS, default 2); exact
+    /// values cached in $DIAG_OUT (computing them takes ~1 min).
     #[test]
     #[ignore]
     fn view_2026_09_23b_pipeline_matches_exact() {
@@ -1461,6 +1538,8 @@ mod tests {
             .map(|(dx, dy)| (dx * 3.0, dy * 3.0)).collect();
         let _ = (rx, ry);
         let gpu = GpuState::new();
+        // BLA off: with it this block takes ~20 ms, too short to be killed.
+        let r = gpu.prepare_with(&r, log2_dc(&offs, g.upp), false);
         let mut first: Option<Vec<u32>> = None;
         for run in 0..6 {
             let t = std::time::Instant::now();
@@ -1512,6 +1591,7 @@ mod tests {
         let block: Vec<[f32; 4]> = (0..256).flat_map(|j| (0..256).map(move |i| (i, j)))
             .map(|(i, j)| pack_fe((i as f64 - 128.3) * 3.0, (j as f64 - 127.6) * 3.0, g.upp)).collect();
         let gpu = GpuState::new();
+        let r = gpu.prepare_with(&r, v.geom.upp as f64 + 12.0, false); // as measured, before BLA
         let layout = gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None, bind_group_layouts: &[Some(&gpu.bgl)], immediate_size: 0,
         });
@@ -1522,7 +1602,7 @@ mod tests {
                 .replace("const F32_MIN_DELTA : f32 = 2.168404344971009e-19;", &format!("const F32_MIN_DELTA : f32 = {:e};", (min_exp as f64).exp2()));
             assert!(body.contains("const F32_SWITCH_EXP : i32 = -60;") && body.contains("const F32_MIN_DELTA : f32 = 2.168404344971009e-19;"));
             let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: None, source: wgpu::ShaderSource::Wgsl(format!("{FE_HELPERS}\n{src}").into()),
+                label: None, source: wgpu::ShaderSource::Wgsl(shader_source(&src).into()),
             });
             let pipeline = gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: None, layout: Some(&layout), module: &module, entry_point: Some("main"),
@@ -1538,6 +1618,47 @@ mod tests {
             let _ = run(&block);
             eprintln!("switch 2^{sw}, fallback below 2^{min_exp}: wrong {wrong}, off>50 {off50}, black {black} (exact 109) | heavy block {:?}",
                 t.elapsed());
+        }
+    }
+
+    /// A/B BLA off vs on with the real shaders: accuracy on each view's
+    /// sample against exact orbits, and GPU time on a heavy 256x256 block
+    /// beside the reference. Exact values cached in $DIAG_OUT (name.exact).
+    ///
+    /// Measured 2026-09-23 (wrong / off by >50 of 15000; heavy block):
+    ///   2^-305 view: 5946/112, 1050 ms  ->  611/10, 35 ms
+    ///   2^-220 view: 1184/23,   144 ms  ->  352/7,  15 ms
+    ///   seahorse (2^-17), bulb (2^-13): identical results, ~5-10% slower
+    ///   (BLA rarely applies there; the search back-off keeps it cheap).
+    #[test]
+    #[ignore]
+    fn diag_bla_ab() {
+        let views = [
+            ("seahorse", "-0.755044091796875,0.12417060546875|7.62939453125e-06", 4096),
+            ("bulb", "-0.30510546875,0.6229296875|0.0001220703125", 4096),
+            ("a", "0.36268061816918528044899172250760567988128488705999553580413024078293361870845608332075349484941,-0.64268799384608729642124986015130477562370908052480481690338843577039749867381572196329048271251|6.226537747227718e-67", 32768),
+            ("b", "0.362680618169185280448991722507605679881284887059995535804130241675861432076423165340038916307547696001473666663642181909,-0.642687993846087296421249860151304775623709080524804816903388435265396126015520705061576074177687940915500836211594418175|1.7963169535192306e-92", 32768),
+        ];
+        let gpu = GpuState::new();
+        for (name, clip, iters) in views {
+            let v = sample_view_cached(name, clip, iters, (3000, 2000), (150, 100));
+            let exact_black = v.exact.iter().filter(|&&x| x == 0).count();
+            let g = &v.geom;
+            let n = find_nucleus(&g.center, &g.radius, g.upp, iters, g.prec, &|| false).unwrap().expect("nucleus");
+            let r = Reference::new(n.c.clone(), iters, Some(n.period));
+            let block: Vec<(f64, f64)> = (0..256).flat_map(|j| (0..256).map(move |i| ((i as f64 - 128.3) * 3.0, (j as f64 - 127.6) * 3.0))).collect();
+            for bla in [false, true] {
+                let (_, got) = gpu_on_sample_with(&v, &gpu, bla);
+                let (wrong, off50, black) = score(&got, &v.exact);
+                let gr = gpu.prepare_with(&r, log2_dc(&block, g.upp), bla);
+                let run = || -> Vec<u32> { block.chunks(4096).flat_map(|c| gpu.dispatch_offsets(c, g.upp, &gr)).collect() };
+                let _ = run();
+                let t = std::time::Instant::now();
+                let _ = run();
+                eprintln!("{name:9} (p={:4}, depth {:3}) BLA {:3}: wrong {wrong:5} off>50 {off50:4} black {black:4} (exact {exact_black:4}) | heavy block {:?}",
+                    n.period, v.ctx.depth, if bla { "on" } else { "off" }, t.elapsed());
+                dump_rgb(&format!("ab_{name}_{}", if bla { "on" } else { "off" }), &got);
+            }
         }
     }
 }

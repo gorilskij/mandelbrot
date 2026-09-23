@@ -7,7 +7,12 @@ struct Uniforms {
     interior_window      : u32,
     interior_contraction : f32,
     interior_windows     : u32,
-    _pad                 : u32,
+    // BLA table (see perturb_common.wgsl); bla_levels 0 disables it.
+    bla_levels           : u32,
+    bla_log2_size        : u32,
+    _pad0                : u32,
+    _pad1                : u32,
+    _pad2                : u32,
 }
 
 @group(0) @binding(0) var<uniform>             uniforms     : Uniforms;
@@ -36,6 +41,9 @@ const GLITCH_BIT : u32 = 0x80000000u;
 // previous window: inside a component the cycle multiplier |λ| < 1, so it
 // shrinks; `interior_windows` consecutive shrinks by `interior_contraction`
 // declare the pixel in the set, instead of running to the iteration limit.
+//
+// BLA: while δ is tiny next to X, skip a whole block of iterations at once
+// (δ ← A·δ + B·δ₀, in floatexp since A can be huge); see perturb_common.wgsl.
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let idx = gid.y * uniforms.dispatch_w + gid.x;
@@ -48,8 +56,32 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     var ld_prev = 0.0;
     var have_prev = false;
     var streak = 0u;
+    var n = 0u;
+    var backoff = BlaBackoff(0u, 1u);
 
-    for (var n = 0u; n < uniforms.orbit_len; n++) {
+    loop {
+        if n >= uniforms.orbit_len { break; }
+
+        var hit = BlaHit(0u, 0u);
+        if bla_should_search(&backoff, m) {
+            hit = bla_find(m, 0.5 * log2(dot(delta, delta)), jump_limit(n));
+            if hit.len == 0u { bla_failed(&backoff); } else { bla_reset(&backoff); }
+        }
+        if hit.len != 0u {
+            let e = bla_table[hit.idx];
+            delta = fe_to_c(bla_apply(e, fe_from_c(delta), fe_from_c(d0)));
+            if uniforms.interior_window != 0u {
+                ld += bla_log2_a2(e);
+                if interior_check(n + hit.len - 1u, &ld_prev, &have_prev, &streak, ld) {
+                    output[idx] = 0u;
+                    return;
+                }
+            }
+            n += hit.len;
+            m += hit.len;
+            continue;
+        }
+
         let c = orbit_data[m];
         let x = c + delta;
         let x2 = dot(x, x);
@@ -61,18 +93,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 
         if uniforms.interior_window != 0u {
             ld += 2.0 + log2(x2);
-            if (n + 1u) % uniforms.interior_window == 0u {
-                if have_prev && ld - ld_prev < uniforms.interior_contraction {
-                    streak += 1u;
-                } else {
-                    streak = 0u;
-                }
-                ld_prev = ld;
-                have_prev = true;
-                if streak >= uniforms.interior_windows {
-                    output[idx] = 0u;
-                    return;
-                }
+            if interior_check(n, &ld_prev, &have_prev, &streak, ld) {
+                output[idx] = 0u;
+                return;
             }
         }
 
@@ -80,6 +103,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
             // Rebase: δ ← z² + δ_0, back to the start of the reference.
             delta = vec2<f32>(x.x * x.x - x.y * x.y, 2.0 * x.x * x.y) + d0;
             m = 0u;
+            bla_reset(&backoff);
         } else {
             // δ_{n+1} = 2 X_n δ_n + δ_n² + δ_0
             let re = 2.0 * c.x * delta.x - 2.0 * c.y * delta.y
@@ -91,6 +115,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
             delta = vec2<f32>(re, im);
             m = m + 1u;
         }
+        n += 1u;
     }
 
     if uniforms.is_full != 0u {

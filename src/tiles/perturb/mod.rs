@@ -9,6 +9,7 @@
 //!   - [`gpu::Gpu`]  — wgpu compute; batches all tiles in a pass into a single
 //!     GPU dispatch with iterative glitch-correction passes.
 
+pub mod bla;
 pub mod cpu;
 pub mod gpu;
 pub mod nucleus;
