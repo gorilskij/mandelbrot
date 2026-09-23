@@ -4,7 +4,8 @@
 //! into a single GPU compute dispatch.  Pixels that the perturbation
 //! approximation cannot resolve (glitches) are re-dispatched in subsequent
 //! passes with a new high-precision reference orbit, up to MAX_GLITCH_PASSES
-//! times.  Residual glitches are stored as black.
+//! times.  Residual glitches are then resolved exactly on the CPU (in
+//! parallel, interruptibly); any left unresolved are not stored.
 //!
 //! Coordinate math
 //! ---------------
@@ -34,6 +35,7 @@ use bytemuck::{Pod, Zeroable};
 use dashu::float::FBig;
 use dashu::integer::IBig;
 use num::Complex;
+use rayon::prelude::*;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use waker_interrupter::MultiInterrupter;
@@ -61,7 +63,7 @@ const MAX_GLITCH_PASSES: usize = 8;
 /// Use the floatexp pipeline once units-per-pixel drops below 2^FE_THRESHOLD.
 /// The f32 seed starts breaking down near 2^-126; -100 leaves a safe margin
 /// while keeping the fast f32 path for all shallower zooms.
-const FE_THRESHOLD: i64 = -100;
+pub(crate) const FE_THRESHOLD: i64 = -100;
 
 /// Sentinel exponent for a zero floatexp value (matches floatexp.wgsl).
 const FE_ZERO_EXP: i64 = -2_000_000_000;
@@ -219,9 +221,9 @@ impl GpuState {
         let device = &self.device;
         let queue  = &self.queue;
 
-        let groups     = (n + 63) / 64;
+        let groups     = n.div_ceil(64);
         let gx         = groups.min(65535);
-        let gy         = (groups + 65534) / 65535;
+        let gy         = groups.div_ceil(65535);
         let dispatch_w = gx * 64;
 
         let uniforms_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -278,16 +280,22 @@ impl GpuState {
             pass.dispatch_workgroups(gx, gy, 1);
         }
         enc.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
+        let t_submit = std::time::Instant::now(); // DIAG
         queue.submit([enc.finish()]);
+        log::info!("[diag gpu] dispatch chunk {n_pixels} px submitted, waiting..."); // DIAG
 
         let slice = staging_buf.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        log::info!(
+            "[diag gpu] dispatch chunk {n_pixels} px ({}x{} groups): gpu wait {:.1} ms",
+            gx, gy, t_submit.elapsed().as_secs_f64() * 1e3,
+        );
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("staging buffer mapped");
         let results: Vec<u32> = data
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>().0.iter()
+            .map(|b| u32::from_le_bytes(*b))
             .collect();
         drop(data);
         staging_buf.unmap();
@@ -306,6 +314,27 @@ fn bgl_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayout
         },
         count: None,
     }
+}
+
+/// DIAG: one-line summary of raw GPU results (in-set / glitched / escape range
+/// / number of distinct values / share of the most common value).
+fn raw_stats(raw: &[u32]) -> String {
+    let mut counts = std::collections::HashMap::<u32, usize>::new();
+    let (mut in_set, mut glitched) = (0usize, 0usize);
+    let (mut lo, mut hi) = (u32::MAX, 0u32);
+    for &r in raw {
+        *counts.entry(r).or_default() += 1;
+        if r & GLITCH_BIT != 0 { glitched += 1; }
+        else if r == 0 { in_set += 1; }
+        else { lo = lo.min(r); hi = hi.max(r); }
+    }
+    let (top_val, top_n) = counts.iter().max_by_key(|(_, n)| **n).map(|(v, n)| (*v, *n)).unwrap_or((0, 0));
+    format!(
+        "n={} in_set={} glitched={} escaped=[{}..{}] distinct={} top={:#x}@{:.1}%",
+        raw.len(), in_set, glitched,
+        if lo == u32::MAX { 0 } else { lo }, hi,
+        counts.len(), top_val, 100.0 * top_n as f64 / raw.len().max(1) as f64,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +362,8 @@ impl Perturbator for Gpu {
         if tiles.is_empty() || int.interrupted() { return; }
 
         let state   = &*self.0;
+        let t_pass  = std::time::Instant::now(); // DIAG
+        let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3; // DIAG
         let stride  = PASS_STRIDES[pass as usize];
         let coarser = (pass > 0).then(|| PASS_STRIDES[pass as usize - 1]);
         let scale   = units_per_pixel(ctx.depth); // Mandelbrot units per depth pixel
@@ -370,9 +401,8 @@ impl Perturbator for Gpu {
 
             for r in (0..TILE_SIZE).step_by(stride) {
                 for c in (0..TILE_SIZE).step_by(stride) {
-                    if let Some(cs) = coarser {
-                        if r % cs == 0 && c % cs == 0 { continue; } // done by coarser pass
-                    }
+                    if let Some(cs) = coarser
+                        && r % cs == 0 && c % cs == 0 { continue; } // done by coarser pass
                     let pixel_idx = r * TILE_SIZE + c;
                     if tile.load(pixel_idx).get().is_some() { continue; } // already computed
 
@@ -404,6 +434,8 @@ impl Perturbator for Gpu {
         // ----------------------------------------------------------------
         // Initial dispatch against the screen-centre reference orbit.
         // ----------------------------------------------------------------
+        let t_collect = ms(t_pass); // DIAG
+        let t_ref = std::time::Instant::now(); // DIAG
         let ref_x = &ctx.coords.origin.x
             + &FBig::try_from(ctx.width  as f64 / 2.0 * view).unwrap();
         let ref_y = &ctx.coords.origin.y
@@ -416,16 +448,41 @@ impl Perturbator for Gpu {
             .map(|c| [c.re as f32, c.im as f32])
             .collect();
 
+        let t_ref = ms(t_ref); // DIAG
+        let t_disp = std::time::Instant::now(); // DIAG
         let mut raw = if use_fe {
             state.dispatch_fe(&deltas_fe, &orbit_data, ref_orbit.is_full)
         } else {
             state.dispatch_f32(&deltas_f32, &orbit_data, ref_orbit.is_full)
         };
 
+        let t_disp = ms(t_disp); // DIAG
+        log::info!(
+            "[diag gpu] pass {pass} timing: collect {} px {t_collect:.1} ms, ref orbit {t_ref:.1} ms, \
+             initial dispatch {t_disp:.1} ms",
+            pixel_refs.len(),
+        );
+        // DIAG
+        {
+            let last = pixel_refs.len() - 1;
+            let seeds = if use_fe {
+                format!("seed[0]={:?} seed[last]={:?}", deltas_fe[0], deltas_fe[last])
+            } else {
+                format!("seed[0]={:?} seed[last]={:?}", deltas_f32[0], deltas_f32[last])
+            };
+            log::info!(
+                "[diag gpu] pass {pass} depth {} upp 2^{upp} view {view:.4e} ratio {ratio:.6} pipe {} | \
+                 ref orbit len {} full {} | off_px ({off_x_px:.3}, {off_y_px:.3}) offset ({offset_x:.4e}, {offset_y:.4e}) | {seeds}",
+                ctx.depth, if use_fe { "fe" } else { "f32" },
+                orbit_data.len(), ref_orbit.is_full,
+            );
+            log::info!("[diag gpu] pass {pass} initial: {}", raw_stats(&raw));
+        }
+
         // ----------------------------------------------------------------
         // Glitch-correction passes.
         // ----------------------------------------------------------------
-        for _ in 0..MAX_GLITCH_PASSES {
+        for round in 0..MAX_GLITCH_PASSES {
             if int.interrupted() { break; }
 
             let mut glitch_indices: Vec<usize> = Vec::new();
@@ -449,6 +506,7 @@ impl Perturbator for Gpu {
             let ref_r    = pr.pixel_idx / TILE_SIZE;
             let ts       = IBig::from(TILE_SIZE as u64);
             let prec     = working_precision(ctx.depth);
+            let t_gref = std::time::Instant::now(); // DIAG
             let (_, new_orbit) = calculate_orbit(
                 Complex {
                     re: pixel_to_coord(&ref_tile.key.x * &ts + IBig::from(ref_c as u64), ctx.depth, prec),
@@ -464,6 +522,8 @@ impl Perturbator for Gpu {
             // differences — exact, and tiny enough for f64 at any depth).
             let ref_col = pr.col;
             let ref_row = pr.row;
+            let t_gref = ms(t_gref); // DIAG
+            let t_gdisp = std::time::Instant::now(); // DIAG
             let new_raw = if use_fe {
                 let nd: Vec<[f32; 4]> = glitch_indices.iter().map(|&gi| {
                     let pr = &pixel_refs[gi];
@@ -483,35 +543,64 @@ impl Perturbator for Gpu {
             for (j, &gi) in glitch_indices.iter().enumerate() {
                 raw[gi] = new_raw[j];
             }
+            log::info!(
+                "[diag gpu] pass {pass} glitch round {round}: {} glitched, new ref orbit len {} full {} \
+                 (orbit {t_gref:.1} ms, dispatch {:.1} ms) -> {}",
+                glitch_indices.len(), new_orbit_data.len(), new_orbit.is_full, ms(t_gdisp),
+                raw_stats(&new_raw),
+            );
         }
 
         // ----------------------------------------------------------------
         // Resolve any residual glitches exactly on the CPU.
         //
-        // Skipped when interrupted: the glitch loop bailed early so there may
-        // be many, and the whole generation is being abandoned anyway.  When we
-        // *did* finish, residuals are rare (one in-set reference usually clears
-        // everything) and resolving them exactly makes every cached pixel
-        // correct regardless of which reference produced it — so partial,
-        // cross-generation tiles never disagree (the bug the CPU path avoids).
+        // Each residual pixel gets its own exact orbit, so this can be slow
+        // (thousands of residuals at ~1 ms each when every reference escapes
+        // early).  It runs across the rayon pool and checks the interrupt per
+        // pixel, so a stale view is abandoned promptly.  Pixels left
+        // unresolved keep GLITCH_BIT and are not stored below, so the next
+        // generation retries them; the ones that did resolve are exact and
+        // safe to cache.
         // ----------------------------------------------------------------
         if !int.interrupted() {
+            let residual: Vec<usize> = raw.iter().enumerate()
+                .filter(|&(_, &r)| r & GLITCH_BIT != 0)
+                .map(|(i, _)| i)
+                .collect();
+            if !residual.is_empty() {
+                log::info!("[diag gpu] pass {pass}: resolving {} residual glitches on CPU", residual.len());
+            }
             let ts   = IBig::from(TILE_SIZE as u64);
             let prec = working_precision(ctx.depth);
-            for (i, r) in raw.iter_mut().enumerate() {
-                if *r & GLITCH_BIT == 0 { continue; }
-                let pr   = &pixel_refs[i];
-                let tile = &tiles[pr.tile_idx].tile;
-                let c    = pr.pixel_idx % TILE_SIZE;
-                let rr   = pr.pixel_idx / TILE_SIZE;
-                let coord = Complex {
-                    re: pixel_to_coord(&tile.key.x * &ts + IBig::from(c as u64),  ctx.depth, prec),
-                    im: pixel_to_coord(&tile.key.y * &ts + IBig::from(rr as u64), ctx.depth, prec),
-                };
-                let (_, orbit) = calculate_orbit(coord, ctx.iterations);
-                *r = check_orbit(&orbit).unwrap().map_or(0, |n| n.get() as u32);
+            let t_resid = std::time::Instant::now(); // DIAG
+            let resolved: Vec<(usize, u32)> = residual.par_iter()
+                .filter_map(|&i| {
+                    if int.interrupted() { return None; }
+                    let pr   = &pixel_refs[i];
+                    let tile = &tiles[pr.tile_idx].tile;
+                    let c    = pr.pixel_idx % TILE_SIZE;
+                    let rr   = pr.pixel_idx / TILE_SIZE;
+                    let coord = Complex {
+                        re: pixel_to_coord(&tile.key.x * &ts + IBig::from(c as u64),  ctx.depth, prec),
+                        im: pixel_to_coord(&tile.key.y * &ts + IBig::from(rr as u64), ctx.depth, prec),
+                    };
+                    let (_, orbit) = calculate_orbit(coord, ctx.iterations);
+                    Some((i, check_orbit(&orbit).unwrap().map_or(0, |n| n.get() as u32)))
+                })
+                .collect();
+            if !residual.is_empty() {
+                log::info!(
+                    "[diag gpu] pass {pass}: residual CPU resolve {}/{} in {:.1} ms",
+                    resolved.len(), residual.len(), ms(t_resid),
+                );
             }
+            for (i, r) in resolved { raw[i] = r; }
         }
+        log::info!(
+            "[diag gpu] pass {pass} final{}: {}",
+            if int.interrupted() { " (interrupted)" } else { "" },
+            raw_stats(&raw),
+        );
 
         // ----------------------------------------------------------------
         // Scatter results into tile pixel stores.  A pixel still carrying
@@ -531,5 +620,9 @@ impl Perturbator for Gpu {
                 item.tile.finish_pass(pass + 1);
             }
         }
+        log::info!(
+            "[diag gpu] pass {pass} total {:.1} ms{}",
+            ms(t_pass), if int.interrupted() { " (interrupted)" } else { "" },
+        );
     }
 }

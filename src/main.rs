@@ -1,3 +1,7 @@
+// wgpu's Send/Sync auto-trait chain (Global -> Hub -> Registry -> ...) is
+// deeper than the default 128; see rust-lang/rust#159228.
+#![recursion_limit = "256"]
+
 mod drawing;
 mod gpu_compositor;
 mod rendering;
@@ -234,6 +238,34 @@ impl App {
         }
     }
 
+    /// DIAG: show zoom / depth / pipeline in the window title so the numbers
+    /// at which rendering breaks can be read off directly.
+    fn update_title(&self) {
+        let Some(window) = &self.window else { return };
+        let view  = self.coords.view.inner;
+        let depth = crate::tiles::store::depth_for_view(view);
+        let upp   = crate::tiles::store::upp_log2(depth);
+        let gpu   = self.use_gpu.load(std::sync::atomic::Ordering::Relaxed);
+        let pipe  = if !gpu { "cpu" }
+            else if upp < crate::tiles::perturb::gpu::FE_THRESHOLD { "fe" }
+            else { "f32" };
+        let (cx, cy) = self.center_coord_f64();
+        window.set_title(&format!(
+            "Mandelbrot | {} | view {:.4e} (2^{:.2}) | depth {} upp 2^{} | iters {} | centre {:.17}, {:.17}",
+            pipe, view, view.log2(), depth, upp, self.iterations, cx, cy,
+        ));
+    }
+
+    /// DIAG: screen-centre coordinate, rounded to f64 (for display only).
+    fn center_coord_f64(&self) -> (f64, f64) {
+        let view = self.coords.view.inner;
+        let off = |px: u32| FBig::try_from(px as f64 / 2.0 * view).unwrap();
+        (
+            (&self.coords.origin.x + &off(self.phys_width)).to_f64().value(),
+            (&self.coords.origin.y + &off(self.phys_height)).to_f64().value(),
+        )
+    }
+
     fn cursor_usize(&self) -> Option<Point<usize, Pixels>> {
         self.cursor_pos
             .map(|(x, y)| Point::new(x as usize, y as usize))
@@ -331,20 +363,20 @@ impl ApplicationHandler for App {
                 self.cursor_pos = Some((position.x, position.y));
 
                 // Update drag coords immediately on every cursor move.
-                if self.mouse_left_down {
-                    if let Some((start_origin, start_cursor)) = self.dragging.clone() {
-                        let dx = position.x - start_cursor.0;
-                        let dy = position.y - start_cursor.1;
-                        let view = self.coords.view.inner;
-                        let exact = |f: f64| FBig::try_from(f).unwrap();
-                        self.coords.origin = Point::new(
-                            &start_origin.x - &exact(dx * view),
-                            &start_origin.y - &exact(dy * view),
-                        );
-                        self.clamp_to_bounds();
-                        self.pending_update = self.pending_update.max(UpdateKind::AroundCursor);
-                        self.publish_view();
-                    }
+                if self.mouse_left_down
+                    && let Some((start_origin, start_cursor)) = self.dragging.clone()
+                {
+                    let dx = position.x - start_cursor.0;
+                    let dy = position.y - start_cursor.1;
+                    let view = self.coords.view.inner;
+                    let exact = |f: f64| FBig::try_from(f).unwrap();
+                    self.coords.origin = Point::new(
+                        &start_origin.x - &exact(dx * view),
+                        &start_origin.y - &exact(dy * view),
+                    );
+                    self.clamp_to_bounds();
+                    self.pending_update = self.pending_update.max(UpdateKind::AroundCursor);
+                    self.publish_view();
                 }
             }
 
@@ -496,6 +528,7 @@ impl ApplicationHandler for App {
                 }
             }
         }
+        self.update_title();
         if update != UpdateKind::No {
             // Push the (possibly changed) view so the render thread repaints.
             self.publish_view();
@@ -516,8 +549,29 @@ impl ApplicationHandler for App {
     }
 }
 
+/// DIAG: writes every log line to both stderr and `gpu.log` (flushed per
+/// line, so the file is complete even if the app hangs and gets killed).
+struct Tee(std::fs::File);
+
+impl std::io::Write for Tee {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::stderr().write_all(buf);
+        self.0.write_all(buf)?;
+        self.0.flush()?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+}
+
 fn main() {
-    env_logger::init();
+    // DIAG: default to `info` (RUST_LOG still overrides) and tee into gpu.log.
+    let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    match std::fs::File::create("gpu.log") {
+        Ok(file) => { logger.target(env_logger::Target::Pipe(Box::new(Tee(file)))); }
+        Err(e)   => eprintln!("could not create gpu.log: {e}"),
+    }
+    logger.init();
+    info!("logging to {}", std::env::current_dir().map(|d| d.join("gpu.log").display().to_string()).unwrap_or_default());
     let event_loop = EventLoop::new().unwrap();
     let mut app = App::new();
     event_loop.run_app(&mut app).unwrap();

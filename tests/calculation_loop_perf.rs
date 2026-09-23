@@ -30,10 +30,7 @@ fn calculate_iter(c: Complex<f64>) -> Option<f64> {
             Ok(())
         }
     });
-    match out {
-        Ok(_) => None,
-        Err(val) => Some(val),
-    }
+    out.err()
 }
 
 #[bench]

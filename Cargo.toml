@@ -5,27 +5,31 @@ edition = "2024"
 
 [dependencies]
 arboard = { version = "3.6.1", default-features = false }
-bytemuck = { version = "1.25.0", features = ["derive"] }
-crossbeam-channel = "0.5.15"
-dashu = { version = "0.4.3", features = ["num-traits"] }
-delegate = "0.13.5"
-env_logger = "0.11.10"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+dashu = { version = "0.6.0", features = ["num-traits"] }
+env_logger = "0.11.11"
 flurry = "0.5.2"
 hsl = "0.1.1"
-itertools = "0.14.0"
-log = "0.4.32"
+itertools = "0.15.0"
+log = "0.4.34"
 num = "0.4.3"
 num-traits = "0.2.19"
-ordered-float = "5.3.0"
+ordered-float = "5.5.0"
 parking_lot = "0.12.5"
-pollster = "0.4.0"
-rand = "0.10.1"
+pollster = "1.0.1"
+rand = "0.10.3"
 rayon = "1.12.0"
 #waker_interrupter = { git = "https://github.com/gorilskij/waker_interrupter" }
 waker_interrupter = { path = "../waker_interrupter" }
-wgpu = "29.0.3"
+wgpu = "30.0.1"
 winit = "0.30"
 
 [profile.release]
 debug = true
 # debug-assertions = true
+
+# Optimise dependencies (dashu, wgpu, ...) even in dev builds, so `cargo run`
+# isn't dominated by unoptimised bignum/driver code. Our own crate stays at
+# opt-level 0 for debuggability.
+[profile.dev.package."*"]
+opt-level = 3

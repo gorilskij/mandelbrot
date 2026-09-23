@@ -7,7 +7,7 @@
 //! Two implementations:
 //!   - [`cpu::Cpu`]  — f32 perturbation on the CPU, parallelised with rayon.
 //!   - [`gpu::Gpu`]  — wgpu compute; batches all tiles in a pass into a single
-//!                     GPU dispatch with iterative glitch-correction passes.
+//!     GPU dispatch with iterative glitch-correction passes.
 
 pub mod cpu;
 pub mod gpu;

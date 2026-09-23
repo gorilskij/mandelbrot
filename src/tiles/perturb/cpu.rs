@@ -139,9 +139,8 @@ fn render_tile_pass(
     for r in (0..TILE_SIZE).step_by(stride) {
         if int.interrupted() { return false; }
         for c in (0..TILE_SIZE).step_by(stride) {
-            if let Some(cs) = coarser_stride {
-                if r % cs == 0 && c % cs == 0 { continue; }
-            }
+            if let Some(cs) = coarser_stride
+                && r % cs == 0 && c % cs == 0 { continue; }
             all_black &= render_pixel(&ctx, c, r, iterations);
         }
     }

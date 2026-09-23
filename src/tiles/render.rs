@@ -60,9 +60,8 @@ impl GroupCache {
 fn group_list(cache: &Mutex<GroupCache>, gkey: &GroupKey, iterations: usize) -> GroupRef {
     {
         let c = cache.lock();
-        if c.iterations == iterations {
-            if let Some(gref) = c.map.get(gkey) { return gref.clone(); }
-        }
+        if c.iterations == iterations
+            && let Some(gref) = c.map.get(gkey) { return gref.clone(); }
     }
 
     let anchor_px = if RANDOM_REFERENCE {
@@ -118,7 +117,11 @@ pub fn run_generation(
     let view       = coords.view.inner;
     let depth      = depth_for_view(view);
 
-    info!("render generation {generation}: depth {depth}, iterations {iterations}");
+    info!(
+        "render generation {generation}: depth {depth}, iterations {iterations} \
+         [diag: view {view:.4e} = 2^{:.3}, upp 2^{}]",
+        view.log2(), crate::tiles::store::upp_log2(depth),
+    );
 
     let x0       = tile_index(&coords.origin.x, depth);
     let y0       = tile_index(&coords.origin.y, depth);
@@ -185,7 +188,36 @@ pub fn run_generation(
 
         backend.render_pass_batch(&ctx, &batch, pass, &int);
         store.bump_progress();
+        log_tile_colors(generation, pass, &tiles);
     }
 
     store.bump_progress();
+}
+
+/// DIAG: backend-agnostic check of what actually landed in the visible tiles
+/// after a pass: how many pixels are set, how many distinct colours, and the
+/// share of the most common one. A "monochrome screen" shows up as
+/// distinct≈1–2 here if the compute side produced it.
+fn log_tile_colors(
+    generation: impl std::fmt::Display,
+    pass:       u8,
+    tiles:      &[(OrderedFloat<f64>, Arc<crate::tiles::store::Tile>)],
+) {
+    let mut counts = HashMap::<u32, usize>::new();
+    let mut unset  = 0usize;
+    for (_, tile) in tiles {
+        for idx in 0..crate::tiles::store::TILE_LEN {
+            match tile.load(idx).get() {
+                Some(c) => *counts.entry(c).or_default() += 1,
+                None    => unset += 1,
+            }
+        }
+    }
+    let set: usize = counts.values().sum();
+    let (top, top_n) = counts.iter().max_by_key(|(_, n)| **n).map(|(c, n)| (*c, *n)).unwrap_or((0, 0));
+    info!(
+        "[diag tiles] gen {generation} pass {pass}: {} tiles, set {set}, unset {unset}, \
+         distinct colours {}, top colour {top:#08x} @ {:.1}%",
+        tiles.len(), counts.len(), 100.0 * top_n as f64 / set.max(1) as f64,
+    );
 }

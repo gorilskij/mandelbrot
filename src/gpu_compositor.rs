@@ -126,6 +126,7 @@ impl GpuCompositor {
                 alpha_mode: caps.alpha_modes[0],
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
+                color_space: wgpu::SurfaceColorSpace::Auto,
             };
             surface.configure(&device, &surface_config);
 
@@ -169,7 +170,7 @@ impl GpuCompositor {
                     module: &shader,
                     entry_point: Some("vs"),
                     compilation_options: Default::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: size_of::<Vertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &[
@@ -184,7 +185,7 @@ impl GpuCompositor {
                                 shader_location: 1,
                             },
                         ],
-                    }],
+                    })],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
@@ -225,7 +226,7 @@ impl GpuCompositor {
                     module: &bar_shader,
                     entry_point: Some("vs"),
                     compilation_options: Default::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: size_of::<BarVertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &[
@@ -240,7 +241,7 @@ impl GpuCompositor {
                                 shader_location: 1,
                             },
                         ],
-                    }],
+                    })],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &bar_shader,
@@ -301,7 +302,7 @@ impl GpuCompositor {
             pass.draw(0..0, 0..1);
         }
         self.queue.submit([enc.finish()]);
-        frame.present();
+        self.queue.present(frame);
         self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
     }
 
@@ -360,16 +361,16 @@ impl GpuCompositor {
             let mut frac = 1.0_f32;
 
             for _ in 0..=MAX_CLIMB {
-                if let Some(tile) = store.get(&candidate) {
-                    if tile.completed_stride().is_some() {
-                        tile.touch(store_frame);
-                        pending.push(Pending {
-                            src: candidate,
-                            px0, py0, px1, py1,
-                            u0, v0, u1: u0 + frac, v1: v0 + frac,
-                        });
-                        break;
-                    }
+                if let Some(tile) = store.get(&candidate)
+                    && tile.completed_stride().is_some()
+                {
+                    tile.touch(store_frame);
+                    pending.push(Pending {
+                        src: candidate,
+                        px0, py0, px1, py1,
+                        u0, v0, u1: u0 + frac, v1: v0 + frac,
+                    });
+                    break;
                 }
                 let (bx, by) = candidate.parent_offset();
                 u0 = u0 / 2.0 + bx as f32 * 0.5;
@@ -429,8 +430,9 @@ impl GpuCompositor {
                     })],
                     ..Default::default()
                 });
-                if PROGRESS_BAR {
-                if let Some((fill, bg_gray, fill_gray)) = bar_progress(store, depth, &x0, &y0, nx, ny) {
+                if PROGRESS_BAR
+                    && let Some((fill, bg_gray, fill_gray)) = bar_progress(store, depth, &x0, &y0, nx, ny)
+                {
                     let bar_verts = bar_vertices(height, fill, bg_gray, fill_gray);
                     let bar_vbuf =
                         self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -441,11 +443,10 @@ impl GpuCompositor {
                     pass.set_pipeline(&self.bar_pipeline);
                     pass.set_vertex_buffer(0, bar_vbuf.slice(..));
                     pass.draw(0..bar_verts.len() as u32, 0..1);
-                }
                 } // PROGRESS_BAR
             }
             self.queue.submit([enc.finish()]);
-            frame.present();
+            self.queue.present(frame);
             return;
         }
 
@@ -478,8 +479,9 @@ impl GpuCompositor {
             }
 
             // Progress bar overlay.
-            if PROGRESS_BAR {
-            if let Some((fill, bg_gray, fill_gray)) = bar_progress(store, depth, &x0, &y0, nx, ny) {
+            if PROGRESS_BAR
+                && let Some((fill, bg_gray, fill_gray)) = bar_progress(store, depth, &x0, &y0, nx, ny)
+            {
                 let bar_verts = bar_vertices(height, fill, bg_gray, fill_gray);
                 let bar_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
@@ -489,12 +491,11 @@ impl GpuCompositor {
                 pass.set_pipeline(&self.bar_pipeline);
                 pass.set_vertex_buffer(0, bar_vbuf.slice(..));
                 pass.draw(0..bar_verts.len() as u32, 0..1);
-            }
             } // PROGRESS_BAR
         }
 
         self.queue.submit([enc.finish()]);
-        frame.present();
+        self.queue.present(frame);
 
         // Drop GPU textures for tiles that have been evicted from the CPU store.
         self.tiles.retain(|key, _| store.get(key).is_some());
@@ -612,15 +613,15 @@ fn bar_progress(
     for (i, j) in iproduct!(0..nx, 0..ny) {
         let key = TileKey { depth, x: x0 + IBig::from(i), y: y0 + IBig::from(j) };
         let pd = store.get(&key).map_or(0, |t| t.passes_done()) as usize;
-        for p in 0..pd.min(NUM_PASSES as usize) {
-            counts[p] += 1;
+        for count in counts.iter_mut().take(pd) {
+            *count += 1;
         }
     }
 
     // Find the lowest pass that isn't yet complete for all tiles.
-    for p in 0..NUM_PASSES as usize {
-        if counts[p] < total {
-            let fill = counts[p] as f32 / total as f32;
+    for (p, &count) in counts.iter().enumerate() {
+        if count < total {
+            let fill = count as f32 / total as f32;
             let bg_gray = p as f32 / NUM_PASSES as f32;       // prev pass color (0 = black)
             let fill_gray = (p + 1) as f32 / NUM_PASSES as f32; // current pass color
             return Some((fill, bg_gray, fill_gray));
