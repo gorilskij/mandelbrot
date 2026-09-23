@@ -21,7 +21,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::drawing::Drawer;
@@ -289,7 +289,12 @@ impl App {
         };
         let dir = if e.state == ElementState::Pressed { "↓" } else { "↑" };
         let rep = if e.repeat { " (repeat)" } else { "" };
-        self.key_debug = format!("{}{key} {dir}{rep}", mod_symbols(self.modifiers));
+        // The layout's character too: shortcuts match on it, not on `key`.
+        let ch = match &e.logical_key {
+            Key::Character(c) => format!(" {c:?}"),
+            _ => String::new(),
+        };
+        self.key_debug = format!("{}{key}{ch} {dir}{rep}", mod_symbols(self.modifiers));
         info!("[diag key] {} logical {:?}", self.key_debug, e.logical_key);
     }
 
@@ -465,6 +470,7 @@ impl ApplicationHandler for App {
                 event:
                     winit::event::KeyEvent {
                         physical_key: PhysicalKey::Code(code),
+                        logical_key,
                         state: ElementState::Pressed,
                         repeat: false,
                         ..
@@ -472,6 +478,14 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 let ctrl = self.modifiers.control_key() || self.modifiers.super_key();
+                // Letter shortcuts follow the character the keyboard layout
+                // produces (Dvorak, AZERTY, ...), not the physical key position.
+                // With Cmd held, winit on macOS reports the unmodified
+                // character, so Cmd-C is Character("c") on any layout.
+                let letter = match &logical_key {
+                    Key::Character(s) => s.to_lowercase(),
+                    _ => String::new(),
+                };
                 match code {
                     KeyCode::Space => {
                         info!("reset (spacebar)");
@@ -499,7 +513,7 @@ impl ApplicationHandler for App {
                             self.pending_update.max(UpdateKind::AroundCursor);
                         self.note_action("iterations ÷2");
                     }
-                    KeyCode::KeyC if ctrl => {
+                    _ if ctrl && letter == "c" => {
                         let data = ClipBoardData {
                             coords: Cow::Borrowed(&self.coords),
                             iterations: self.iterations,
@@ -514,7 +528,7 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
-                    KeyCode::KeyV if ctrl => {
+                    _ if ctrl && letter == "v" => {
                         let contents = Clipboard::new()
                             .and_then(|mut cb| cb.get_text())
                             .unwrap_or_default();
