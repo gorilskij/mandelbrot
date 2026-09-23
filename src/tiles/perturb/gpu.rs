@@ -79,6 +79,18 @@ const TARGET_CHUNK_MS: f64 = 30.0;
 /// overhead-dominated dispatches.
 const MIN_CHUNK_PX: usize = 65_536;
 
+/// Interior detection (with a nucleus reference of period p): every window of
+/// `p·ceil(INTERIOR_MIN_WINDOW/p)` iterations, compare log2|dz/dz₀|² with its
+/// value a window earlier. Inside a component the cycle's multiplier |λ| < 1,
+/// so it keeps shrinking; just outside, |λ| ≥ 1. A pixel whose derivative
+/// shrank by at least INTERIOR_Q per period over INTERIOR_WINDOWS consecutive
+/// windows is declared in the set. Windows much shorter than ~64 iterations
+/// let escaping pixels pass (brief contractions near 0); measured with
+/// `diag_interior_detection`: 0 false positives over 6 views at these values.
+const INTERIOR_MIN_WINDOW: usize = 128;
+const INTERIOR_WINDOWS:    u32   = 2;
+const INTERIOR_Q:          f64   = 0.9;
+
 /// Use the floatexp pipeline once units-per-pixel drops below 2^FE_THRESHOLD.
 /// The f32 seed starts breaking down near 2^-126; -100 leaves a safe margin
 /// while keeping the fast f32 path for all shallower zooms.
@@ -108,6 +120,13 @@ struct Uniforms {
     orbit_len:   u32,
     is_full:     u32,
     dispatch_w:  u32,
+    /// Interior-detection window in iterations; 0 disables it.
+    interior_window:      u32,
+    /// log2 of the squared contraction a window must show.
+    interior_contraction: f32,
+    /// Consecutive contracting windows needed.
+    interior_windows:     u32,
+    _pad:                 u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +152,18 @@ impl Reference {
             c,
             iterations,
             period,
+        }
+    }
+
+    /// (window, log2 contraction threshold) for interior detection; only a
+    /// nucleus has a known period (window 0 disables detection).
+    fn interior(&self) -> (u32, f32) {
+        match self.period {
+            Some(p) if p > 0 && self.is_full => {
+                let periods = INTERIOR_MIN_WINDOW.div_ceil(p);
+                ((p * periods) as u32, (2.0 * INTERIOR_Q.log2() * periods as f64) as f32)
+            }
+            _ => (0, 0.0),
         }
     }
 
@@ -394,25 +425,25 @@ impl GpuState {
     fn dispatch_offsets(&self, offs: &[(f64, f64)], upp: i64, r: &Reference) -> Vec<u32> {
         if upp < FE_THRESHOLD {
             let d: Vec<[f32; 4]> = offs.iter().map(|&(x, y)| pack_fe(x, y, upp)).collect();
-            self.dispatch_fe(&d, &r.orbit, r.is_full)
+            self.dispatch_fe(&d, r)
         } else {
             // upp >= FE_THRESHOLD, so 2^upp is a normal f64 and f32.
             let scale = (upp as f64).exp2();
             let d: Vec<[f32; 2]> = offs.iter()
                 .map(|&(x, y)| [(x * scale) as f32, (y * scale) as f32])
                 .collect();
-            self.dispatch_f32(&d, &r.orbit, r.is_full)
+            self.dispatch_f32(&d, r)
         }
     }
 
     /// Plain-f32 dispatch: one `[f32; 2]` delta per pixel.
-    fn dispatch_f32(&self, deltas: &[[f32; 2]], orbit_data: &[[f32; 2]], is_full: bool) -> Vec<u32> {
-        self.dispatch(&self.pipeline, bytemuck::cast_slice(deltas), deltas.len(), 8, orbit_data, is_full)
+    fn dispatch_f32(&self, deltas: &[[f32; 2]], r: &Reference) -> Vec<u32> {
+        self.dispatch(&self.pipeline, bytemuck::cast_slice(deltas), deltas.len(), 8, r)
     }
 
     /// floatexp dispatch: one `[f32; 4]` seed per pixel (mantissa.xy, exp, _).
-    fn dispatch_fe(&self, deltas: &[[f32; 4]], orbit_data: &[[f32; 2]], is_full: bool) -> Vec<u32> {
-        self.dispatch(&self.pipeline_fe, bytemuck::cast_slice(deltas), deltas.len(), 16, orbit_data, is_full)
+    fn dispatch_fe(&self, deltas: &[[f32; 4]], r: &Reference) -> Vec<u32> {
+        self.dispatch(&self.pipeline_fe, bytemuck::cast_slice(deltas), deltas.len(), 16, r)
     }
 
     /// Upload deltas + orbit, dispatch `pipeline`, and read back raw results.
@@ -428,17 +459,16 @@ impl GpuState {
         delta_bytes: &[u8],
         n:           usize,
         elem:        usize,
-        orbit_data:  &[[f32; 2]],
-        is_full:     bool,
+        r:           &Reference,
     ) -> Vec<u32> {
         if n == 0 { return Vec::new(); }
         let max_pixels = ((self.max_binding / elem) * 9 / 10).max(1);
         if n <= max_pixels {
-            return self.dispatch_chunk(pipeline, delta_bytes, n, orbit_data, is_full);
+            return self.dispatch_chunk(pipeline, delta_bytes, n, r);
         }
         let mut out = Vec::with_capacity(n);
         for chunk in delta_bytes.chunks(max_pixels * elem) {
-            out.extend(self.dispatch_chunk(pipeline, chunk, chunk.len() / elem, orbit_data, is_full));
+            out.extend(self.dispatch_chunk(pipeline, chunk, chunk.len() / elem, r));
         }
         out
     }
@@ -449,10 +479,11 @@ impl GpuState {
         pipeline:    &wgpu::ComputePipeline,
         delta_bytes: &[u8],
         n_pixels:    usize,
-        orbit_data:  &[[f32; 2]],
-        is_full:     bool,
+        r:           &Reference,
     ) -> Vec<u32> {
         let n = n_pixels as u32;
+        let orbit_data = &r.orbit;
+        let (interior_window, interior_contraction) = r.interior();
         if n == 0 { return Vec::new(); }
 
         let device = &self.device;
@@ -468,8 +499,12 @@ impl GpuState {
             contents: bytemuck::bytes_of(&Uniforms {
                 pixel_count: n,
                 orbit_len:   orbit_data.len() as u32,
-                is_full:     is_full as u32,
+                is_full:     r.is_full as u32,
                 dispatch_w,
+                interior_window,
+                interior_contraction,
+                interior_windows: INTERIOR_WINDOWS,
+                _pad: 0,
             }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -1018,6 +1053,159 @@ mod tests {
                 }
                 eprintln!("{name:8} {fname}: orbit len {} | glitched {glitched} | wrong {wrong} (of which pauldelbrot {wrong_pd}) | pauldelbrot-flagged {pd}",
                     orbit.orbit.len());
+            }
+        }
+    }
+
+    /// CPU mirror of the shader loop with rebasing and cycle-multiplier
+    /// interior detection: every `period` iterations compare log2|dz/dz0|²
+    /// with its value a cycle earlier; `k` consecutive drops below
+    /// `log2_q2` declare the pixel interior.  Returns (result, iterations).
+    fn perturb_interior<F: num::Float>(
+        orbit: &[Complex<FBig>], d0: (f64, f64), full: bool, period: usize, k: u32, log2_q2: f64,
+    ) -> (Result<Option<usize>, ()>, usize) {
+        let x: Vec<Complex<F>> = orbit.iter().map(|c| Complex {
+            re: F::from(c.re.to_f64().value()).unwrap(), im: F::from(c.im.to_f64().value()).unwrap(),
+        }).collect();
+        let d0 = Complex { re: F::from(d0.0).unwrap(), im: F::from(d0.1).unwrap() };
+        let two = F::from(2.0).unwrap();
+        let (mut d, mut m) = (d0, 0usize);
+        let (mut ld, mut prev, mut streak) = (F::zero(), None::<F>, 0u32);
+        let lq = F::from(log2_q2).unwrap();
+        let n_max = orbit.len() - 1;
+        for n in 0..orbit.len() {
+            let z = x[m] + d;
+            let z2 = z.norm_sqr();
+            if z2 > F::from(4.0).unwrap() { return (Ok(Some(n + 1)), n + 1); }
+            if n == n_max { break; }
+            ld = ld + two + z2.log2(); // |dz_{n+1}|² = 4|z_n|²|dz_n|²
+            if period > 0 && (n + 1) % period == 0 {
+                streak = match prev { Some(p) if ld - p < lq => streak + 1, _ => 0 };
+                prev = Some(ld);
+                if streak >= k { return (Ok(None), n + 1); }
+            }
+            if z2 < d.norm_sqr() {
+                d = z * z + d0;
+                m = 0;
+            } else {
+                d = x[m] * d * two + d * d + d0;
+                m += 1;
+            }
+        }
+        (if full { Ok(None) } else { Err(()) }, orbit.len())
+    }
+
+    struct InteriorCase { name: &'static str, depth: i64, iters: usize, centre: Option<(f64, f64)>, off: (i64, i64) }
+
+    struct InteriorResult { period: usize, in_set: usize, detected: usize, false_pos: usize, work: f64 }
+
+    /// Run the shader's interior detection (CPU mirror, f32, parameters from
+    /// `Reference::interior`) on a `side`² grid of a 256 px view, against
+    /// exact orbits. `None` if no nucleus is found (detection is then off).
+    fn interior_case(case: &InteriorCase, side: i64) -> Option<InteriorResult> {
+        let depth = case.depth;
+        let prec  = working_precision(depth);
+        let upp   = upp_log2(depth);
+        let fp = |x: f64| FBig::try_from(x).unwrap().with_precision(prec).value();
+        let origin = match case.centre {
+            Some((cx, cy)) => Point::new(
+                &fp(cx) - &(FBig::from(128) << upp as isize),
+                &fp(cy) - &(FBig::from(128) << upp as isize),
+            ),
+            None => {
+                // Beside the period-998 minibrot near the seahorse valley.
+                let seed = Complex { re: fp(-0.743_643_887_037_151), im: fp(0.131_825_904_205_330) };
+                let rough = find_nucleus(&seed, &fp(1e-12), -50, 10_000, prec, &|| false).unwrap().unwrap();
+                let tol2 = FBig::ONE << (2 * (upp - 60)) as isize;
+                let nuc = newton_nucleus(&rough.c, rough.period, prec, &tol2, &fp(1.0), &|| false).unwrap().unwrap();
+                Point::new(
+                    &nuc.re - &(FBig::from(128 + case.off.0) << upp as isize),
+                    &nuc.im - &(FBig::from(128 + case.off.1) << upp as isize),
+                )
+            }
+        };
+        let ctx = PassBatchCtx {
+            coords: CoordinatesBox { origin: origin.clone(), view: View::new((upp as f64).exp2()) },
+            depth, x0: tile_index(&origin.x, depth), y0: tile_index(&origin.y, depth),
+            width: 256, height: 256, iterations: case.iters, progress: Default::default(),
+        };
+        let g = ViewGeom::new(&ctx);
+        let n = find_nucleus(&g.center, &g.radius, g.upp, case.iters, g.prec, &|| false).unwrap()?;
+        let r = Reference::new(n.c.clone(), case.iters, Some(n.period));
+        let (window, contraction) = r.interior();
+        let (orbit, _) = calculate_orbit(n.c.clone(), case.iters);
+        let (rx, ry) = ref_px(&n.c, &ctx);
+        let scale = (upp as f64).exp2();
+        let ts = IBig::from(TILE_SIZE as u64);
+        let (gx0, gy0) = (&ctx.x0 * &ts, &ctx.y0 * &ts);
+        let step = 256 / side;
+        let pix: Vec<(i64, i64)> = (0..side).flat_map(|j| (0..side).map(move |i| (i * step + 3, j * step + 5))).collect();
+        let exact: Vec<Option<usize>> = pix.par_iter().map(|&(col, row)| {
+            let c = Complex {
+                re: pixel_to_coord(&gx0 + IBig::from(col), depth, prec),
+                im: pixel_to_coord(&gy0 + IBig::from(row), depth, prec),
+            };
+            check_orbit(&calculate_orbit(c, case.iters).1).unwrap().map(|v| v.get())
+        }).collect();
+        let mut out = InteriorResult {
+            period: n.period, in_set: exact.iter().filter(|e| e.is_none()).count(),
+            detected: 0, false_pos: 0, work: 0.0,
+        };
+        let (mut run, mut base) = (0usize, 0usize);
+        for &(col, row) in &pix {
+            let d0 = ((col as f64 - rx) * scale, (row as f64 - ry) * scale);
+            let (res, used) = perturb_interior::<f32>(&orbit.orbit, d0, orbit.is_full, window as usize, INTERIOR_WINDOWS, contraction as f64);
+            let (res0, used0) = perturb_interior::<f32>(&orbit.orbit, d0, orbit.is_full, 0, 0, 0.0);
+            run += used;
+            base += used0;
+            if matches!(res, Ok(None)) && used < used0 {
+                out.detected += 1;
+                // Detection changed the answer: without it, this pixel escapes.
+                if matches!(res0, Ok(Some(_))) { out.false_pos += 1; }
+            }
+        }
+        out.work = run as f64 / base as f64;
+        Some(out)
+    }
+
+    /// Interior detection must never mark an escaping pixel as in the set,
+    /// and must save real work where there is interior.
+    #[test]
+    fn interior_detection_is_safe_and_useful() {
+        let cases = [
+            (InteriorCase { name: "shallow period-3 bulb", depth: 8, iters: 2000, centre: Some((-0.122, 0.745)), off: (0, 0) }, 0.3),
+            (InteriorCase { name: "shallow cardioid", depth: 6, iters: 2000, centre: Some((-0.1, 0.65)), off: (0, 0) }, 0.5),
+            (InteriorCase { name: "deep minibrot inside", depth: 55, iters: 6000, centre: None, off: (-50, 48) }, 0.65),
+            (InteriorCase { name: "deep beside minibrot", depth: 40, iters: 4000, centre: None, off: (-50, 48) }, 1.01),
+        ];
+        for (case, max_work) in &cases {
+            let r = interior_case(case, 16).expect("nucleus");
+            eprintln!("{}: p={} in-set {} detected {} false+ {} work {:.1}%",
+                case.name, r.period, r.in_set, r.detected, r.false_pos, 100.0 * r.work);
+            assert_eq!(r.false_pos, 0, "{}", case.name);
+            assert!(r.work <= *max_work, "{}: work {:.2}", case.name, r.work);
+        }
+    }
+
+    /// Broader measurement (more views, more pixels). Run with
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn diag_interior_detection() {
+        let cases = [
+            InteriorCase { name: "shallow cardioid", depth: 6, iters: 4000, centre: Some((-0.1, 0.65)), off: (0, 0) },
+            InteriorCase { name: "shallow bulb edge", depth: 9, iters: 4000, centre: Some((-0.75, 0.05)), off: (0, 0) },
+            InteriorCase { name: "shallow seahorse", depth: 12, iters: 4000, centre: Some((-0.7436, 0.1318)), off: (0, 0) },
+            InteriorCase { name: "shallow period-3 bulb", depth: 8, iters: 4000, centre: Some((-0.122, 0.745)), off: (0, 0) },
+            InteriorCase { name: "shallow cardioid cusp", depth: 10, iters: 4000, centre: Some((0.25, 0.0)), off: (0, 0) },
+            InteriorCase { name: "deep minibrot inside", depth: 55, iters: 8000, centre: None, off: (-50, 48) },
+            InteriorCase { name: "deep beside minibrot", depth: 40, iters: 8000, centre: None, off: (-50, 48) },
+        ];
+        for case in &cases {
+            match interior_case(case, 32) {
+                None => eprintln!("{}: no nucleus -> detection off (safe)", case.name),
+                Some(r) => eprintln!("{} (depth {}, {} iters): p={} in-set {}/1024 detected {} false+ {} work {:.1}%",
+                    case.name, case.depth, case.iters, r.period, r.in_set, r.detected, r.false_pos, 100.0 * r.work),
             }
         }
     }

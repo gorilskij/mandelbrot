@@ -74,6 +74,16 @@ pixel's orbit does not follow. The shaders track `n` (iterations, reported)
 and `m` (reference index) separately. `shaders_validate` checks the WGSL with
 naga, since it is otherwise only compiled at runtime.
 
+**Interior detection** (GPU, nucleus references only): the shaders track
+log2|dz/dz₀|² and, every window of ≥128 iterations (a whole number of the
+nucleus period p), compare it with the previous window; 2 consecutive windows
+contracting by ≥0.9× per period → in the set. Inside a component the cycle
+multiplier |λ| < 1; just outside |λ| ≥ 1. Short windows (< ~64) produce false
+positives (escaping pixels contracting briefly near 0), so don't shorten them.
+`interior_detection_is_safe_and_useful` (regular) and `diag_interior_detection`
+(ignored, broader) check 0 false positives against exact orbits. Parameters
+are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
+
 ## GPU backend (`gpu.rs`)
 
 - For each pass, all needed pixels from all batch tiles are collected in

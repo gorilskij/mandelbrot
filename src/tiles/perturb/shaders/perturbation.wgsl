@@ -3,6 +3,11 @@ struct Uniforms {
     orbit_len   : u32,
     is_full     : u32,
     dispatch_w  : u32,
+    // Interior detection (see INTERIOR_* in gpu.rs); window 0 disables it.
+    interior_window      : u32,
+    interior_contraction : f32,
+    interior_windows     : u32,
+    _pad                 : u32,
 }
 
 @group(0) @binding(0) var<uniform>             uniforms     : Uniforms;
@@ -24,6 +29,13 @@ const GLITCH_BIT : u32 = 0x80000000u;
 // against the start of the reference orbit: in the X_0 = C convention the next
 // value is z² + c = X_0 + (z² + δ_0), so δ ← z² + δ_0 at reference index 0.
 // This is exact too; it only changes which reference point δ is measured from.
+//
+// Interior detection: track ld = log2|dz/dz_0|² (|dz_{n+1}|² = 4|z_n|²|dz_n|²,
+// additive in log space so it cannot over/underflow). Every `interior_window`
+// iterations (a whole number of the nucleus period) compare it with the
+// previous window: inside a component the cycle multiplier |λ| < 1, so it
+// shrinks; `interior_windows` consecutive shrinks by `interior_contraction`
+// declare the pixel in the set, instead of running to the iteration limit.
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let idx = gid.y * uniforms.dispatch_w + gid.x;
@@ -32,6 +44,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let d0    = pixel_deltas[idx];
     var delta = d0;
     var m     = 0u;  // index into the reference orbit (resets on rebase)
+    var ld     = 0.0; // log2 |dz/dz_0|²
+    var ld_prev = 0.0;
+    var have_prev = false;
+    var streak = 0u;
 
     for (var n = 0u; n < uniforms.orbit_len; n++) {
         let c = orbit_data[m];
@@ -41,6 +57,23 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         if x2 > 4.0 {
             output[idx] = n + 1u;
             return;
+        }
+
+        if uniforms.interior_window != 0u {
+            ld += 2.0 + log2(x2);
+            if (n + 1u) % uniforms.interior_window == 0u {
+                if have_prev && ld - ld_prev < uniforms.interior_contraction {
+                    streak += 1u;
+                } else {
+                    streak = 0u;
+                }
+                ld_prev = ld;
+                have_prev = true;
+                if streak >= uniforms.interior_windows {
+                    output[idx] = 0u;
+                    return;
+                }
+            }
         }
 
         if x2 < dot(delta, delta) {
