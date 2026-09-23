@@ -241,6 +241,44 @@ Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
   `f64`, which reaches far deeper. Ask before changing it.
 - Commit each logical step separately.
 
+## Open bug (as of 2026-09-23, not fixed): uniform image past 2⁻³¹⁰
+
+Start from the 2⁻³⁰⁵ view (renders correctly on the GPU):
+
+```
+0.362680618169185280448991722507605679881284887059995535804130241675861432076423165340038916307547696001473666663642181909,-0.642687993846087296421249860151304775623709080524804816903388435265396126015520705061576074177687940915500836211594418175|1.7963169535192306e-92/32768
+```
+
+Raise iterations to 262144 (↑ three times) and zoom in slightly, to about
+view 3.5651e-95 (2⁻³¹³·⁷⁵, depth 309, upp 2⁻³¹⁴): the image turns almost
+uniformly one colour with faint structure. No exact Cmd-C string of the bad
+view yet; get one first and reproduce with the harnesses (see Testing).
+
+What `gpu.log` showed for the bad view:
+- `reference: no nucleus from view centre` (after 1.8 s), so the fallback
+  reference was the **view-centre point**, an escaping (non-full) orbit of
+  length 17622.
+- Every chunk of passes 3–6 with that reference returned **exactly 17619 for
+  every pixel** (`distinct=1 … 100%`, `glitched=0`). The faint structure is
+  passes 0–2, computed earlier with nucleus references (p=18990/33760/14770,
+  some 3k–47k px away), which gave varied values (escapes 131k–261k, many
+  in set). So pixels that should outlive the reference (→ glitched → glitch
+  rounds) instead "escape" together with it, two iterations before its end.
+- Other nucleus searches at this depth took 1.7–3.4 s.
+
+Hypotheses, not yet confirmed:
+- BLA jumping through the reference's escape (a non-full orbit's last steps
+  have |X| > 2; the validity radius knows nothing about escape). Tested with
+  `bla_with_escaping_reference_matches_plain` (a corner pixel as reference, at
+  the 2⁻³⁰⁵ view with 262144 iterations): BLA and plain **agree** there
+  (999 glitched each), so not reproduced that way. If it is confirmed,
+  the fix is to invalidate BLA steps where |X_m| ≥ 2.
+- δ collapsing (like the fixed floatexp underflow) so pixels shadow the
+  reference exactly; or something specific to the centre point / this depth.
+Next step: get the Cmd-C string of the bad view, run `run_pipeline` there
+against exact orbits (262144 iterations: exact values will be slow, sample
+fewer pixels), then A/B BLA on/off and the reference choice.
+
 ## Open threads (as of 2026-09-23)
 
 Done: bounded chunked dispatch, nucleus references, rebasing, sub-passes,

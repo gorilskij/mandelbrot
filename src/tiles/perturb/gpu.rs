@@ -1661,4 +1661,50 @@ mod tests {
             }
         }
     }
+
+    /// BLA must not change results when the reference is an escaping point
+    /// (the fallback when no nucleus is found): 2^-309 view reported
+    /// 2026-09-23 at 262144 iterations came out uniform because every pixel
+    /// jumped through the reference's escape and "escaped" with it. Real
+    /// GPU, BLA on vs off with the same escaping reference; needs a GPU.
+    #[test]
+    #[ignore]
+    fn bla_with_escaping_reference_matches_plain() {
+        let clip = "0.362680618169185280448991722507605679881284887059995535804130241675861432076423165340038916307547696001473666663642181909,-0.642687993846087296421249860151304775623709080524804816903388435265396126015520705061576074177687940915500836211594418175|1.7963169535192306e-92";
+        let iters = 262144;
+        let v = sample_view_geometry(clip, iters, (3000, 2000), (150, 100));
+        let g = &v.geom;
+        // An escaping point in the view: the top-left sample pixel.
+        let ts = IBig::from(TILE_SIZE as u64);
+        let (col, row) = v.pix[0];
+        let c = Complex {
+            re: pixel_to_coord(&v.ctx.x0 * &ts + IBig::from(col), v.ctx.depth, g.prec),
+            im: pixel_to_coord(&v.ctx.y0 * &ts + IBig::from(row), v.ctx.depth, g.prec),
+        };
+        let r = Reference::new(c, iters, None);
+        assert!(!r.is_full, "need an escaping reference");
+        eprintln!("reference {}", r.describe());
+        let (rx, ry) = ref_px(&r.c, &v.ctx);
+        let offs: Vec<(f64, f64)> = v.pix.iter().map(|&(c, w)| (c as f64 - rx, w as f64 - ry)).collect();
+        let gpu = GpuState::new();
+        let run = |bla: bool| {
+            let gr = gpu.prepare_with(&r, log2_dc(&offs, g.upp), bla);
+            offs.chunks(1024).flat_map(|c| gpu.dispatch_offsets(c, g.upp, &gr)).collect::<Vec<u32>>()
+        };
+        let (plain, bla) = (run(false), run(true));
+        let glitch = |v: &[u32]| v.iter().filter(|&&x| x & GLITCH_BIT != 0).count();
+        let mode = |v: &[u32]| {
+            let mut h = std::collections::HashMap::new();
+            for &x in v { *h.entry(x).or_insert(0usize) += 1; }
+            h.into_iter().max_by_key(|&(_, n)| n).unwrap()
+        };
+        let differ = plain.iter().zip(&bla).filter(|(a, b)| a != b).count();
+        let far = plain.iter().zip(&bla)
+            .filter(|&(&a, &b)| (a & GLITCH_BIT != b & GLITCH_BIT) || (a & !GLITCH_BIT).abs_diff(b & !GLITCH_BIT) > 50)
+            .count();
+        eprintln!("plain: glitched {}, most common {:?}", glitch(&plain), mode(&plain));
+        eprintln!("BLA:   glitched {}, most common {:?}", glitch(&bla), mode(&bla));
+        eprintln!("differ {differ}, glitch status differs or off by >50: {far} (of {})", plain.len());
+        assert!(far * 100 < plain.len(), "BLA changed {far} results");
+    }
 }
