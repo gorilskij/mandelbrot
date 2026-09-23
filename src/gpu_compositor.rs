@@ -53,14 +53,13 @@ fn fs(v: VOut) -> @location(0) vec4<f32> {
 
 const PROGRESS_BAR: bool = true;
 const BAR_HEIGHT_PX: u32 = 10;
-/// Width of the dark separators between pass sections, in pixels.
-const BAR_SEPARATOR_PX: f32 = 2.0;
 /// Smoothing time of the bar's spring: progress arrives in steps (one per GPU
-/// chunk or CPU pass); the spring turns them into near-constant motion.
+/// chunk or CPU pass), and jumps back when the view or iteration count
+/// changes; the spring turns both into smooth motion.
 const BAR_SMOOTH_SECS: f32 = 0.25;
 
 /// The drawn progress bar: a critically damped spring ("SmoothDamp") chasing
-/// the real progress, never ahead of it.
+/// the real progress in either direction, never overshooting it.
 struct BarAnim {
     shown: f32,
     vel:   f32,
@@ -79,11 +78,8 @@ impl BarAnim {
 
     /// `advance` with an explicit time step.
     fn step(&mut self, target: f32, dt: f32) -> Option<f32> {
-        if target < self.shown - 0.005 {
-            // A new view started: jump back rather than sliding backwards.
-            self.shown = target;
-            self.vel   = 0.0;
-        } else if dt > 0.0 {
+        if dt > 0.0 {
+            let from   = self.shown;
             let omega  = 2.0 / BAR_SMOOTH_SECS;
             let x      = omega * dt;
             let decay  = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x);
@@ -91,7 +87,9 @@ impl BarAnim {
             let temp   = (self.vel + omega * change) * dt;
             self.vel   = (self.vel - omega * temp) * decay;
             self.shown = target + (change + temp) * decay;
-            if self.shown > target {
+            // Never overshoot: while rising that would show work not yet
+            // done; while falling it would bounce.
+            if (target > from) == (self.shown > target) {
                 self.shown = target;
                 self.vel   = 0.0;
             }
@@ -479,7 +477,7 @@ impl GpuCompositor {
         // Progress bar: advance the animation and build its geometry.
         let target = bar_progress(store, depth, &x0, &y0, nx, ny);
         let bar = PROGRESS_BAR.then(|| self.bar.advance(target)).flatten().map(|fill| {
-            let bar_verts = bar_vertices(width, height, fill);
+            let bar_verts = bar_vertices(height, fill);
             let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(&bar_verts),
@@ -726,23 +724,15 @@ fn pass_boundaries() -> [f32; NUM_PASSES as usize + 1] {
     out
 }
 
-/// Bar geometry: a dark track, a white fill up to `fill`, and dark separators
-/// at the pass-section boundaries, across the bottom BAR_HEIGHT_PX pixels.
-fn bar_vertices(width: u32, height: u32, fill: f32) -> Vec<BarVertex> {
+/// Bar geometry: a dark track and a solid white fill up to `fill`, across
+/// the bottom BAR_HEIGHT_PX pixels.
+fn bar_vertices(height: u32, fill: f32) -> Vec<BarVertex> {
     let h = height as f32;
     let y0 = 1.0 - ((height - BAR_HEIGHT_PX) as f32 / h) * 2.0;
     let y1 = -1.0_f32;
-    let x_at = |f: f32| -1.0 + f * 2.0;
-    let sep_half = BAR_SEPARATOR_PX / width.max(1) as f32; // half-width in clip units
-
-    let mut out = Vec::with_capacity(6 * (2 + NUM_PASSES as usize));
+    let mut out = Vec::with_capacity(12);
     out.extend(quad([-1.0, y0, 1.0, y1], [0.12, 0.12, 0.12, 1.0]));
-    out.extend(quad([-1.0, y0, x_at(fill), y1], [1.0, 1.0, 1.0, 1.0]));
-    let bounds = pass_boundaries();
-    for &b in &bounds[1..NUM_PASSES as usize] {
-        let x = x_at(b);
-        out.extend(quad([x - sep_half, y0, x + sep_half, y1], [0.0, 0.0, 0.0, 1.0]));
-    }
+    out.extend(quad([-1.0, y0, -1.0 + fill * 2.0, y1], [1.0, 1.0, 1.0, 1.0]));
     out
 }
 
@@ -926,10 +916,7 @@ mod tests {
     /// never overtaken, and finishes then hides.
     #[test]
     fn bar_follows_steps_smoothly_and_hides() {
-        let mut bar = BarAnim { shown: 1.0, vel: 0.0, last: None };
-        // New view: jumps down to the (small) real progress.
-        assert_eq!(bar.step(0.02, FRAME), Some(0.02));
-
+        let mut bar = BarAnim { shown: 0.02, vel: 0.0, last: None };
         let mut target = 0.02_f32;
         let mut prev = 0.02_f32;
         let mut max_step = 0.0_f32;
@@ -950,5 +937,26 @@ mod tests {
         }
         assert!(hidden);
         assert!(!bar.animating(1.0));
+    }
+
+    /// A new view (or iteration change) drops the real progress: the bar
+    /// eases down smoothly, never below the new value, and gets there.
+    #[test]
+    fn bar_eases_down_on_restart() {
+        let mut bar = BarAnim { shown: 0.8, vel: 0.3, last: None }; // moving up
+        let mut prev = 0.8_f32;
+        let mut max_step = 0.0_f32;
+        let mut reached = None;
+        for frame in 0..120 {
+            let shown = bar.step(0.05, FRAME).unwrap();
+            assert!(shown >= 0.05 - 1e-6, "undershot");
+            max_step = max_step.max((shown - prev).abs());
+            prev = shown;
+            if reached.is_none() && (shown - 0.05).abs() < 0.005 { reached = Some(frame); }
+        }
+        let reached = reached.expect("settles at the new progress");
+        assert!(reached > 5, "snapped instead of easing ({reached} frames)");
+        assert!(reached < 60, "too slow: {reached} frames");
+        assert!(max_step < 0.1, "jumped {max_step} in one frame");
     }
 }
