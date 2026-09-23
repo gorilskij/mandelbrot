@@ -136,6 +136,7 @@ pub fn run_generation(
 
     // Collect and sort tiles by distance from cursor (ascending).
     let mut tiles: Vec<(OrderedFloat<f64>, Arc<crate::tiles::store::Tile>)> = Vec::new();
+    let mut seeded = 0usize;
     for (i, j) in iproduct!(0..nx, 0..ny) {
         let key = TileKey { depth, x: &x0 + IBig::from(i), y: &y0 + IBig::from(j) };
         let tile = store.get_or_insert(&key, iterations, generation);
@@ -144,6 +145,7 @@ pub fn run_generation(
         if tile.iterations.load(std::sync::atomic::Ordering::Relaxed) != iterations {
             tile.reset(iterations);
         }
+        if !tile.is_complete() && store.seed_from_relatives(&tile) { seeded += 1; }
         if tile.is_complete() { continue; }
 
         let cx = sx0 + (i as f64 + 0.5) * tile_px - center.x as f64;
@@ -153,7 +155,8 @@ pub fn run_generation(
     tiles.sort_unstable_by_key(|(dist, _)| *dist);
 
     store.evict_excess();
-    info!("rendering {} tiles", tiles.len());
+    if seeded > 0 { store.bump_progress(); }
+    info!("rendering {} tiles ({seeded} seeded from parent/children)", tiles.len());
 
     let ctx = PassBatchCtx {
         coords:     coords.clone(),

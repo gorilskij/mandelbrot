@@ -44,6 +44,16 @@ const SUB_PASS_PARITY: [(usize, usize); 3] = [(1, 1), (0, 1), (1, 0)];
 
 pub const NUM_PASSES: u8 = NUM_GRID_PASSES + SUB_PASS_PARITY.len() as u8;
 
+/// Passes done once the grid of every `stride`-th pixel is complete (0 if
+/// that grid is coarser than pass 0's).
+pub fn passes_for_stride(stride: usize) -> u8 {
+    if stride == 1 {
+        NUM_PASSES
+    } else {
+        GRID_STRIDES.iter().filter(|&&s| s >= stride).count() as u8
+    }
+}
+
 /// (row, col) of the pixels that `pass` adds to a tile, in row-major order.
 pub fn pass_pixels(pass: u8) -> impl Iterator<Item = (usize, usize)> {
     let p = pass as usize;
@@ -318,6 +328,77 @@ impl TileStore {
         tile
     }
 
+    /// Seed `tile` from already-rendered tiles one level up or down. Their
+    /// pixel grids nest exactly: pixel (i, j) at depth d is the same point as
+    /// pixel (2i, 2j) at depth d+1, since `upp_log2` drops by one per level.
+    ///
+    /// - Parent → child: the parent's quadrant fills the child's even-even
+    ///   pixels, so a parent complete at stride s completes the child's
+    ///   stride-2s grid (a finished parent gives passes 0–3 for free).
+    /// - Children → parent: each child's even-even pixels fill one quadrant,
+    ///   so four children complete at stride s complete the parent at s/2.
+    ///
+    /// Only tiles computed with the same iteration count are used, and only
+    /// when that raises `tile`'s completed passes. Returns whether it did.
+    /// Must not run while a backend is writing to these tiles.
+    pub fn seed_from_relatives(&self, tile: &Tile) -> bool {
+        let iterations = tile.iterations.load(Ordering::Relaxed);
+        let usable = |t: &Arc<Tile>| {
+            (t.iterations.load(Ordering::Relaxed) == iterations).then(|| t.completed_stride()).flatten()
+        };
+        let half = TILE_SIZE / 2;
+        let copy_quadrant = |from: &Tile, to: &Tile, parent_to_child: bool, (bx, by): (usize, usize)| {
+            for i in 0..half {
+                for j in 0..half {
+                    let parent_idx = (by * half + i) * TILE_SIZE + bx * half + j;
+                    let child_idx  = (2 * i) * TILE_SIZE + 2 * j;
+                    let (src, dst) = if parent_to_child { (parent_idx, child_idx) } else { (child_idx, parent_idx) };
+                    if to.load(dst).get().is_none() && from.load(src).get().is_some() {
+                        to.store(dst, from.load(src));
+                    }
+                }
+            }
+        };
+
+        // Parent → child.
+        let parent_level = self.get(&tile.key.parent())
+            .and_then(|p| usable(&p).map(|s| (p, passes_for_stride(2 * s))))
+            .filter(|(_, level)| *level > tile.passes_done());
+        // Children → parent (needs all four).
+        let children: Option<Vec<_>> = [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().map(|(bx, by)| {
+            let key = TileKey {
+                depth: tile.key.depth + 1,
+                x: &tile.key.x * IBig::from(2) + IBig::from(bx),
+                y: &tile.key.y * IBig::from(2) + IBig::from(by),
+            };
+            let child = self.get(&key)?;
+            let stride = usable(&child)?;
+            Some((child, (bx as usize, by as usize), stride))
+        }).collect();
+        let children_level = children.as_ref()
+            .map(|cs| passes_for_stride(cs.iter().map(|&(_, _, s)| (s / 2).max(1)).max().unwrap()))
+            .filter(|level| *level > tile.passes_done());
+
+        let mut level = 0;
+        if let Some((parent, l)) = &parent_level {
+            let (bx, by) = tile.key.parent_offset();
+            copy_quadrant(parent, tile, true, (bx as usize, by as usize));
+            level = level.max(*l);
+        }
+        if let (Some(cs), Some(l)) = (&children, children_level) {
+            for (child, quadrant, _) in cs {
+                copy_quadrant(child, tile, false, *quadrant);
+            }
+            level = level.max(l);
+        }
+        if level > tile.passes_done() {
+            tile.finish_pass(level);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn begin_generation(&self) -> u64 {
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
@@ -470,5 +551,81 @@ mod pass_tests {
                 }
             }
         }
+    }
+
+    /// Unique non-black value per pixel, remembering where it came from.
+    fn fill(tile: &Tile, id: u32) {
+        for idx in 0..TILE_LEN {
+            tile.store(idx, MaybePixel::from((id << 16) | idx as u32)); // id >= 1: never black
+        }
+        tile.finish_pass(NUM_PASSES);
+    }
+
+    fn global_coord(key: &TileKey, idx: usize) -> (FBig, FBig) {
+        let ts = IBig::from(TILE_SIZE as u64);
+        let (r, c) = (idx / TILE_SIZE, idx % TILE_SIZE);
+        (
+            pixel_to_coord(&key.x * &ts + IBig::from(c), key.depth, 64),
+            pixel_to_coord(&key.y * &ts + IBig::from(r), key.depth, 64),
+        )
+    }
+
+    /// Every seeded pixel must be the *same point* as the pixel it was
+    /// copied from, for negative and positive tile indices alike.
+    #[test]
+    fn seeding_copies_identical_points() {
+        for (x, y) in [(5i64, -3i64), (-7, 4), (0, 0), (-1, -1)] {
+            // Parent -> child, for each of the four children.
+            let store = TileStore::new(1 << 26);
+            let parent_key = TileKey { depth: 10, x: IBig::from(x), y: IBig::from(y) };
+            fill(&store.get_or_insert(&parent_key, 100, 0), 1);
+            for (bx, by) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let key = TileKey { depth: 11, x: IBig::from(2 * x + bx), y: IBig::from(2 * y + by) };
+                assert_eq!(key.parent(), parent_key);
+                let child = store.get_or_insert(&key, 100, 0);
+                assert!(store.seed_from_relatives(&child));
+                assert_eq!(child.passes_done(), NUM_GRID_PASSES); // stride-2 grid
+                let mut copied = 0;
+                for idx in 0..TILE_LEN {
+                    let Some(v) = child.load(idx).get() else { continue };
+                    let src = (v & 0xFFFF) as usize;
+                    assert_eq!(global_coord(&key, idx), global_coord(&parent_key, src));
+                    copied += 1;
+                }
+                assert_eq!(copied, TILE_LEN / 4);
+            }
+
+            // Children -> parent.
+            let store = TileStore::new(1 << 26);
+            let mut keys = vec![];
+            for (i, (bx, by)) in [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().enumerate() {
+                let key = TileKey { depth: 11, x: IBig::from(2 * x + bx), y: IBig::from(2 * y + by) };
+                fill(&store.get_or_insert(&key, 100, 0), i as u32 + 1);
+                keys.push(key);
+            }
+            let parent = store.get_or_insert(&parent_key, 100, 0);
+            assert!(store.seed_from_relatives(&parent));
+            assert!(parent.is_complete());
+            for idx in 0..TILE_LEN {
+                let v = parent.load(idx).get().expect("parent fully seeded");
+                let child_key = &keys[(v >> 16) as usize - 1];
+                assert_eq!(global_coord(&parent_key, idx), global_coord(child_key, (v & 0xFFFF) as usize));
+            }
+        }
+    }
+
+    #[test]
+    fn seeding_needs_same_iterations() {
+        let store = TileStore::new(1 << 26);
+        let parent_key = TileKey { depth: 3, x: IBig::from(1), y: IBig::from(1) };
+        fill(&store.get_or_insert(&parent_key, 100, 0), 1);
+        let child = store.get_or_insert(&TileKey { depth: 4, x: IBig::from(2), y: IBig::from(3) }, 200, 0);
+        assert!(!store.seed_from_relatives(&child));
+        assert_eq!(child.passes_done(), 0);
+    }
+
+    #[test]
+    fn stride_to_passes() {
+        assert_eq!([32, 16, 8, 4, 2, 1].map(passes_for_stride), [0, 1, 2, 3, 4, NUM_PASSES]);
     }
 }
