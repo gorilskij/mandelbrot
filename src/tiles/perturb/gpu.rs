@@ -7,34 +7,34 @@
 //! times.  Residual glitches are then resolved exactly on the CPU (in
 //! parallel, interruptibly); any left unresolved are not stored.
 //!
+//! References
+//! ----------
+//! Glitches only happen when a pixel outlives the reference orbit, so the
+//! reference is chosen to outlive everything: a hyperbolic-component nucleus
+//! near the view (see `nucleus.rs`), whose orbit never escapes.  It is cached
+//! in `GpuState` and reused across passes and nearby views.  When no nucleus
+//! is found from the view centre, the glitch rounds pick the longest-lived of
+//! a sample of glitched pixels (exact orbits, in parallel) and seed the
+//! nucleus search from it instead; improvements are cached for later passes.
+//!
 //! Coordinate math
 //! ---------------
-//! The initial reference point is the screen centre.  Its Mandelbrot
-//! coordinate is computed at arbitrary precision on the CPU.  For every other
-//! pixel, the delta from the reference is:
-//!
-//!   δx = (col * units_per_pixel(depth) + offset_x)  [f32]
-//!
-//! where `col = tile_i * TILE_SIZE + c` is the pixel's integer position in
-//! the depth-level grid (relative to the tile-grid origin x0), and
-//!
-//!   offset_x = (sx0 − width/2) * view
-//!
-//! is a constant per pass that shifts from "grid pixels" to "Mandelbrot units
-//! centred on the screen".  The computation is done in f64 and then cast to
-//! f32.  No large-number cancellation occurs because both operands are small
-//! (a few thousand pixels, a small sub-pixel offset), so f32 precision is
-//! adequate for the initial delta.
+//! A reference `c` need not lie on the pixel grid.  Its position in pixel
+//! units relative to the tile-grid origin (`ref_px`) is computed exactly in
+//! FBig and rounded to f64 once; each pixel's offset is then
+//! `(col - ref_px.x, row - ref_px.y)`, O(1e4) pixels, exact enough in f64 at
+//! any depth.  The f32 pipeline multiplies by `2^upp`; the floatexp pipeline
+//! carries `2^upp` in the exponent (`pack_fe`).
 
+use super::nucleus::{MAX_REF_DIST, find_nucleus};
 use super::{PassBatchCtx, Perturbator, TileItem};
 use crate::rendering::{calculate_orbit, check_orbit, val_to_color};
-use crate::tiles::store::{
-    PASS_STRIDES, TILE_SIZE, pixel_to_coord, units_per_pixel, upp_log2, working_precision,
-};
+use crate::tiles::store::{PASS_STRIDES, TILE_SIZE, pixel_to_coord, upp_log2, working_precision};
 use bytemuck::{Pod, Zeroable};
 use dashu::float::FBig;
 use dashu::integer::IBig;
 use num::Complex;
+use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -59,6 +59,10 @@ const SHADER_FE_BODY: &str = include_str!("shaders/perturbation_floatexp.wgsl");
 
 const GLITCH_BIT: u32 = 0x80000000;
 const MAX_GLITCH_PASSES: usize = 8;
+
+/// Glitched pixels whose exact orbits are computed (in parallel) to pick the
+/// next reference in a glitch round.
+const GLITCH_CANDIDATES: usize = 32;
 
 /// Use the floatexp pipeline once units-per-pixel drops below 2^FE_THRESHOLD.
 /// The f32 seed starts breaking down near 2^-126; -100 leaves a safe margin
@@ -92,6 +96,92 @@ struct Uniforms {
 }
 
 // ---------------------------------------------------------------------------
+// Reference points
+// ---------------------------------------------------------------------------
+
+/// A perturbation reference: an exact point and its orbit as uploaded.
+struct Reference {
+    c:          Complex<FBig>,
+    orbit:      Vec<[f32; 2]>,
+    is_full:    bool,
+    iterations: usize,
+    /// Period, when `c` is a nucleus found by Newton.
+    period:     Option<usize>,
+}
+
+impl Reference {
+    fn new(c: Complex<FBig>, iterations: usize, period: Option<usize>) -> Self {
+        let (_, orbit) = calculate_orbit(c.clone(), iterations);
+        Self {
+            orbit: orbit.orbit.iter().map(|z| [z.re as f32, z.im as f32]).collect(),
+            is_full: orbit.is_full,
+            c,
+            iterations,
+            period,
+        }
+    }
+
+    /// A longer orbit covers more pixels; a full one covers all of them.
+    fn beats(&self, other: &Reference) -> bool {
+        self.orbit.len() > other.orbit.len()
+    }
+
+    fn describe(&self) -> String {
+        let kind = match self.period {
+            Some(p) => format!("nucleus p={p}"),
+            None    => "point".to_string(),
+        };
+        format!("{kind} len {} full {}", self.orbit.len(), self.is_full)
+    }
+}
+
+/// The view's centre and half-diagonal, at the precision reference search
+/// needs for this depth.
+struct ViewGeom {
+    center: Complex<FBig>,
+    radius: FBig,
+    prec:   usize,
+    upp:    i64,
+}
+
+impl ViewGeom {
+    fn new(ctx: &PassBatchCtx) -> Self {
+        let view = ctx.coords.view.inner;
+        let (w, h) = (ctx.width as f64, ctx.height as f64);
+        let prec = working_precision(ctx.depth);
+        let half = |o: &FBig, px: f64| {
+            (o + &FBig::try_from(px / 2.0 * view).unwrap()).with_precision(prec).value()
+        };
+        Self {
+            center: Complex { re: half(&ctx.coords.origin.x, w), im: half(&ctx.coords.origin.y, h) },
+            radius: FBig::try_from(view * w.hypot(h) / 2.0).unwrap(),
+            prec,
+            upp:    upp_log2(ctx.depth),
+        }
+    }
+
+    /// Whether `c` is close enough to the view to serve as its reference.
+    fn near(&self, c: &Complex<FBig>) -> bool {
+        let dx = &c.re - &self.center.re;
+        let dy = &c.im - &self.center.im;
+        let max = &self.radius * FBig::from(MAX_REF_DIST);
+        &dx * &dx + &dy * &dy <= &max * &max
+    }
+}
+
+/// Position of `c` in the pass's pixel grid (units of `2^upp`, relative to
+/// the tile-grid origin `x0, y0`).  Exact in FBig; only the O(1e4) result is
+/// rounded to f64.
+fn ref_px(c: &Complex<FBig>, ctx: &PassBatchCtx) -> (f64, f64) {
+    let shift = -upp_log2(ctx.depth) as isize;
+    let ts    = IBig::from(TILE_SIZE as u64);
+    let px = |v: &FBig, grid0: &IBig| {
+        ((v.clone() << shift) - FBig::from_parts(grid0 * &ts, 0)).to_f64().value()
+    };
+    (px(&c.re, &ctx.x0), px(&c.im, &ctx.y0))
+}
+
+// ---------------------------------------------------------------------------
 // GpuState — owns the wgpu device / pipeline
 // ---------------------------------------------------------------------------
 
@@ -106,6 +196,11 @@ pub struct GpuState {
     /// `max_storage_buffer_binding_size`; dispatches are chunked to stay under
     /// it (the delta buffer is the largest binding).
     max_binding: usize,
+    /// Best reference found so far, reused across passes and nearby views.
+    reference:   Mutex<Option<Arc<Reference>>>,
+    /// (centre, radius, iterations) of the last view whose centre-seeded
+    /// nucleus search failed, so the passes of one view search only once.
+    failed_search: Mutex<Option<(Complex<FBig>, FBig, usize)>>,
 }
 
 impl GpuState {
@@ -164,8 +259,119 @@ impl GpuState {
                 format!("{FE_HELPERS}\n{SHADER_FE_BODY}"),
             );
 
-            GpuState { device, queue, pipeline, pipeline_fe, bgl, max_binding }
+            GpuState {
+                device, queue, pipeline, pipeline_fe, bgl, max_binding,
+                reference: Mutex::new(None),
+                failed_search: Mutex::new(None),
+            }
         })
+    }
+
+    /// Reference for a pass: a cached one if it is still near and full,
+    /// otherwise a nucleus near the view centre, otherwise the longer of the
+    /// centre's orbit and the cached one.  `None` if interrupted.
+    fn initial_reference(
+        &self,
+        ctx: &PassBatchCtx,
+        g:   &ViewGeom,
+        int: &MultiInterrupter,
+    ) -> Option<Arc<Reference>> {
+        let iters  = ctx.iterations;
+        let cached = self.reference.lock().clone().filter(|r| g.near(&r.c));
+        if let Some(r) = &cached {
+            if r.iterations == iters && r.is_full { return Some(r.clone()); }
+            // A nucleus stays a nucleus when only the iteration count changed.
+            if r.period.is_some() && r.iterations != iters {
+                let r = Arc::new(Reference::new(r.c.clone(), iters, r.period));
+                if r.is_full { return Some(self.remember(r, g)); }
+            }
+        }
+
+        let key = (g.center.clone(), g.radius.clone(), iters);
+        if self.failed_search.lock().as_ref() != Some(&key) {
+            let t = std::time::Instant::now(); // DIAG
+            match find_nucleus(&g.center, &g.radius, g.upp, iters, g.prec, &|| int.interrupted()) {
+                Err(_) => return None,
+                Ok(Some(n)) => {
+                    let r = Arc::new(Reference::new(n.c, iters, Some(n.period)));
+                    log::info!(
+                        "[diag gpu] reference: {} from view centre in {:.1} ms",
+                        r.describe(), t.elapsed().as_secs_f64() * 1e3,
+                    );
+                    if r.is_full { return Some(self.remember(r, g)); }
+                }
+                Ok(None) => {
+                    log::info!(
+                        "[diag gpu] reference: no nucleus from view centre ({:.1} ms)",
+                        t.elapsed().as_secs_f64() * 1e3,
+                    );
+                    *self.failed_search.lock() = Some(key);
+                }
+            }
+        }
+
+        let centre = Arc::new(Reference::new(g.center.clone(), iters, None));
+        let best = match cached {
+            Some(r) if r.iterations == iters && r.beats(&centre) => r,
+            _ => centre,
+        };
+        Some(self.remember(best, g))
+    }
+
+    /// Pick a new reference among glitched pixels: exact orbits for
+    /// `candidates` in parallel, keep the longest, and if it still escapes
+    /// look for a nucleus seeded from it.  `None` if interrupted.
+    fn glitch_reference(
+        &self,
+        ctx:        &PassBatchCtx,
+        g:          &ViewGeom,
+        candidates: Vec<Complex<FBig>>,
+        int:        &MultiInterrupter,
+    ) -> Option<Arc<Reference>> {
+        let iters = ctx.iterations;
+        let mut best = Arc::new(
+            candidates.into_par_iter()
+                .map(|c| Reference::new(c, iters, None))
+                .max_by_key(|r| r.orbit.len())?,
+        );
+        if int.interrupted() { return None; }
+        if !best.is_full {
+            match find_nucleus(&best.c, &g.radius, g.upp, iters, g.prec, &|| int.interrupted()) {
+                Err(_) => return None,
+                Ok(Some(n)) if g.near(&n.c) => {
+                    let r = Arc::new(Reference::new(n.c, iters, Some(n.period)));
+                    if r.beats(&best) { best = r; }
+                }
+                Ok(_) => {}
+            }
+        }
+        Some(self.remember(best, g))
+    }
+
+    /// Cache `r` unless the cached reference still applies to this view and
+    /// is strictly better.
+    fn remember(&self, r: Arc<Reference>, g: &ViewGeom) -> Arc<Reference> {
+        let mut cache = self.reference.lock();
+        let keep = cache.as_ref().is_some_and(|c| {
+            c.iterations == r.iterations && g.near(&c.c) && c.beats(&r)
+        });
+        if !keep { *cache = Some(r.clone()); }
+        r
+    }
+
+    /// Dispatch pixels given as offsets from `r` in pixel units.
+    fn dispatch_offsets(&self, offs: &[(f64, f64)], upp: i64, r: &Reference) -> Vec<u32> {
+        if upp < FE_THRESHOLD {
+            let d: Vec<[f32; 4]> = offs.iter().map(|&(x, y)| pack_fe(x, y, upp)).collect();
+            self.dispatch_fe(&d, &r.orbit, r.is_full)
+        } else {
+            // upp >= FE_THRESHOLD, so 2^upp is a normal f64 and f32.
+            let scale = (upp as f64).exp2();
+            let d: Vec<[f32; 2]> = offs.iter()
+                .map(|&(x, y)| [(x * scale) as f32, (y * scale) as f32])
+                .collect();
+            self.dispatch_f32(&d, &r.orbit, r.is_full)
+        }
     }
 
     /// Plain-f32 dispatch: one `[f32; 2]` delta per pixel.
@@ -366,31 +572,18 @@ impl Perturbator for Gpu {
         let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3; // DIAG
         let stride  = PASS_STRIDES[pass as usize];
         let coarser = (pass > 0).then(|| PASS_STRIDES[pass as usize - 1]);
-        let scale   = units_per_pixel(ctx.depth); // Mandelbrot units per depth pixel
         let view    = ctx.coords.view.inner;
 
         // Beyond this depth the f32 seed underflows, so iterate the delta in
-        // floatexp instead. The depth scale `2^upp` then rides in the floatexp
-        // exponent and offsets are computed in pixel units (always O(1e4), so
-        // the f64 math never underflows however deep the zoom).
+        // floatexp instead (see `dispatch_offsets`).  Offsets are always in
+        // pixel units, O(1e4), so the f64 math never underflows.
         let upp    = upp_log2(ctx.depth);
         let use_fe = upp < FE_THRESHOLD;
-
-        // f32 path: absolute Mandelbrot-unit offsets from the screen centre.
-        let offset_x = (ctx.sx0 - ctx.width  as f64 / 2.0) * view;
-        let offset_y = (ctx.sy0 - ctx.height as f64 / 2.0) * view;
-        // floatexp path: same offsets but in units of `2^upp` (pixel units).
-        // ratio = view / scale ≈ O(1), formed in log space to avoid over/underflow.
-        let ratio    = (view.log2() - upp as f64).exp2();
-        let off_x_px = (ctx.sx0 - ctx.width  as f64 / 2.0) * ratio;
-        let off_y_px = (ctx.sy0 - ctx.height as f64 / 2.0) * ratio;
 
         // ----------------------------------------------------------------
         // Collect all pixels that need computing this pass.
         // ----------------------------------------------------------------
-        let mut pixel_refs:  Vec<PixelRef>  = Vec::new();
-        let mut deltas_f32:  Vec<[f32; 2]>  = Vec::new();
-        let mut deltas_fe:   Vec<[f32; 4]>  = Vec::new();
+        let mut pixel_refs: Vec<PixelRef> = Vec::new();
 
         for (ti, item) in tiles.iter().enumerate() {
             let tile   = &item.tile;
@@ -408,18 +601,6 @@ impl Perturbator for Gpu {
 
                     let col = tile_i * TILE_SIZE as i64 + c as i64;
                     let row = tile_j * TILE_SIZE as i64 + r as i64;
-                    if use_fe {
-                        deltas_fe.push(pack_fe(
-                            col as f64 + off_x_px,
-                            row as f64 + off_y_px,
-                            upp,
-                        ));
-                    } else {
-                        deltas_f32.push([
-                            (col as f64 * scale + offset_x) as f32,
-                            (row as f64 * scale + offset_y) as f32,
-                        ]);
-                    }
                     pixel_refs.push(PixelRef { tile_idx: ti, pixel_idx, col, row });
                 }
             }
@@ -431,122 +612,89 @@ impl Perturbator for Gpu {
             return;
         }
 
+        // Offsets of the given pixels from reference `r`, in pixel units.
+        let offsets = |indices: &mut dyn Iterator<Item = usize>, r: &Reference| -> Vec<(f64, f64)> {
+            let (rx, ry) = ref_px(&r.c, ctx);
+            indices.map(|i| {
+                let pr = &pixel_refs[i];
+                (pr.col as f64 - rx, pr.row as f64 - ry)
+            }).collect()
+        };
+
         // ----------------------------------------------------------------
-        // Initial dispatch against the screen-centre reference orbit.
+        // Initial dispatch against the view's reference (ideally a nucleus,
+        // whose orbit never escapes, so nothing glitches).
         // ----------------------------------------------------------------
+        let geom = ViewGeom::new(ctx);
         let t_collect = ms(t_pass); // DIAG
         let t_ref = std::time::Instant::now(); // DIAG
-        let ref_x = &ctx.coords.origin.x
-            + &FBig::try_from(ctx.width  as f64 / 2.0 * view).unwrap();
-        let ref_y = &ctx.coords.origin.y
-            + &FBig::try_from(ctx.height as f64 / 2.0 * view).unwrap();
-        let (_, ref_orbit) = calculate_orbit(
-            Complex { re: ref_x, im: ref_y },
-            ctx.iterations,
-        );
-        let orbit_data: Vec<[f32; 2]> = ref_orbit.orbit.iter()
-            .map(|c| [c.re as f32, c.im as f32])
-            .collect();
-
+        let Some(reference) = state.initial_reference(ctx, &geom, int) else { return };
         let t_ref = ms(t_ref); // DIAG
+
         let t_disp = std::time::Instant::now(); // DIAG
-        let mut raw = if use_fe {
-            state.dispatch_fe(&deltas_fe, &orbit_data, ref_orbit.is_full)
-        } else {
-            state.dispatch_f32(&deltas_f32, &orbit_data, ref_orbit.is_full)
-        };
+        let offs = offsets(&mut (0..pixel_refs.len()), &reference);
+        let mut raw = state.dispatch_offsets(&offs, upp, &reference);
 
         let t_disp = ms(t_disp); // DIAG
         log::info!(
-            "[diag gpu] pass {pass} timing: collect {} px {t_collect:.1} ms, ref orbit {t_ref:.1} ms, \
+            "[diag gpu] pass {pass} timing: collect {} px {t_collect:.1} ms, reference {t_ref:.1} ms, \
              initial dispatch {t_disp:.1} ms",
             pixel_refs.len(),
         );
         // DIAG
         {
-            let last = pixel_refs.len() - 1;
-            let seeds = if use_fe {
-                format!("seed[0]={:?} seed[last]={:?}", deltas_fe[0], deltas_fe[last])
-            } else {
-                format!("seed[0]={:?} seed[last]={:?}", deltas_f32[0], deltas_f32[last])
-            };
+            let (rx, ry) = ref_px(&reference.c, ctx);
             log::info!(
-                "[diag gpu] pass {pass} depth {} upp 2^{upp} view {view:.4e} ratio {ratio:.6} pipe {} | \
-                 ref orbit len {} full {} | off_px ({off_x_px:.3}, {off_y_px:.3}) offset ({offset_x:.4e}, {offset_y:.4e}) | {seeds}",
-                ctx.depth, if use_fe { "fe" } else { "f32" },
-                orbit_data.len(), ref_orbit.is_full,
+                "[diag gpu] pass {pass} depth {} upp 2^{upp} view {view:.4e} pipe {} | ref {} at px ({rx:.3}, {ry:.3}) | \
+                 off[0]={:?} off[last]={:?}",
+                ctx.depth, if use_fe { "fe" } else { "f32" }, reference.describe(),
+                offs[0], offs[offs.len() - 1],
             );
             log::info!("[diag gpu] pass {pass} initial: {}", raw_stats(&raw));
         }
 
         // ----------------------------------------------------------------
-        // Glitch-correction passes.
+        // Glitch-correction passes: a pixel is glitched only when it outlived
+        // the reference's (escaping) orbit.  Re-dispatch those against a
+        // longer-lived reference chosen among them.
         // ----------------------------------------------------------------
         for round in 0..MAX_GLITCH_PASSES {
             if int.interrupted() { break; }
 
-            let mut glitch_indices: Vec<usize> = Vec::new();
-            let mut best_flat = 0usize;
-            let mut best_itr  = 0u32;
-
-            for (i, &r) in raw.iter().enumerate() {
-                if r & GLITCH_BIT != 0 {
-                    let itr = r & !GLITCH_BIT;
-                    if itr > best_itr { best_itr = itr; best_flat = i; }
-                    glitch_indices.push(i);
-                }
-            }
+            let glitch_indices: Vec<usize> = raw.iter().enumerate()
+                .filter(|&(_, &r)| r & GLITCH_BIT != 0)
+                .map(|(i, _)| i)
+                .collect();
             if glitch_indices.is_empty() { break; }
 
-            // New reference: the glitch pixel with the longest path before
-            // detection (best proxy for a point close to the set boundary).
-            let pr       = &pixel_refs[best_flat];
-            let ref_tile = &tiles[pr.tile_idx].tile;
-            let ref_c    = pr.pixel_idx % TILE_SIZE;
-            let ref_r    = pr.pixel_idx / TILE_SIZE;
-            let ts       = IBig::from(TILE_SIZE as u64);
-            let prec     = working_precision(ctx.depth);
-            let t_gref = std::time::Instant::now(); // DIAG
-            let (_, new_orbit) = calculate_orbit(
+            // Candidates spread evenly over the glitched pixels.
+            let ts   = IBig::from(TILE_SIZE as u64);
+            let step = glitch_indices.len().div_ceil(GLITCH_CANDIDATES);
+            let candidates = glitch_indices.iter().step_by(step).map(|&gi| {
+                let pr   = &pixel_refs[gi];
+                let tile = &tiles[pr.tile_idx].tile;
+                let c    = pr.pixel_idx % TILE_SIZE;
+                let r    = pr.pixel_idx / TILE_SIZE;
                 Complex {
-                    re: pixel_to_coord(&ref_tile.key.x * &ts + IBig::from(ref_c as u64), ctx.depth, prec),
-                    im: pixel_to_coord(&ref_tile.key.y * &ts + IBig::from(ref_r as u64), ctx.depth, prec),
-                },
-                ctx.iterations,
-            );
-            let new_orbit_data: Vec<[f32; 2]> = new_orbit.orbit.iter()
-                .map(|c| [c.re as f32, c.im as f32])
-                .collect();
+                    re: pixel_to_coord(&tile.key.x * &ts + IBig::from(c as u64), ctx.depth, geom.prec),
+                    im: pixel_to_coord(&tile.key.y * &ts + IBig::from(r as u64), ctx.depth, geom.prec),
+                }
+            }).collect();
 
-            // Deltas of glitched pixels from the new reference (integer pixel
-            // differences — exact, and tiny enough for f64 at any depth).
-            let ref_col = pr.col;
-            let ref_row = pr.row;
+            let t_gref = std::time::Instant::now(); // DIAG
+            let Some(new_ref) = state.glitch_reference(ctx, &geom, candidates, int) else { break };
             let t_gref = ms(t_gref); // DIAG
+
             let t_gdisp = std::time::Instant::now(); // DIAG
-            let new_raw = if use_fe {
-                let nd: Vec<[f32; 4]> = glitch_indices.iter().map(|&gi| {
-                    let pr = &pixel_refs[gi];
-                    pack_fe((pr.col - ref_col) as f64, (pr.row - ref_row) as f64, upp)
-                }).collect();
-                state.dispatch_fe(&nd, &new_orbit_data, new_orbit.is_full)
-            } else {
-                let nd: Vec<[f32; 2]> = glitch_indices.iter().map(|&gi| {
-                    let pr = &pixel_refs[gi];
-                    [
-                        ((pr.col - ref_col) as f64 * scale) as f32,
-                        ((pr.row - ref_row) as f64 * scale) as f32,
-                    ]
-                }).collect();
-                state.dispatch_f32(&nd, &new_orbit_data, new_orbit.is_full)
-            };
+            let offs    = offsets(&mut glitch_indices.iter().copied(), &new_ref);
+            let new_raw = state.dispatch_offsets(&offs, upp, &new_ref);
             for (j, &gi) in glitch_indices.iter().enumerate() {
                 raw[gi] = new_raw[j];
             }
             log::info!(
-                "[diag gpu] pass {pass} glitch round {round}: {} glitched, new ref orbit len {} full {} \
-                 (orbit {t_gref:.1} ms, dispatch {:.1} ms) -> {}",
-                glitch_indices.len(), new_orbit_data.len(), new_orbit.is_full, ms(t_gdisp),
+                "[diag gpu] pass {pass} glitch round {round}: {} glitched, new ref {} \
+                 (reference {t_gref:.1} ms, dispatch {:.1} ms) -> {}",
+                glitch_indices.len(), new_ref.describe(), ms(t_gdisp),
                 raw_stats(&new_raw),
             );
         }
@@ -624,5 +772,205 @@ impl Perturbator for Gpu {
             "[diag gpu] pass {pass} total {:.1} ms{}",
             ms(t_pass), if int.interrupted() { " (interrupted)" } else { "" },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rendering::{CoordinatesBox, View};
+    use crate::support::Point;
+    use crate::tiles::perturb::nucleus::newton_nucleus;
+    use crate::tiles::store::tile_index;
+
+    /// End-to-end check of the reference path the GPU uses, run on the CPU:
+    /// in a deep view beside a minibrot, where the view centre itself
+    /// escapes, the nucleus found from the view centre must give a full
+    /// orbit, `ref_px` offsets must match exact pixel coordinates, and
+    /// perturbation against it must reproduce exact per-pixel escape counts
+    /// with no glitches.
+    ///
+    /// The perturbation here runs in f64 so that it tests the reference, not
+    /// the working float: in f32 (what the GPU uses) ~30% of these long-lived
+    /// near-boundary pixels get a different count — see
+    /// `diag_reference_precision`.
+    #[test]
+    fn nucleus_reference_matches_exact_orbits() {
+        let depth = 40; // 2^-45 units per pixel: the minibrot is sub-pixel
+        let prec  = working_precision(depth);
+        let iters = 3000;
+        let fp = |x: f64| FBig::try_from(x).unwrap().with_precision(prec).value();
+
+        // A period-998 nucleus near the seahorse-valley point, to full precision.
+        let seed = Complex { re: fp(-0.743_643_887_037_151), im: fp(0.131_825_904_205_330) };
+        let rough = find_nucleus(&seed, &fp(1e-12), -50, 10_000, prec, &|| false).unwrap().unwrap();
+        let tol2  = FBig::ONE << (2 * (upp_log2(depth) - 60)) as isize;
+        let nuc   = newton_nucleus(&rough.c, rough.period, prec, &tol2, &fp(1.0), &|| false).unwrap().unwrap();
+
+        // A 256x256 view (1 screen px = 1 depth px) whose centre is ~70 px
+        // from the nucleus, so the reference is off-centre and off-grid.
+        let (w, h) = (256usize, 256usize);
+        let upp    = upp_log2(depth);
+        let view   = (upp as f64).exp2();
+        let origin = Point::new(
+            &nuc.re - &(FBig::from(128 - 50) << upp as isize),
+            &nuc.im - &(FBig::from(128 + 48) << upp as isize),
+        );
+        let ctx = PassBatchCtx {
+            coords: CoordinatesBox { origin: origin.clone(), view: View::new(view) },
+            depth,
+            x0: tile_index(&origin.x, depth),
+            y0: tile_index(&origin.y, depth),
+            width: w,
+            height: h,
+            iterations: iters,
+        };
+        let g = ViewGeom::new(&ctx);
+        let n = find_nucleus(&g.center, &g.radius, g.upp, iters, g.prec, &|| false)
+            .unwrap()
+            .expect("nucleus from view centre");
+        let r = Reference::new(n.c, iters, Some(n.period));
+        assert!(r.is_full, "{}", r.describe());
+        let centre = Reference::new(g.center.clone(), iters, None);
+        eprintln!("reference {}; view centre alone: {}", r.describe(), centre.describe());
+        // The case that used to glitch: the centre's own orbit escapes.
+        assert!(!centre.is_full);
+
+        // Sample pixels on a grid across the view.
+        let (rx, ry) = ref_px(&r.c, &ctx);
+        let ts = IBig::from(TILE_SIZE as u64);
+        let (gx0, gy0) = (&ctx.x0 * &ts, &ctx.y0 * &ts);
+        let pix: Vec<(i64, i64)> = (0..16).flat_map(|j| (0..16).map(move |i| (i * 16 + 3, j * 16 + 5))).collect();
+        let (ref_orbit, _) = calculate_orbit(r.c.clone(), iters);
+
+        let mismatches: Vec<_> = pix.par_iter().filter_map(|&(col, row)| {
+            let exact = Complex {
+                re: pixel_to_coord(&gx0 + IBig::from(col), depth, prec),
+                im: pixel_to_coord(&gy0 + IBig::from(row), depth, prec),
+            };
+            // ref_px offset vs exact offset, in pixels.
+            let (dx, dy) = (col as f64 - rx, row as f64 - ry);
+            let ex = ((&exact.re - &r.c.re) << -upp as isize).to_f64().value();
+            let ey = ((&exact.im - &r.c.im) << -upp as isize).to_f64().value();
+            assert!((dx - ex).abs() < 1e-6 && (dy - ey).abs() < 1e-6, "offset ({dx},{dy}) vs ({ex},{ey})");
+
+            let scale = (upp as f64).exp2();
+            let got   = perturb::<f64>(&ref_orbit.orbit, (dx * scale, dy * scale), ref_orbit.is_full).0
+                .expect("no glitch with a full reference");
+            let (_, own) = calculate_orbit(exact, iters);
+            let want  = check_orbit(&own).unwrap().map(|n| n.get());
+            (got != want).then_some(((col, row), got, want))
+        }).collect();
+
+        eprintln!("{} / {} sampled pixels differ: {:?}", mismatches.len(), pix.len(), &mismatches[..mismatches.len().min(5)]);
+        assert!(mismatches.len() <= pix.len() / 100, "too many mismatches");
+    }
+
+    /// Diagnostic: per-pixel perturbation in f32/f64 against a given orbit,
+    /// counting Pauldelbrot's precision-loss condition |z|² < 1e-6·|X|².
+    fn perturb<F: num::Float>(orbit: &[Complex<FBig>], d0: (f64, f64), full: bool) -> (Result<Option<usize>, ()>, bool) {
+        perturb_x::<F>(orbit, d0, full, false)
+    }
+
+    /// f32 delta arithmetic, reference as a hi+lo f32 pair: the 2·X·δ term is
+    /// 2·(hi·δ + lo·δ).
+    fn perturb_hilo(orbit: &[Complex<FBig>], d0: (f64, f64), full: bool) -> Result<Option<usize>, ()> {
+        let split = |v: f64| { let hi = v as f32; (hi, (v - hi as f64) as f32) };
+        let x: Vec<(Complex<f32>, Complex<f32>)> = orbit.iter().map(|c| {
+            let (rh, rl) = split(c.re.to_f64().value());
+            let (ih, il) = split(c.im.to_f64().value());
+            (Complex { re: rh, im: ih }, Complex { re: rl, im: il })
+        }).collect();
+        let d0 = Complex { re: d0.0 as f32, im: d0.1 as f32 };
+        let mut d = d0;
+        for (i, &(hi, lo)) in x.iter().enumerate() {
+            let z = hi + d;
+            if z.norm_sqr() > 4.0 { return Ok(Some(i + 1)); }
+            d = (hi * d + lo * d) * 2.0 + d * d + d0;
+        }
+        if full { Ok(None) } else { Err(()) }
+    }
+
+    /// As `perturb`, optionally rounding the reference orbit to f32 first.
+    fn perturb_x<F: num::Float>(orbit: &[Complex<FBig>], d0: (f64, f64), full: bool, x_f32: bool) -> (Result<Option<usize>, ()>, bool) {
+        let rnd = |v: f64| if x_f32 { v as f32 as f64 } else { v };
+        let x: Vec<Complex<F>> = orbit.iter().map(|c| Complex {
+            re: F::from(rnd(c.re.to_f64().value())).unwrap(), im: F::from(rnd(c.im.to_f64().value())).unwrap(),
+        }).collect();
+        let d0 = Complex { re: F::from(d0.0).unwrap(), im: F::from(d0.1).unwrap() };
+        let mut d = d0;
+        let mut pauldel = false;
+        let two = F::from(2.0).unwrap();
+        for (i, &xn) in x.iter().enumerate() {
+            let z = xn + d;
+            let zn = z.norm_sqr();
+            if zn > F::from(4.0).unwrap() { return (Ok(Some(i + 1)), pauldel); }
+            if zn < F::from(1e-6).unwrap() * xn.norm_sqr() { pauldel = true; }
+            d = xn * d * two + d * d + d0;
+        }
+        (if full { Ok(None) } else { Err(()) }, pauldel)
+    }
+
+    /// Measurement, not a pass/fail test: escape-count accuracy of
+    /// perturbation against the nucleus vs the (escaping) view-centre
+    /// reference, in f32 / f64 / mixed.  Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn diag_reference_precision() {
+        let depth = 40;
+        let prec  = working_precision(depth);
+        let iters = 3000;
+        let fp = |x: f64| FBig::try_from(x).unwrap().with_precision(prec).value();
+        let seed = Complex { re: fp(-0.743_643_887_037_151), im: fp(0.131_825_904_205_330) };
+        let rough = find_nucleus(&seed, &fp(1e-12), -50, 10_000, prec, &|| false).unwrap().unwrap();
+        let upp  = upp_log2(depth);
+        let tol2 = FBig::ONE << (2 * (upp - 60)) as isize;
+        let nuc  = newton_nucleus(&rough.c, rough.period, prec, &tol2, &fp(1.0), &|| false).unwrap().unwrap();
+        let origin = Point::new(
+            &nuc.re - &(FBig::from(128 - 50) << upp as isize),
+            &nuc.im - &(FBig::from(128 + 48) << upp as isize),
+        );
+        let ctx = PassBatchCtx {
+            coords: CoordinatesBox { origin: origin.clone(), view: View::new((upp as f64).exp2()) },
+            depth, x0: tile_index(&origin.x, depth), y0: tile_index(&origin.y, depth),
+            width: 256, height: 256, iterations: iters,
+        };
+        let g = ViewGeom::new(&ctx);
+        let ts = IBig::from(TILE_SIZE as u64);
+        let (gx0, gy0) = (&ctx.x0 * &ts, &ctx.y0 * &ts);
+        let pix: Vec<(i64, i64)> = (0..16).flat_map(|j| (0..16).map(move |i| (i * 16 + 3, j * 16 + 5))).collect();
+        let exact: Vec<Option<usize>> = pix.par_iter().map(|&(col, row)| {
+            let c = Complex {
+                re: pixel_to_coord(&gx0 + IBig::from(col), depth, prec),
+                im: pixel_to_coord(&gy0 + IBig::from(row), depth, prec),
+            };
+            check_orbit(&calculate_orbit(c, iters).1).unwrap().map(|n| n.get())
+        }).collect();
+
+        for (name, refc) in [("nucleus", nuc.clone()), ("centre", g.center.clone())] {
+            let (orbit, _) = calculate_orbit(refc.clone(), iters);
+            let (rx, ry) = ref_px(&refc, &ctx);
+            let scale = (upp as f64).exp2();
+            for fname in ["f32", "f64", "f64 δ + f32 X", "f32 δ + hi/lo X"] {
+                let (mut wrong, mut glitched, mut pd, mut wrong_pd) = (0, 0, 0, 0);
+                for (k, &(col, row)) in pix.iter().enumerate() {
+                    let d0 = ((col as f64 - rx) * scale, (row as f64 - ry) * scale);
+                    let (res, p) = match fname {
+                        "f32" => perturb::<f32>(&orbit.orbit, d0, orbit.is_full),
+                        "f64" => perturb::<f64>(&orbit.orbit, d0, orbit.is_full),
+                        "f32 δ + hi/lo X" => (perturb_hilo(&orbit.orbit, d0, orbit.is_full), false),
+                        _     => perturb_x::<f64>(&orbit.orbit, d0, orbit.is_full, true),
+                    };
+                    if p { pd += 1; }
+                    match res {
+                        Err(()) => glitched += 1,
+                        Ok(v) if v != exact[k] => { wrong += 1; if p { wrong_pd += 1; } }
+                        Ok(_) => {}
+                    }
+                }
+                eprintln!("{name:8} {fname}: orbit len {} | glitched {glitched} | wrong {wrong} (of which pauldelbrot {wrong_pd}) | pauldelbrot-flagged {pd}",
+                    orbit.orbit.len());
+            }
+        }
     }
 }

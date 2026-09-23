@@ -160,8 +160,6 @@ pub fn run_generation(
         depth,
         x0:         x0.clone(),
         y0:         y0.clone(),
-        sx0,
-        sy0,
         width,
         height,
         iterations,

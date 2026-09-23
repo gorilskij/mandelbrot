@@ -11,6 +11,7 @@
 
 pub mod cpu;
 pub mod gpu;
+pub mod nucleus;
 
 use crate::rendering::{CoordinatesBox, Orbit, Pf};
 use crate::support::append_only::List as AOList;
@@ -47,9 +48,6 @@ pub struct PassBatchCtx {
     /// Tile-grid origin (top-left tile index at this depth).
     pub x0:         IBig,
     pub y0:         IBig,
-    /// Screen-pixel offset of the tile-grid origin (may be negative).
-    pub sx0:        f64,
-    pub sy0:        f64,
     pub width:      usize,
     pub height:     usize,
     pub iterations: usize,
