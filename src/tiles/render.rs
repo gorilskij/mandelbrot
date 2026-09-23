@@ -142,9 +142,7 @@ pub fn run_generation(
         let tile = store.get_or_insert(&key, iterations, generation);
         tile.render_gen.store(generation, std::sync::atomic::Ordering::Relaxed);
 
-        if tile.iterations.load(std::sync::atomic::Ordering::Relaxed) != iterations {
-            tile.reset(iterations);
-        }
+        tile.retarget(iterations); // no-op unless the iteration count changed
         if !tile.is_complete() && store.seed_from_relatives(&tile) { seeded += 1; }
         if tile.is_complete() { continue; }
 
@@ -198,8 +196,9 @@ pub fn run_generation(
 
 /// DIAG: backend-agnostic check of what actually landed in the visible tiles
 /// after a pass: how many pixels are set, how many distinct colours, and the
-/// share of the most common one. A "monochrome screen" shows up as
-/// distinct≈1–2 here if the compute side produced it.
+/// share of the most common one (values are escape iterations). A
+/// "monochrome screen" shows up as distinct≈1–2 here if the compute side
+/// produced it.
 fn log_tile_colors(
     generation: impl std::fmt::Display,
     pass:       u8,
@@ -219,7 +218,7 @@ fn log_tile_colors(
     let (top, top_n) = counts.iter().max_by_key(|(_, n)| **n).map(|(c, n)| (*c, *n)).unwrap_or((0, 0));
     info!(
         "[diag tiles] gen {generation} pass {pass}: {} tiles, set {set}, unset {unset}, \
-         distinct colours {}, top colour {top:#08x} @ {:.1}%",
+         distinct values {}, top value {top} @ {:.1}%",
         tiles.len(), counts.len(), 100.0 * top_n as f64 / set.max(1) as f64,
     );
 }

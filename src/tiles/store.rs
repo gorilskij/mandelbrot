@@ -16,7 +16,7 @@ use dashu::integer::IBig;
 use flurry::HashMap as FlurryMap;
 use std::sync::Arc;
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 pub const TILE_POW: usize = 7;
 /// side length of a tile in pixels
@@ -52,6 +52,16 @@ pub fn passes_for_stride(stride: usize) -> u8 {
     } else {
         GRID_STRIDES.iter().filter(|&&s| s >= stride).count() as u8
     }
+}
+
+/// The pass that computes pixel (row, col) of a tile (inverse of
+/// `pass_pixels`).
+pub fn pass_of(r: usize, c: usize) -> u8 {
+    if let Some(p) = GRID_STRIDES.iter().position(|&s| r.is_multiple_of(s) && c.is_multiple_of(s)) {
+        return p as u8;
+    }
+    let parity = (r % 2, c % 2);
+    NUM_GRID_PASSES + SUB_PASS_PARITY.iter().position(|&q| q == parity).unwrap() as u8
 }
 
 /// (row, col) of the pixels that `pass` adds to a tile, in row-major order.
@@ -196,11 +206,23 @@ impl TileKey {
 }
 
 /// A single rendered (or partially rendered) tile.
+///
+/// Pixels hold the escape iteration, not a colour: 0 = in the set, n =
+/// escaped at iteration n (colouring happens in the compositor). That keeps
+/// the contents meaningful when the iteration count changes (see `retarget`).
 pub struct Tile {
     pub key: TileKey,
     pixels: UnsafeCell<Box<[u32]>>,
     /// number of fully completed progressive passes (0..=NUM_PASSES)
     passes_done: AtomicU8,
+    /// passes to *display* regardless of `passes_done`: after raising the
+    /// iteration count, the recomputed passes still show at their old
+    /// resolution, with the pixels being recomputed drawn as in-set (black),
+    /// which is what they were
+    display_floor: AtomicU8,
+    /// bumped whenever displayable contents change, so the compositor knows
+    /// to re-upload
+    version: AtomicU32,
     /// iteration count the contents were/are being computed with
     pub iterations: AtomicUsize,
     /// frame counter value when this tile last contributed to the display
@@ -220,6 +242,8 @@ impl Tile {
             key,
             pixels: UnsafeCell::new(vec![MaybePixel::NONE_RAW; TILE_LEN].into_boxed_slice()),
             passes_done: AtomicU8::new(0),
+            display_floor: AtomicU8::new(0),
+            version: AtomicU32::new(0),
             iterations: AtomicUsize::new(iterations),
             last_used: AtomicU64::new(0),
             render_gen: AtomicU64::new(render_gen),
@@ -241,6 +265,17 @@ impl Tile {
     /// monotonically raise the completed-passes counter
     pub fn finish_pass(&self, passes_done: u8) {
         self.passes_done.fetch_max(passes_done, Ordering::Release);
+        self.version.fetch_add(1, Ordering::Release);
+    }
+
+    /// passes the compositor should display (see `display_floor`)
+    pub fn display_passes(&self) -> u8 {
+        self.passes_done().max(self.display_floor.load(Ordering::Acquire))
+    }
+
+    /// changes whenever the displayable contents change
+    pub fn version(&self) -> u32 {
+        self.version.load(Ordering::Acquire)
     }
 
     pub fn is_complete(&self) -> bool {
@@ -258,11 +293,41 @@ impl Tile {
         }
     }
 
-    /// wipe contents for re-rendering with a different iteration count
-    pub fn reset(&self, iterations: usize) {
-        self.passes_done.store(0, Ordering::Release);
-        self.iterations.store(iterations, Ordering::Relaxed);
-        unsafe { (*self.pixels.get()).fill(MaybePixel::NONE_RAW) };
+    /// Switch to a new iteration count, keeping every pixel that is still
+    /// exact under it (no guesses are kept):
+    /// - fewer iterations: a pixel that escaped after the new maximum is now
+    ///   in the set; everything else is unchanged. Nothing to recompute.
+    /// - more iterations: escaped pixels are unchanged; in-set pixels might
+    ///   escape later, so they are cleared, and `passes_done` drops to the
+    ///   passes still fully computed. The backends then recompute only the
+    ///   cleared pixels, while the tile keeps displaying at its old level.
+    ///
+    /// Must not run while a backend is writing to this tile.
+    pub fn retarget(&self, iterations: usize) {
+        let old = self.iterations.swap(iterations, Ordering::Relaxed);
+        if iterations == old { return; }
+        let pixels = unsafe { &mut *self.pixels.get() };
+        if iterations < old {
+            let max = iterations as u32;
+            for px in pixels.iter_mut() {
+                if MaybePixel::from_raw(*px).get().is_some_and(|n| n > max) {
+                    *px = MaybePixel::from(0).to_raw();
+                }
+            }
+        } else {
+            for px in pixels.iter_mut() {
+                if MaybePixel::from_raw(*px).get() == Some(0) {
+                    *px = MaybePixel::NONE_RAW;
+                }
+            }
+            let shown = self.display_passes();
+            let complete = (0..NUM_PASSES)
+                .take_while(|&p| pass_pixels(p).all(|(r, c)| MaybePixel::from_raw(pixels[r * TILE_SIZE + c]).get().is_some()))
+                .count() as u8;
+            self.passes_done.store(complete.min(self.passes_done()), Ordering::Release);
+            self.display_floor.store(shown, Ordering::Release);
+        }
+        self.version.fetch_add(1, Ordering::Release);
     }
 
     pub fn touch(&self, frame: u64) {
@@ -524,6 +589,15 @@ mod pass_tests {
     }
 
     #[test]
+    fn pass_of_inverts_pass_pixels() {
+        for pass in 0..NUM_PASSES {
+            for (r, c) in pass_pixels(pass) {
+                assert_eq!(pass_of(r, c), pass, "({r},{c})");
+            }
+        }
+    }
+
+    #[test]
     fn pass_sizes() {
         let sizes: Vec<usize> = (0..NUM_PASSES).map(|p| pass_pixels(p).count()).collect();
         assert_eq!(sizes, [64, 192, 768, 3072, 4096, 4096, 4096]);
@@ -627,5 +701,63 @@ mod pass_tests {
     #[test]
     fn stride_to_passes() {
         assert_eq!([32, 16, 8, 4, 2, 1].map(passes_for_stride), [0, 1, 2, 3, 4, NUM_PASSES]);
+    }
+
+    /// What a backend stores for a pixel with true escape time `e` under
+    /// `iterations`: e if it escapes in time, else 0 (in the set).
+    fn computed(e: u32, iterations: usize) -> u32 {
+        if e as usize <= iterations { e } else { 0 }
+    }
+
+    /// Retargeting keeps only exact values: retarget N1 -> N2, recompute
+    /// just the cleared pixels, and the tile equals a direct N2 render.
+    #[test]
+    fn retarget_matches_direct_render() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        for _ in 0..40 {
+            let truth: Vec<u32> = (0..TILE_LEN).map(|_| 1 + (rand() % 5000) as u32).collect();
+            let n1 = 256 << (rand() % 5);
+            let n2 = 256 << (rand() % 5);
+            let store = TileStore::new(1 << 26);
+            let tile = store.get_or_insert(&TileKey { depth: 1, x: IBig::from(0), y: IBig::from(0) }, n1, 0);
+            for (i, &e) in truth.iter().enumerate() { tile.store(i, computed(e, n1).into()); }
+            tile.finish_pass(NUM_PASSES);
+            let v0 = tile.version();
+
+            tile.retarget(n2);
+            assert!(tile.version() != v0 || n1 == n2);
+            assert_eq!(tile.display_passes(), NUM_PASSES, "keeps displaying");
+            if n2 <= n1 {
+                assert!(tile.is_complete(), "fewer iterations never needs recomputing");
+            }
+            let mut recomputed = 0;
+            for (i, &e) in truth.iter().enumerate() {
+                if tile.load(i).get().is_none() {
+                    tile.store(i, computed(e, n2).into());
+                    recomputed += 1;
+                }
+                assert_eq!(tile.load(i).get(), Some(computed(e, n2)), "pixel {i}, {n1} -> {n2}");
+            }
+            // Only formerly in-set pixels are recomputed.
+            let in_set_before = truth.iter().filter(|&&e| computed(e, n1) == 0).count();
+            assert_eq!(recomputed, if n2 > n1 { in_set_before } else { 0 });
+        }
+    }
+
+    /// After raising iterations, passes_done drops to the leading passes
+    /// whose pixels are all still known.
+    #[test]
+    fn retarget_up_lowers_passes_to_complete_prefix() {
+        let store = TileStore::new(1 << 26);
+        let tile = store.get_or_insert(&TileKey { depth: 1, x: IBig::from(0), y: IBig::from(0) }, 100, 0);
+        for i in 0..TILE_LEN { tile.store(i, 50.into()); }
+        // One in-set pixel in the first sub-pass.
+        let (r, c) = pass_pixels(NUM_GRID_PASSES).next().unwrap();
+        tile.store(r * TILE_SIZE + c, 0.into());
+        tile.finish_pass(NUM_PASSES);
+        tile.retarget(200);
+        assert_eq!(tile.passes_done(), NUM_GRID_PASSES);
+        assert_eq!(tile.display_passes(), NUM_PASSES);
     }
 }

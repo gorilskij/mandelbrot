@@ -1,7 +1,8 @@
-use crate::rendering::CoordinatesBox;
+use crate::rendering::{CoordinatesBox, val_to_color};
+use std::num::NonZeroUsize;
 use crate::tiles::store::{
-    GRID_STRIDES, NUM_GRID_PASSES, NUM_PASSES, TILE_LEN, TILE_SIZE, TileKey, TileStore, depth_for_view,
-    pass_pixels, tile_index,
+    GRID_STRIDES, NUM_GRID_PASSES, NUM_PASSES, TILE_LEN, TILE_SIZE, Tile, TileKey, TileStore,
+    depth_for_view, pass_of, pass_pixels, tile_index,
     units_per_pixel,
 };
 use bytemuck::{Pod, Zeroable};
@@ -131,7 +132,8 @@ struct TileEntry {
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     tex_size: u32,
-    passes_done: u8,
+    /// `Tile::version` this texture was built from
+    version: u32,
 }
 
 pub struct GpuCompositor {
@@ -145,6 +147,9 @@ pub struct GpuCompositor {
     bgl: wgpu::BindGroupLayout,
     tiles: HashMap<TileKey, TileEntry>,
     bar: BarAnim,
+    /// Colour per escape iteration (`val_to_color`), grown on demand: tiles
+    /// store iterations and are coloured here, at upload.
+    palette: Vec<u32>,
 }
 
 impl GpuCompositor {
@@ -325,6 +330,7 @@ impl GpuCompositor {
                 pipeline,
                 bar_pipeline,
                 bar: BarAnim { shown: 1.0, vel: 0.0, last: None },
+                palette: Vec::new(),
                 sampler,
                 bgl,
                 tiles: HashMap::new(),
@@ -422,7 +428,7 @@ impl GpuCompositor {
 
             for _ in 0..=MAX_CLIMB {
                 if let Some(tile) = store.get(&candidate)
-                    && tile.completed_stride().is_some()
+                    && tile.display_passes() > 0
                 {
                     tile.touch(store_frame);
                     pending.push(Pending {
@@ -563,7 +569,8 @@ impl GpuCompositor {
             Some(t) => t,
             None => return,
         };
-        let passes_done = tile.passes_done();
+        let passes_done = tile.display_passes();
+        let version = tile.version();
         if passes_done == 0 {
             return;
         }
@@ -579,12 +586,12 @@ impl GpuCompositor {
         let tex_size = (TILE_SIZE / stride) as u32;
 
         if let Some(entry) = self.tiles.get(key) {
-            if entry.passes_done == passes_done {
+            if entry.version == version {
                 return;
             }
             if entry.tex_size == tex_size {
                 // Same resolution — overwrite pixels in-place.
-                let data = Self::texels(&tile, stride, tex_size);
+                let data = Self::texels(&tile, stride, tex_size, &mut self.palette);
                 self.queue.write_texture(
                     entry.texture.as_image_copy(),
                     bytemuck::cast_slice(&data),
@@ -595,13 +602,13 @@ impl GpuCompositor {
                     },
                     wgpu::Extent3d { width: tex_size, height: tex_size, depth_or_array_layers: 1 },
                 );
-                self.tiles.get_mut(key).unwrap().passes_done = passes_done;
+                self.tiles.get_mut(key).unwrap().version = version;
                 return;
             }
         }
 
         // Create a new texture (first upload or size changed due to new pass).
-        let data = Self::texels(&tile, stride, tex_size);
+        let data = Self::texels(&tile, stride, tex_size, &mut self.palette);
         let texture = self.device.create_texture_with_data(
             &self.queue,
             &wgpu::TextureDescriptor {
@@ -632,60 +639,89 @@ impl GpuCompositor {
                 },
             ],
         });
-        self.tiles.insert(key.clone(), TileEntry { texture, bind_group, tex_size, passes_done });
+        self.tiles.insert(key.clone(), TileEntry { texture, bind_group, tex_size, version });
     }
 
     /// Texels for a tile displayed at `stride`: the stride grid, or at
     /// stride 1 the reconstructed full-resolution tile.
-    fn texels(tile: &crate::tiles::store::Tile, stride: usize, tex_size: u32) -> Vec<u32> {
-        if stride == 1 { Self::reconstruct(tile) } else { Self::sample_pixels(tile, stride, tex_size) }
+    /// Texels for a tile displayed at `stride`: the stride grid, or at
+    /// stride 1 the reconstructed full-resolution tile.
+    fn texels(tile: &Tile, stride: usize, tex_size: u32, palette: &mut Vec<u32>) -> Vec<u32> {
+        if stride == 1 {
+            Self::reconstruct(tile, palette)
+        } else {
+            Self::sample_pixels(tile, stride, tex_size, palette)
+        }
     }
 
     /// Sample the stride grid from tile pixels into an Rgba8Unorm buffer.
+    /// A missing grid pixel is one being recomputed after the iteration
+    /// count went up, i.e. formerly in the set: drawn black, as it was.
     /// Data races are intentional — see store.rs.
-    fn sample_pixels(tile: &crate::tiles::store::Tile, stride: usize, tex_size: u32) -> Vec<u32> {
+    fn sample_pixels(tile: &Tile, stride: usize, tex_size: u32, palette: &mut Vec<u32>) -> Vec<u32> {
         let n = tex_size as usize;
         let mut data = vec![0u32; n * n];
         for row in 0..n {
             for col in 0..n {
-                let raw = tile.load(row * stride * TILE_SIZE + col * stride).to_raw();
-                data[row * n + col] = rgb_to_rgba8(raw);
+                let px = tile.load(row * stride * TILE_SIZE + col * stride).get();
+                data[row * n + col] = rgb_to_rgba8(px.map_or(0, |v| color_of(v, palette)));
             }
         }
         data
     }
 
     /// Full-resolution texels for a tile during (or after) the sub-passes:
-    /// computed pixels as they are, each missing one as the mean colour of
-    /// its computed axis neighbours. The sub-pass order guarantees all four
-    /// exist from the first sub-pass on (fewer at the tile edge).
-    fn reconstruct(tile: &crate::tiles::store::Tile) -> Vec<u32> {
+    /// computed pixels as they are, each sub-pass gap as the mean colour of
+    /// its computed axis neighbours (the sub-pass order guarantees all four
+    /// from the first sub-pass on, fewer at the tile edge). A missing pixel
+    /// from an already-displayed pass is being recomputed after the
+    /// iteration count went up — formerly in the set — and is drawn black.
+    fn reconstruct(tile: &Tile, palette: &mut Vec<u32>) -> Vec<u32> {
         let n = TILE_SIZE;
-        let px = |r: usize, c: usize| tile.load(r * n + c).get();
+        let shown = tile.display_passes();
+        let mut known = |r: usize, c: usize| match tile.load(r * n + c).get() {
+            Some(v) => Some(color_of(v, palette)),
+            None if pass_of(r, c) < shown => Some(0),
+            None => None,
+        };
         let mut data = vec![0u32; n * n];
         for r in 0..n {
             for c in 0..n {
-                let rgb = px(r, c).unwrap_or_else(|| {
-                    let neighbours = [
-                        (r > 0).then(|| px(r - 1, c)).flatten(),
-                        (r + 1 < n).then(|| px(r + 1, c)).flatten(),
-                        (c > 0).then(|| px(r, c - 1)).flatten(),
-                        (c + 1 < n).then(|| px(r, c + 1)).flatten(),
-                    ];
-                    let (mut sum, mut k) = ([0u32; 3], 0);
-                    for v in neighbours.into_iter().flatten() {
-                        for (i, s) in sum.iter_mut().enumerate() {
-                            *s += (v >> (8 * i)) & 0xFF;
+                let rgb = match known(r, c) {
+                    Some(rgb) => rgb,
+                    None => {
+                        let neighbours = [
+                            (r > 0).then(|| known(r - 1, c)).flatten(),
+                            (r + 1 < n).then(|| known(r + 1, c)).flatten(),
+                            (c > 0).then(|| known(r, c - 1)).flatten(),
+                            (c + 1 < n).then(|| known(r, c + 1)).flatten(),
+                        ];
+                        let (mut sum, mut k) = ([0u32; 3], 0);
+                        for v in neighbours.into_iter().flatten() {
+                            for (i, s) in sum.iter_mut().enumerate() {
+                                *s += (v >> (8 * i)) & 0xFF;
+                            }
+                            k += 1;
                         }
-                        k += 1;
+                        if k == 0 { 0 } else { (0..3).map(|i| (sum[i] / k) << (8 * i)).sum() }
                     }
-                    if k == 0 { 0 } else { (0..3).map(|i| (sum[i] / k) << (8 * i)).sum() }
-                });
+                };
                 data[r * n + c] = rgb_to_rgba8(rgb);
             }
         }
         data
     }
+}
+
+/// Colour (0x00RRGGBB) of a stored pixel value: the escape iteration, 0 for
+/// in the set. Looked up in `palette`, which grows as needed.
+fn color_of(iteration: u32, palette: &mut Vec<u32>) -> u32 {
+    let i = iteration as usize;
+    if i >= palette.len() {
+        let len = (i + 1).next_power_of_two().max(256);
+        palette.extend((palette.len()..len).map(|j| val_to_color(NonZeroUsize::new(j))));
+    }
+    palette[i]
 }
 
 /// 0x00RRGGBB → Rgba8Unorm [R, G, B, 255] as a little-endian u32.

@@ -34,7 +34,7 @@
 
 use super::nucleus::{MAX_REF_DIST, find_nucleus};
 use super::{PassBatchCtx, Perturbator, TileItem};
-use crate::rendering::{calculate_orbit, check_orbit, val_to_color};
+use crate::rendering::{calculate_orbit, check_orbit};
 use crate::tiles::store::{TILE_SIZE, pass_pixels, pixel_to_coord, upp_log2, working_precision};
 use bytemuck::{Pod, Zeroable};
 use dashu::float::FBig;
@@ -42,7 +42,6 @@ use dashu::integer::IBig;
 use num::Complex;
 use parking_lot::Mutex;
 use rayon::prelude::*;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use waker_interrupter::MultiInterrupter;
@@ -777,8 +776,7 @@ impl Perturbator for Gpu {
             for (j, &r) in raw.iter().enumerate() {
                 if r & GLITCH_BIT != 0 { continue; }
                 let pr = &pixel_refs[pos + j];
-                let color = val_to_color(NonZeroUsize::new(r as usize));
-                tiles[pr.tile_idx].tile.store(pr.pixel_idx, color.into());
+                tiles[pr.tile_idx].tile.store(pr.pixel_idx, r.into()); // escape iteration, 0 = in set
                 remaining[pr.tile_idx] -= 1;
                 if remaining[pr.tile_idx] == 0 { finish(pr.tile_idx); }
             }

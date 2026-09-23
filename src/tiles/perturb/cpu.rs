@@ -4,7 +4,7 @@
 //! group list so later pixels reuse it.
 
 use super::{PassBatchCtx, Perturbator, RefList, RefOrbit, TileItem};
-use crate::rendering::{Pf, calculate_orbit, check_divergence_delta, check_orbit, val_to_color};
+use crate::rendering::{Pf, calculate_orbit, check_divergence_delta, check_orbit};
 use crate::tiles::store::{
     GROUP_POW, GROUP_TILES, NUM_PASSES, TILE_SIZE, Tile, floor_div_pow2, pass_pixels,
     pixel_to_coord, units_per_pixel, working_precision,
@@ -98,7 +98,7 @@ fn render_pixel(ctx: &TileCtx, c: usize, r: usize, iterations: usize) -> bool {
             val
         });
 
-    ctx.tile.store(idx, val_to_color(val).into());
+    ctx.tile.store(idx, (val.map_or(0, |n| n.get()) as u32).into());
     val.is_none()
 }
 

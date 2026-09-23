@@ -27,6 +27,13 @@ delta iteration per pixel. There are two interchangeable backends, CPU and GPU.
     single source of truth; both backends use it. The compositor shows grid
     passes via the sampler and, from the first sub-pass, a full-res texture
     with gaps averaged from neighbours (`reconstruct`).
+  - **Tiles store escape iterations, not colours** (0 = in set, n = escaped
+    at n; bit 31 = not computed). The compositor colours at upload through a
+    palette table (`color_of`). Changing iterations calls `Tile::retarget`:
+    ↓ is exact with no recompute (n > max → in set); ↑ clears only in-set
+    pixels, lowers `passes_done` to the still-complete prefix and keeps
+    displaying at the old level (`display_floor`, cleared pixels drawn black).
+    The compositor re-uploads on `Tile::version`, not `passes_done`.
   - **Quadtree seeding** (`seed_from_relatives`): pixel (i,j) at depth d is
     pixel (2i,2j) at depth d+1, so a finished parent gives a child passes
     0–3 for free, and four children give their parent. Same iterations only.
