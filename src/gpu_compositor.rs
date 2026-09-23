@@ -1,6 +1,7 @@
 use crate::rendering::CoordinatesBox;
 use crate::tiles::store::{
-    GRID_STRIDES, NUM_GRID_PASSES, NUM_PASSES, TILE_SIZE, TileKey, TileStore, depth_for_view, tile_index,
+    GRID_STRIDES, NUM_GRID_PASSES, NUM_PASSES, TILE_LEN, TILE_SIZE, TileKey, TileStore, depth_for_view,
+    pass_pixels, tile_index,
     units_per_pixel,
 };
 use bytemuck::{Pod, Zeroable};
@@ -52,6 +53,63 @@ fn fs(v: VOut) -> @location(0) vec4<f32> {
 
 const PROGRESS_BAR: bool = true;
 const BAR_HEIGHT_PX: u32 = 10;
+/// Width of the dark separators between pass sections, in pixels.
+const BAR_SEPARATOR_PX: f32 = 2.0;
+/// Smoothing time of the bar's spring: progress arrives in steps (one per GPU
+/// chunk or CPU pass); the spring turns them into near-constant motion.
+const BAR_SMOOTH_SECS: f32 = 0.25;
+
+/// The drawn progress bar: a critically damped spring ("SmoothDamp") chasing
+/// the real progress, never ahead of it.
+struct BarAnim {
+    shown: f32,
+    vel:   f32,
+    last:  Option<std::time::Instant>,
+}
+
+impl BarAnim {
+    /// Advance towards `target` (0..=1) and return the fill to draw, or
+    /// `None` once complete and settled (bar hidden).
+    fn advance(&mut self, target: f32) -> Option<f32> {
+        let now = std::time::Instant::now();
+        let dt  = self.last.map_or(0.0, |t| (now - t).as_secs_f32()).min(0.1);
+        self.last = Some(now);
+        self.step(target, dt)
+    }
+
+    /// `advance` with an explicit time step.
+    fn step(&mut self, target: f32, dt: f32) -> Option<f32> {
+        if target < self.shown - 0.005 {
+            // A new view started: jump back rather than sliding backwards.
+            self.shown = target;
+            self.vel   = 0.0;
+        } else if dt > 0.0 {
+            let omega  = 2.0 / BAR_SMOOTH_SECS;
+            let x      = omega * dt;
+            let decay  = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x);
+            let change = self.shown - target;
+            let temp   = (self.vel + omega * change) * dt;
+            self.vel   = (self.vel - omega * temp) * decay;
+            self.shown = target + (change + temp) * decay;
+            if self.shown > target {
+                self.shown = target;
+                self.vel   = 0.0;
+            }
+        }
+        if target >= 1.0 && self.shown >= 0.999 {
+            // Done: settle exactly so `animating` stops asking for frames.
+            self.shown = 1.0;
+            self.vel   = 0.0;
+            return None;
+        }
+        Some(self.shown)
+    }
+
+    /// Whether another frame is needed to keep the bar moving.
+    fn animating(&self, target: f32) -> bool {
+        (target - self.shown).abs() > 1e-4
+    }
+}
 
 /// How many parent levels to climb looking for a coarser tile to upscale when
 /// the target tile has no data yet (the preview while a fresh view renders).
@@ -88,6 +146,7 @@ pub struct GpuCompositor {
     sampler: wgpu::Sampler,
     bgl: wgpu::BindGroupLayout,
     tiles: HashMap<TileKey, TileEntry>,
+    bar: BarAnim,
 }
 
 impl GpuCompositor {
@@ -267,6 +326,7 @@ impl GpuCompositor {
                 surface_config,
                 pipeline,
                 bar_pipeline,
+                bar: BarAnim { shown: 1.0, vel: 0.0, last: None },
                 sampler,
                 bgl,
                 tiles: HashMap::new(),
@@ -315,10 +375,12 @@ impl GpuCompositor {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    pub fn render(&mut self, store: &TileStore, coords: &CoordinatesBox, width: u32, height: u32) {
+    /// Draw one frame. Returns whether the progress bar is still moving, i.e.
+    /// whether another frame is wanted even if nothing else changes.
+    pub fn render(&mut self, store: &TileStore, coords: &CoordinatesBox, width: u32, height: u32) -> bool {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            _ => return,
+            _ => return false,
         };
         let frame_view = frame.texture.create_view(&Default::default());
 
@@ -414,6 +476,19 @@ impl GpuCompositor {
             draw_keys.push((&p.src, base));
         }
 
+        // Progress bar: advance the animation and build its geometry.
+        let target = bar_progress(store, depth, &x0, &y0, nx, ny);
+        let bar = PROGRESS_BAR.then(|| self.bar.advance(target)).flatten().map(|fill| {
+            let bar_verts = bar_vertices(width, height, fill);
+            let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&bar_verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            (vbuf, bar_verts.len() as u32)
+        });
+        let animating = PROGRESS_BAR && self.bar.animating(target);
+
         let mut enc = self.device.create_command_encoder(&Default::default());
 
         if verts.is_empty() {
@@ -430,24 +505,15 @@ impl GpuCompositor {
                     })],
                     ..Default::default()
                 });
-                if PROGRESS_BAR
-                    && let Some((fill, bg_gray, fill_gray)) = bar_progress(store, depth, &x0, &y0, nx, ny)
-                {
-                    let bar_verts = bar_vertices(height, fill, bg_gray, fill_gray);
-                    let bar_vbuf =
-                        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: None,
-                            contents: bytemuck::cast_slice(&bar_verts),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
+                if let Some((vbuf, n)) = &bar {
                     pass.set_pipeline(&self.bar_pipeline);
-                    pass.set_vertex_buffer(0, bar_vbuf.slice(..));
-                    pass.draw(0..bar_verts.len() as u32, 0..1);
-                } // PROGRESS_BAR
+                    pass.set_vertex_buffer(0, vbuf.slice(..));
+                    pass.draw(0..*n, 0..1);
+                }
             }
             self.queue.submit([enc.finish()]);
             self.queue.present(frame);
-            return;
+            return animating;
         }
 
         let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -479,19 +545,11 @@ impl GpuCompositor {
             }
 
             // Progress bar overlay.
-            if PROGRESS_BAR
-                && let Some((fill, bg_gray, fill_gray)) = bar_progress(store, depth, &x0, &y0, nx, ny)
-            {
-                let bar_verts = bar_vertices(height, fill, bg_gray, fill_gray);
-                let bar_vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: bytemuck::cast_slice(&bar_verts),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
+            if let Some((vbuf, n)) = &bar {
                 pass.set_pipeline(&self.bar_pipeline);
-                pass.set_vertex_buffer(0, bar_vbuf.slice(..));
-                pass.draw(0..bar_verts.len() as u32, 0..1);
-            } // PROGRESS_BAR
+                pass.set_vertex_buffer(0, vbuf.slice(..));
+                pass.draw(0..*n, 0..1);
+            }
         }
 
         self.queue.submit([enc.finish()]);
@@ -499,6 +557,7 @@ impl GpuCompositor {
 
         // Drop GPU textures for tiles that have been evicted from the CPU store.
         self.tiles.retain(|key, _| store.get(key).is_some());
+        animating
     }
 
     fn ensure_texture(&mut self, key: &TileKey, store: &TileStore) {
@@ -639,68 +698,51 @@ fn rgb_to_rgba8(raw: u32) -> u32 {
     r | (g << 8) | (b << 16) | (0xFF << 24)
 }
 
-/// Returns (fill 0..1, bg_gray 0..1, fill_gray 0..1) for the progress bar,
-/// or None if all tiles have finished all passes (bar should be hidden).
-///
-/// bg_gray = color of the last fully-completed pass (0 = black if none).
-/// fill_gray = color of the pass currently being filled in.
-fn bar_progress(
-    store: &TileStore,
-    depth: i64,
-    x0: &IBig,
-    y0: &IBig,
-    nx: i64,
-    ny: i64,
-) -> Option<(f32, f32, f32)> {
-    let total = (nx * ny) as u32;
-    if total == 0 {
-        return None;
+/// Fraction of the rendering work done for the visible tiles, weighting each
+/// finished pass by its share of a tile's pixels (so the bar's sections are
+/// proportional to the work). 1.0 when everything is complete.
+fn bar_progress(store: &TileStore, depth: i64, x0: &IBig, y0: &IBig, nx: i64, ny: i64) -> f32 {
+    let total = (nx * ny) as f32;
+    if total == 0.0 {
+        return 1.0;
     }
-
-    // counts[p] = number of tiles with passes_done >= p+1
-    let mut counts = [0u32; NUM_PASSES as usize];
+    let done = pass_boundaries();
+    let mut sum = 0.0;
     for (i, j) in iproduct!(0..nx, 0..ny) {
         let key = TileKey { depth, x: x0 + IBig::from(i), y: y0 + IBig::from(j) };
         let pd = store.get(&key).map_or(0, |t| t.passes_done()) as usize;
-        for count in counts.iter_mut().take(pd) {
-            *count += 1;
-        }
+        sum += done[pd.min(NUM_PASSES as usize)];
     }
-
-    // Find the lowest pass that isn't yet complete for all tiles.
-    for (p, &count) in counts.iter().enumerate() {
-        if count < total {
-            let fill = count as f32 / total as f32;
-            let bg_gray = p as f32 / NUM_PASSES as f32;       // prev pass color (0 = black)
-            let fill_gray = (p + 1) as f32 / NUM_PASSES as f32; // current pass color
-            return Some((fill, bg_gray, fill_gray));
-        }
-    }
-    None
+    sum / total
 }
 
-/// Build bar quad vertices: background (last completed pass color) + colored
-/// fill (current pass color), both covering the bottom BAR_HEIGHT_PX pixels.
-fn bar_vertices(height: u32, fill: f32, bg_gray: f32, fill_gray: f32) -> [BarVertex; 12] {
-    let h = height as f32;
+/// Cumulative share of a tile's pixels after each number of finished passes:
+/// `[0, 64/16384, 256/16384, …, 1]`.
+fn pass_boundaries() -> [f32; NUM_PASSES as usize + 1] {
+    let mut out = [0.0; NUM_PASSES as usize + 1];
+    for p in 0..NUM_PASSES {
+        out[p as usize + 1] = out[p as usize] + pass_pixels(p).count() as f32 / TILE_LEN as f32;
+    }
+    out
+}
 
-    // Clip-space y coords for the bar (bottom strip).
+/// Bar geometry: a dark track, a white fill up to `fill`, and dark separators
+/// at the pass-section boundaries, across the bottom BAR_HEIGHT_PX pixels.
+fn bar_vertices(width: u32, height: u32, fill: f32) -> Vec<BarVertex> {
+    let h = height as f32;
     let y0 = 1.0 - ((height - BAR_HEIGHT_PX) as f32 / h) * 2.0;
     let y1 = -1.0_f32;
+    let x_at = |f: f32| -1.0 + f * 2.0;
+    let sep_half = BAR_SEPARATOR_PX / width.max(1) as f32; // half-width in clip units
 
-    let bg_color = [bg_gray, bg_gray, bg_gray, 1.0];
-    let fill_color = [fill_gray, fill_gray, fill_gray, 1.0];
-
-    // Background: full width, color of last completed pass.
-    let bg = quad([-1.0, y0, 1.0, y1], bg_color);
-
-    // Fill: left to fill fraction, color of current pass.
-    let x1 = -1.0 + fill * 2.0;
-    let fg = quad([-1.0, y0, x1, y1], fill_color);
-
-    let mut out = [BarVertex { pos: [0.0; 2], color: [0.0; 4] }; 12];
-    out[..6].copy_from_slice(&bg);
-    out[6..].copy_from_slice(&fg);
+    let mut out = Vec::with_capacity(6 * (2 + NUM_PASSES as usize));
+    out.extend(quad([-1.0, y0, 1.0, y1], [0.12, 0.12, 0.12, 1.0]));
+    out.extend(quad([-1.0, y0, x_at(fill), y1], [1.0, 1.0, 1.0, 1.0]));
+    let bounds = pass_boundaries();
+    for &b in &bounds[1..NUM_PASSES as usize] {
+        let x = x_at(b);
+        out.extend(quad([x - sep_half, y0, x + sep_half, y1], [0.0, 0.0, 0.0, 1.0]));
+    }
     out
 }
 
@@ -797,9 +839,14 @@ impl RenderThread {
                     // during the render show up as a change on the next pass and
                     // keep us looping at vsync rate while computation is active.
                     let progress = store.progress();
-                    compositor.render(&store, &coords, w, h);
+                    let animating = compositor.render(&store, &coords, w, h);
                     let last_gen = generation;
                     let last_progress = progress;
+                    // The progress bar is still moving: draw again right away
+                    // (presenting blocks on vsync, so this runs at frame rate).
+                    if animating {
+                        continue;
+                    }
 
                     // Park until the view changes, a resize is queued, exit is
                     // requested, or computation makes further progress. The
@@ -857,5 +904,51 @@ impl RenderThread {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FRAME: f32 = 1.0 / 60.0;
+
+    #[test]
+    fn bar_boundaries_are_pass_shares() {
+        let b = pass_boundaries();
+        assert_eq!(b[0], 0.0);
+        assert!((b[NUM_GRID_PASSES as usize] - 0.25).abs() < 1e-6);
+        assert!((b[NUM_PASSES as usize] - 1.0).abs() < 1e-6);
+        assert!(b.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// Progress arriving in steps (like GPU chunks) is followed smoothly,
+    /// never overtaken, and finishes then hides.
+    #[test]
+    fn bar_follows_steps_smoothly_and_hides() {
+        let mut bar = BarAnim { shown: 1.0, vel: 0.0, last: None };
+        // New view: jumps down to the (small) real progress.
+        assert_eq!(bar.step(0.02, FRAME), Some(0.02));
+
+        let mut target = 0.02_f32;
+        let mut prev = 0.02_f32;
+        let mut max_step = 0.0_f32;
+        for frame in 0..600 {
+            if frame % 2 == 0 && target < 1.0 { target = (target + 0.01).min(1.0); } // a chunk every 2 frames
+            let Some(shown) = bar.step(target, FRAME) else { break };
+            assert!(shown <= target + 1e-6, "ahead of progress");
+            assert!(shown >= prev - 1e-6, "went backwards");
+            max_step = max_step.max(shown - prev);
+            prev = shown;
+        }
+        // Chunks add 0.01 every 2 frames; the bar moves ~0.005/frame, not in jumps.
+        assert!(max_step < 0.0075, "max per-frame step {max_step}");
+        // Settles at 100% and hides.
+        let mut hidden = false;
+        for _ in 0..300 {
+            if bar.step(1.0, FRAME).is_none() { hidden = true; break; }
+        }
+        assert!(hidden);
+        assert!(!bar.animating(1.0));
     }
 }
