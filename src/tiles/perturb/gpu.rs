@@ -171,6 +171,12 @@ struct Uniforms {
 struct Reference {
     c:          Complex<FBig>,
     orbit:      Vec<[f32; 2]>,
+    /// The orbit as floatexp seeds (`pack_fe`), for the deep pipeline: a
+    /// deep orbit comes far closer to 0 than f32 reaches (a nucleus of
+    /// period p passes within ~2^-149 and ~2^-271 of 0 at the periods of
+    /// its parents), and flushing those values to 0 there drops the pixel's
+    /// linear term, so pixels shadow the reference and never escape.
+    orbit_fe:   Vec<[f32; 4]>,
     /// The same orbit in f64, for building BLA tables (f64's range keeps
     /// the tiny values near the orbit's zeros that f32 flushes to 0).
     orbit64:    Vec<Complex<f64>>,
@@ -183,11 +189,13 @@ struct Reference {
 impl Reference {
     fn new(c: Complex<FBig>, iterations: usize, period: Option<usize>) -> Self {
         let (exact, orbit) = calculate_orbit(c.clone(), iterations);
+        let orbit64: Vec<Complex<f64>> = exact.orbit.iter()
+            .map(|z| Complex { re: z.re.to_f64().value(), im: z.im.to_f64().value() })
+            .collect();
         Self {
             orbit: orbit.orbit.iter().map(|z| [z.re as f32, z.im as f32]).collect(),
-            orbit64: exact.orbit.iter()
-                .map(|z| Complex { re: z.re.to_f64().value(), im: z.im.to_f64().value() })
-                .collect(),
+            orbit_fe: orbit64.iter().map(|z| pack_fe(z.re, z.im, 0)).collect(),
+            orbit64,
             is_full: orbit.is_full,
             c,
             iterations,
@@ -465,18 +473,23 @@ impl GpuState {
         r
     }
 
-    /// Upload `r` for dispatching pixels with |δ₀| ≤ 2^log2_dc.
-    fn prepare(&self, r: &Reference, log2_dc: f64) -> GpuRef {
-        self.prepare_with(r, log2_dc, USE_BLA)
+    /// Upload `r` for dispatching pixels with |δ₀| ≤ 2^log2_dc at depth
+    /// `upp` (which picks the pipeline, and so the orbit's format).
+    fn prepare(&self, r: &Reference, log2_dc: f64, upp: i64) -> GpuRef {
+        self.prepare_with(r, log2_dc, upp, USE_BLA)
     }
 
-    fn prepare_with(&self, r: &Reference, log2_dc: f64, bla: bool) -> GpuRef {
+    fn prepare_with(&self, r: &Reference, log2_dc: f64, upp: i64, bla: bool) -> GpuRef {
         let table = if bla { BlaTable::build(&r.orbit64, log2_dc) } else { BlaTable::disabled() };
         let buf = |bytes: &[u8]| self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None, contents: bytes, usage: wgpu::BufferUsages::STORAGE,
         });
         GpuRef {
-            orbit_buf:     buf(bytemuck::cast_slice(&r.orbit)),
+            orbit_buf:     if upp < FE_THRESHOLD {
+                buf(bytemuck::cast_slice(&r.orbit_fe))
+            } else {
+                buf(bytemuck::cast_slice(&r.orbit))
+            },
             bla_buf:       buf(bytemuck::cast_slice(&table.entries)),
             orbit_len:     r.orbit.len() as u32,
             is_full:       r.is_full,
@@ -826,7 +839,7 @@ impl Perturbator for Gpu {
             log2_dc(&[(max, 0.0)], upp)
         };
         let t_prep = std::time::Instant::now(); // DIAG
-        let mut gref = state.prepare(&reference, pass_dc(&reference));
+        let mut gref = state.prepare(&reference, pass_dc(&reference), upp);
         log::info!("[diag gpu] pass {pass}: reference uploaded (BLA {} levels) in {:.1} ms", gref.bla_levels, ms(t_prep));
         // DIAG
         {
@@ -883,7 +896,7 @@ impl Perturbator for Gpu {
 
                 let t_gdisp = std::time::Instant::now(); // DIAG
                 let offs    = offsets(&mut glitched.iter().map(|&j| pos + j), &new_ref);
-                let new_gref = state.prepare(&new_ref, log2_dc(&offs, upp));
+                let new_gref = state.prepare(&new_ref, log2_dc(&offs, upp), upp);
                 let new_raw = state.dispatch_offsets(&offs, upp, &new_gref);
                 for (k, &j) in glitched.iter().enumerate() {
                     raw[j] = new_raw[k];
@@ -896,7 +909,7 @@ impl Perturbator for Gpu {
                 // Later chunks start from the better reference.
                 if new_ref.beats(&reference) {
                     reference = new_ref;
-                    gref = state.prepare(&reference, pass_dc(&reference));
+                    gref = state.prepare(&reference, pass_dc(&reference), upp);
                 }
             }
 
@@ -1384,7 +1397,7 @@ mod tests {
         let r = Reference::new(n.c.clone(), v.ctx.iterations, Some(n.period));
         let (rx, ry) = ref_px(&r.c, &v.ctx);
         let offs: Vec<(f64, f64)> = v.pix.iter().map(|&(col, row)| (col as f64 - rx, row as f64 - ry)).collect();
-        let gr = gpu.prepare_with(&r, log2_dc(&offs, g.upp), bla);
+        let gr = gpu.prepare_with(&r, log2_dc(&offs, g.upp), g.upp, bla);
         let out = gpu.dispatch_offsets(&offs, g.upp, &gr);
         (r, out)
     }
@@ -1539,7 +1552,7 @@ mod tests {
         let _ = (rx, ry);
         let gpu = GpuState::new();
         // BLA off: with it this block takes ~20 ms, too short to be killed.
-        let r = gpu.prepare_with(&r, log2_dc(&offs, g.upp), false);
+        let r = gpu.prepare_with(&r, log2_dc(&offs, g.upp), g.upp, false);
         let mut first: Option<Vec<u32>> = None;
         for run in 0..6 {
             let t = std::time::Instant::now();
@@ -1591,7 +1604,7 @@ mod tests {
         let block: Vec<[f32; 4]> = (0..256).flat_map(|j| (0..256).map(move |i| (i, j)))
             .map(|(i, j)| pack_fe((i as f64 - 128.3) * 3.0, (j as f64 - 127.6) * 3.0, g.upp)).collect();
         let gpu = GpuState::new();
-        let r = gpu.prepare_with(&r, v.geom.upp as f64 + 12.0, false); // as measured, before BLA
+        let r = gpu.prepare_with(&r, v.geom.upp as f64 + 12.0, v.geom.upp, false); // as measured, before BLA
         let layout = gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None, bind_group_layouts: &[Some(&gpu.bgl)], immediate_size: 0,
         });
@@ -1650,7 +1663,7 @@ mod tests {
             for bla in [false, true] {
                 let (_, got) = gpu_on_sample_with(&v, &gpu, bla);
                 let (wrong, off50, black) = score(&got, &v.exact);
-                let gr = gpu.prepare_with(&r, log2_dc(&block, g.upp), bla);
+                let gr = gpu.prepare_with(&r, log2_dc(&block, g.upp), g.upp, bla);
                 let run = || -> Vec<u32> { block.chunks(4096).flat_map(|c| gpu.dispatch_offsets(c, g.upp, &gr)).collect() };
                 let _ = run();
                 let t = std::time::Instant::now();
@@ -1663,10 +1676,11 @@ mod tests {
     }
 
     /// BLA must not change results when the reference is an escaping point
-    /// (the fallback when no nucleus is found): 2^-309 view reported
-    /// 2026-09-23 at 262144 iterations came out uniform because every pixel
-    /// jumped through the reference's escape and "escaped" with it. Real
-    /// GPU, BLA on vs off with the same escaping reference; needs a GPU.
+    /// (the fallback when no nucleus is found). Written for the uniform
+    /// 2^-314 view of 2026-09-23 while suspecting BLA jumps through the
+    /// reference's escape; that was not it (see view_2026_09_23c), but the
+    /// check stays. Real GPU, BLA on vs off with the same escaping
+    /// reference; needs a GPU.
     #[test]
     #[ignore]
     fn bla_with_escaping_reference_matches_plain() {
@@ -1688,7 +1702,7 @@ mod tests {
         let offs: Vec<(f64, f64)> = v.pix.iter().map(|&(c, w)| (c as f64 - rx, w as f64 - ry)).collect();
         let gpu = GpuState::new();
         let run = |bla: bool| {
-            let gr = gpu.prepare_with(&r, log2_dc(&offs, g.upp), bla);
+            let gr = gpu.prepare_with(&r, log2_dc(&offs, g.upp), g.upp, bla);
             offs.chunks(1024).flat_map(|c| gpu.dispatch_offsets(c, g.upp, &gr)).collect::<Vec<u32>>()
         };
         let (plain, bla) = (run(false), run(true));
@@ -1706,5 +1720,29 @@ mod tests {
         eprintln!("BLA:   glitched {}, most common {:?}", glitch(&bla), mode(&bla));
         eprintln!("differ {differ}, glitch status differs or off by >50: {far} (of {})", plain.len());
         assert!(far * 100 < plain.len(), "BLA changed {far} results");
+    }
+
+    /// Regression for the view copied 2026-09-23 (2^-313.9, 262144
+    /// iterations): every GPU pixel came out in set (exact: none). The
+    /// nucleus orbit (p=33760) passes within 2^-149 / 2^-271 of 0 every
+    /// 2110 / 4220 steps; uploaded as f32 those values flushed to 0, which
+    /// dropped the 2·X·δ term while δ was smaller still, so pixels shadowed
+    /// the reference. An f64 mirror with the orbit rounded to f32 showed the
+    /// same. Fixed by giving the deep shader a floatexp orbit (before: 600
+    /// of 600 black; after: 139 wrong by f32 rounding, 0 off by >50, 0
+    /// black). Needs a GPU; exact values (~10 s) cached in $DIAG_OUT.
+    #[test]
+    #[ignore]
+    fn view_2026_09_23c_matches_exact() {
+        let clip = "0.3626806181691852804489917225076056798812848870599955358041302416758614320764231653400389334599052087605123550187040027890282,-0.6426879938460872964212498601513047756237090805248048169033884352653961260155207050615760571472782180516346029887216862939575|3.290623677226253e-95";
+        let v = sample_view_cached("c30", clip, 262144, (3000, 2000), (30, 20));
+        let (r, got) = gpu_on_sample(&v, &GpuState::new());
+        let (wrong, off50, black) = score(&got, &v.exact);
+        let exact_black = v.exact.iter().filter(|&&x| x == 0).count();
+        eprintln!("reference {}: wrong {wrong}, off by >50 {off50}, black {black} (exact {exact_black}) of {}", r.describe(), got.len());
+        dump_rgb("c_exact", &v.exact);
+        dump_rgb("c_gpu", &got);
+        assert_eq!(black, exact_black, "pixels shadowed the reference");
+        assert!(off50 * 100 < got.len(), "{off50} pixels off by >50 iterations");
     }
 }

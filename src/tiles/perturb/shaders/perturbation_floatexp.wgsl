@@ -22,6 +22,11 @@
 // log2|z|² taken from the floatexp z in phase 1 (z can be far below f32 there).
 // BLA jumps (perturb_common.wgsl) work in both phases; a jump that leaves δ
 // tiny in phase 2 goes back to phase 1, like any other tiny result.
+//
+// The reference orbit is floatexp too: a deep orbit passes far closer to 0
+// than f32 reaches (~2^-149 and ~2^-271 at 2^-314), and while δ is smaller
+// still, 2·X·δ is what separates the pixel from the reference. Flushed to 0,
+// every pixel shadowed the reference and none escaped (all black at 2^-314).
 
 struct Uniforms {
     pixel_count : u32,
@@ -43,7 +48,8 @@ struct Uniforms {
 @group(0) @binding(0) var<uniform>             uniforms     : Uniforms;
 // floatexp seed: xy = complex mantissa, z = exponent (as f32), w unused.
 @group(0) @binding(1) var<storage, read>       pixel_deltas : array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read>       orbit_data   : array<vec2<f32>>;
+// floatexp reference orbit, same packing as the seeds.
+@group(0) @binding(2) var<storage, read>       orbit_data   : array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> output       : array<u32>;
 
 const GLITCH_BIT : u32 = 0x80000000u;
@@ -53,6 +59,12 @@ const F32_SWITCH_EXP : i32 = -60;
 // 2^-62: below this a phase-2 step goes back to floatexp (δ² stays a normal
 // f32 above it: 2^-124 > 2^-126).
 const F32_MIN_DELTA : f32 = 2.168404344971009e-19;
+
+// Reference orbit value X_m (unnormalized mantissa: fine for fe_to_c).
+fn orbit_raw(m : u32) -> Fe {
+    let o = orbit_data[m];
+    return Fe(o.xy, i32(o.z));
+}
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -95,15 +107,15 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
             if (delta.e > F32_SWITCH_EXP) { break; }
             continue;
         }
-        let c = orbit_data[m];
-        let x = c + fe_to_c(delta);
+        let cf = fe_norm(orbit_raw(m));
+        let x = fe_to_c(cf) + fe_to_c(delta);
         if (dot(x, x) > 4.0) {
             output[idx] = n + 1u;
             return;
         }
         // z in floatexp: X can be ~0 (a nucleus orbit hits 0), where the f32
         // value above has underflowed.
-        let z = fe_add(fe_from_c(c), delta);
+        let z = fe_add(cf, delta);
         if (uniforms.interior_window != 0u) {
             ld += 2.0 + log2(dot(z.m, z.m)) + 2.0 * f32(z.e);
             if (interior_check(n, &ld_prev, &have_prev, &streak, ld)) {
@@ -118,7 +130,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
             bla_reset(&backoff);
         } else {
             // δ_{n+1} = 2 X_n δ_n + δ_n² + δ_0
-            let t1 = fe_mul(delta, fe_from_c(2.0 * c));
+            let t1 = fe_mul(delta, Fe(cf.m, cf.e + 1));
             let t2 = fe_mul(delta, delta);
             delta = fe_add(fe_add(t1, t2), d0);
             m = m + 1u;
@@ -158,7 +170,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
             df = fe_to_c(dn);
             continue;
         }
-        let c = orbit_data[m];
+        let c = fe_to_c(orbit_raw(m));
         let x = c + df;
         let x2 = dot(x, x);
         if (x2 > 4.0) {
@@ -186,6 +198,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
                    + d0f.y;
             next = vec2<f32>(re, im);
         }
+        let m_prev = m;
         m = select(m + 1u, 0u, rebase);
         n = n + 1u;
         if (rebase) { bla_reset(&backoff); }
@@ -193,11 +206,12 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
             // δ is tiny again: redo this step in floatexp (z formed there
             // too, as X + δ may cancel below f32 range) and go back to phase 1.
             let dfe = fe_from_c(df);
+            let cf = fe_norm(orbit_raw(m_prev));
             if (rebase) {
-                let z = fe_add(fe_from_c(c), dfe);
+                let z = fe_add(cf, dfe);
                 delta = fe_add(fe_mul(z, z), d0);
             } else {
-                delta = fe_add(fe_add(fe_mul(dfe, fe_from_c(2.0 * c)), fe_mul(dfe, dfe)), d0);
+                delta = fe_add(fe_add(fe_mul(dfe, Fe(cf.m, cf.e + 1)), fe_mul(dfe, dfe)), d0);
             }
             break;
         }
