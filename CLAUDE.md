@@ -59,6 +59,14 @@ heuristic. A pixel is "glitched" only when the reference orbit ended early
 flagged nearly every pixel at low zoom and produced an "iteration-1 egg". Do not
 re-add it.
 
+**Rebasing** (Zhuoran 2021) is in both GPU shaders: when |z| < |δ|, set
+δ ← z² + δ₀ and restart the reference index at 0 (the X₀ = C form of "δ ← z,
+back to the start"). It is exact, not a heuristic, and removes the blocky
+precision-loss artifacts that appear once the reference is a nucleus the
+pixel's orbit does not follow. The shaders track `n` (iterations, reported)
+and `m` (reference index) separately. `shaders_validate` checks the WGSL with
+naga, since it is otherwise only compiled at runtime.
+
 ## GPU backend (`gpu.rs`)
 
 - For each pass, all needed pixels from all batch tiles are collected in

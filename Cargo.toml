@@ -33,3 +33,6 @@ debug = true
 # opt-level 0 for debuggability.
 [profile.dev.package."*"]
 opt-level = 3
+
+[dev-dependencies]
+naga = { version = "30.0.1", features = ["wgsl-in"] }

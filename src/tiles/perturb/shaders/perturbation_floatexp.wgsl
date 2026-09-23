@@ -6,6 +6,10 @@
 // Two phases per pixel: iterate in floatexp while the delta is tiny; once it
 // grows into the normal f32 range, drop to plain f32 for the rest (the seed
 // delta_0 is negligible by then, exactly as the f64 CPU path treats it).
+//
+// Both phases rebase as in perturbation.wgsl: when |z| < |δ|, δ ← z² + δ_0 and
+// the reference index restarts at 0.  `n` counts iterations, `m` indexes the
+// reference orbit.
 
 struct Uniforms {
     pixel_count : u32,
@@ -34,22 +38,33 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let d0    = fe_norm(Fe(seed.xy, i32(seed.z)));
     var delta = d0;
 
-    var i = 0u;
+    var n = 0u;  // iteration count
+    var m = 0u;  // index into the reference orbit (resets on rebase)
 
     // Phase 1: floatexp while delta is too small for f32.
     loop {
-        if (i >= uniforms.orbit_len) { break; }
-        let c = orbit_data[i];
+        if (n >= uniforms.orbit_len) { break; }
+        let c = orbit_data[m];
         let x = c + fe_to_c(delta);
         if (dot(x, x) > 4.0) {
-            output[idx] = i + 1u;
+            output[idx] = n + 1u;
             return;
         }
-        // δ_{n+1} = 2 X_n δ_n + δ_n² + δ_0
-        let t1 = fe_mul(delta, fe_from_c(2.0 * c));
-        let t2 = fe_mul(delta, delta);
-        delta = fe_add(fe_add(t1, t2), d0);
-        i = i + 1u;
+        // z in floatexp: X can be ~0 (a nucleus orbit hits 0), where the f32
+        // value above has underflowed.
+        let z = fe_add(fe_from_c(c), delta);
+        if (fe_abs_lt(z, delta)) {
+            // Rebase: δ ← z² + δ_0, back to the start of the reference.
+            delta = fe_add(fe_mul(z, z), d0);
+            m = 0u;
+        } else {
+            // δ_{n+1} = 2 X_n δ_n + δ_n² + δ_0
+            let t1 = fe_mul(delta, fe_from_c(2.0 * c));
+            let t2 = fe_mul(delta, delta);
+            delta = fe_add(fe_add(t1, t2), d0);
+            m = m + 1u;
+        }
+        n = n + 1u;
         if (delta.e > F32_SWITCH_EXP) { break; }
     }
 
@@ -57,21 +72,29 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     var df  = fe_to_c(delta);
     let d0f = fe_to_c(d0);
     loop {
-        if (i >= uniforms.orbit_len) { break; }
-        let c = orbit_data[i];
+        if (n >= uniforms.orbit_len) { break; }
+        let c = orbit_data[m];
         let x = c + df;
-        if (dot(x, x) > 4.0) {
-            output[idx] = i + 1u;
+        let x2 = dot(x, x);
+        if (x2 > 4.0) {
+            output[idx] = n + 1u;
             return;
         }
-        let re = 2.0 * c.x * df.x - 2.0 * c.y * df.y
-               + df.x * df.x      - df.y * df.y
-               + d0f.x;
-        let im = 2.0 * c.x * df.y + 2.0 * c.y * df.x
-               + 2.0 * df.x * df.y
-               + d0f.y;
-        df = vec2<f32>(re, im);
-        i = i + 1u;
+        if (x2 < dot(df, df)) {
+            // Rebase: δ ← z² + δ_0, back to the start of the reference.
+            df = vec2<f32>(x.x * x.x - x.y * x.y, 2.0 * x.x * x.y) + d0f;
+            m = 0u;
+        } else {
+            let re = 2.0 * c.x * df.x - 2.0 * c.y * df.y
+                   + df.x * df.x      - df.y * df.y
+                   + d0f.x;
+            let im = 2.0 * c.x * df.y + 2.0 * c.y * df.x
+                   + 2.0 * df.x * df.y
+                   + d0f.y;
+            df = vec2<f32>(re, im);
+            m = m + 1u;
+        }
+        n = n + 1u;
     }
 
     if (uniforms.is_full != 0u) {

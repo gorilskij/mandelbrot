@@ -798,6 +798,22 @@ impl Perturbator for Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WGSL is only compiled at runtime (when the GPU backend starts), so
+    /// check here that both perturbation shaders parse and validate.
+    #[test]
+    fn shaders_validate() {
+        for (name, src) in [
+            ("perturbation", SHADER_SRC.to_string()),
+            ("perturbation_floatexp", format!("{FE_HELPERS}\n{SHADER_FE_BODY}")),
+        ] {
+            let module = naga::front::wgsl::parse_str(&src)
+                .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::default())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+    }
     use crate::rendering::{CoordinatesBox, View};
     use crate::support::Point;
     use crate::tiles::perturb::nucleus::newton_nucleus;
@@ -810,9 +826,10 @@ mod tests {
     /// perturbation against it must reproduce exact per-pixel escape counts
     /// with no glitches.
     ///
-    /// The perturbation here runs in f64 so that it tests the reference, not
-    /// the working float: in f32 (what the GPU uses) ~30% of these long-lived
-    /// near-boundary pixels get a different count — see
+    /// The perturbation here mirrors the shaders (with rebasing) but runs in
+    /// f64, so that it tests the reference, not the working float: in f32
+    /// (what the GPU uses) ~12% of these long-lived near-boundary pixels get
+    /// a different count (~30% without rebasing) — see
     /// `diag_reference_precision`.
     #[test]
     fn nucleus_reference_matches_exact_orbits() {
@@ -876,7 +893,7 @@ mod tests {
             assert!((dx - ex).abs() < 1e-6 && (dy - ey).abs() < 1e-6, "offset ({dx},{dy}) vs ({ex},{ey})");
 
             let scale = (upp as f64).exp2();
-            let got   = perturb::<f64>(&ref_orbit.orbit, (dx * scale, dy * scale), ref_orbit.is_full).0
+            let got   = perturb_rebase::<f64>(&ref_orbit.orbit, (dx * scale, dy * scale), ref_orbit.is_full).0
                 .expect("no glitch with a full reference");
             let (_, own) = calculate_orbit(exact, iters);
             let want  = check_orbit(&own).unwrap().map(|n| n.get());
@@ -893,23 +910,32 @@ mod tests {
         perturb_x::<F>(orbit, d0, full, false)
     }
 
-    /// f32 delta arithmetic, reference as a hi+lo f32 pair: the 2·X·δ term is
-    /// 2·(hi·δ + lo·δ).
-    fn perturb_hilo(orbit: &[Complex<FBig>], d0: (f64, f64), full: bool) -> Result<Option<usize>, ()> {
-        let split = |v: f64| { let hi = v as f32; (hi, (v - hi as f64) as f32) };
-        let x: Vec<(Complex<f32>, Complex<f32>)> = orbit.iter().map(|c| {
-            let (rh, rl) = split(c.re.to_f64().value());
-            let (ih, il) = split(c.im.to_f64().value());
-            (Complex { re: rh, im: ih }, Complex { re: rl, im: il })
+    /// Perturbation with rebasing (Zhuoran): when |z| < |δ|, restart against
+    /// the start of the reference orbit.  In the X_0 = C convention the next
+    /// value is z² + c = X_0 + (z² + δ₀), so δ ← z² + δ₀ at index 0.
+    fn perturb_rebase<F: num::Float>(orbit: &[Complex<FBig>], d0: (f64, f64), full: bool) -> (Result<Option<usize>, ()>, usize) {
+        let x: Vec<Complex<F>> = orbit.iter().map(|c| Complex {
+            re: F::from(c.re.to_f64().value()).unwrap(), im: F::from(c.im.to_f64().value()).unwrap(),
         }).collect();
-        let d0 = Complex { re: d0.0 as f32, im: d0.1 as f32 };
-        let mut d = d0;
-        for (i, &(hi, lo)) in x.iter().enumerate() {
-            let z = hi + d;
-            if z.norm_sqr() > 4.0 { return Ok(Some(i + 1)); }
-            d = (hi * d + lo * d) * 2.0 + d * d + d0;
+        let d0 = Complex { re: F::from(d0.0).unwrap(), im: F::from(d0.1).unwrap() };
+        let two = F::from(2.0).unwrap();
+        let (mut d, mut m, mut rebases) = (d0, 0usize, 0usize);
+        let n = orbit.len() - 1; // iterations: orbit holds X_0..=X_n when full
+        for i in 0..orbit.len() {
+            let z = x[m] + d;
+            if z.norm_sqr() > F::from(4.0).unwrap() { return (Ok(Some(i + 1)), rebases); }
+            if i == n { break; }
+            if z.norm_sqr() < d.norm_sqr() {
+                d = z * z + d0;
+                m = 0;
+                rebases += 1;
+            } else {
+                d = x[m] * d * two + d * d + d0;
+                m += 1;
+                if m >= x.len() { return (if full { Ok(None) } else { Err(()) }, rebases); }
+            }
         }
-        if full { Ok(None) } else { Err(()) }
+        (if full { Ok(None) } else { Err(()) }, rebases)
     }
 
     /// As `perturb`, optionally rounding the reference orbit to f32 first.
@@ -934,7 +960,9 @@ mod tests {
 
     /// Measurement, not a pass/fail test: escape-count accuracy of
     /// perturbation against the nucleus vs the (escaping) view-centre
-    /// reference, in f32 / f64 / mixed.  Run with `--ignored --nocapture`.
+    /// reference, in f32 / f64, with and without rebasing.  Run with
+    /// `--ignored --nocapture`.  Measured 2026-09-23 (nucleus, 256 px):
+    /// f32 76 wrong, f64 1, f32+rebase 30, f64+rebase 0.
     #[test]
     #[ignore]
     fn diag_reference_precision() {
@@ -972,14 +1000,15 @@ mod tests {
             let (orbit, _) = calculate_orbit(refc.clone(), iters);
             let (rx, ry) = ref_px(&refc, &ctx);
             let scale = (upp as f64).exp2();
-            for fname in ["f32", "f64", "f64 δ + f32 X", "f32 δ + hi/lo X"] {
+            for fname in ["f32", "f64", "f32 rebase", "f64 rebase"] {
                 let (mut wrong, mut glitched, mut pd, mut wrong_pd) = (0, 0, 0, 0);
                 for (k, &(col, row)) in pix.iter().enumerate() {
                     let d0 = ((col as f64 - rx) * scale, (row as f64 - ry) * scale);
                     let (res, p) = match fname {
                         "f32" => perturb::<f32>(&orbit.orbit, d0, orbit.is_full),
                         "f64" => perturb::<f64>(&orbit.orbit, d0, orbit.is_full),
-                        "f32 δ + hi/lo X" => (perturb_hilo(&orbit.orbit, d0, orbit.is_full), false),
+                        "f32 rebase" => (perturb_rebase::<f32>(&orbit.orbit, d0, orbit.is_full).0, false),
+                        "f64 rebase" => (perturb_rebase::<f64>(&orbit.orbit, d0, orbit.is_full).0, false),
                         _     => perturb_x::<f64>(&orbit.orbit, d0, orbit.is_full, true),
                     };
                     if p { pd += 1; }

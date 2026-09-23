@@ -45,6 +45,13 @@ fn fe_add(a : Fe, b : Fe) -> Fe {
     return fe_norm(Fe(b.m + ldexp(a.m, vec2<i32>(s, s)), b.e));
 }
 
+// |a| < |b|, compared as log2 of the squared magnitude (the exponents are far
+// outside f32 range, so the values themselves cannot be formed). Zero has
+// log2(0) = -inf and so is smaller than everything else.
+fn fe_abs_lt(a : Fe, b : Fe) -> bool {
+    return log2(dot(a.m, a.m)) + 2.0 * f32(a.e) < log2(dot(b.m, b.m)) + 2.0 * f32(b.e);
+}
+
 // Complex multiply.
 fn fe_mul(a : Fe, b : Fe) -> Fe {
     let m = vec2<f32>(
