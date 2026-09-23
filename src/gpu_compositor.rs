@@ -713,6 +713,11 @@ impl GpuCompositor {
     }
 }
 
+#[cfg(test)]
+pub fn color_of_for_tests(iteration: u32, palette: &mut Vec<u32>) -> u32 {
+    color_of(iteration, palette)
+}
+
 /// Colour (0x00RRGGBB) of a stored pixel value: the escape iteration, 0 for
 /// in the set. Looked up in `palette`, which grows as needed.
 fn color_of(iteration: u32, palette: &mut Vec<u32>) -> u32 {

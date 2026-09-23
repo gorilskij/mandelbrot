@@ -131,8 +131,15 @@ are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
   Double-single (hi+lo f32) would **not** help, because it keeps the f32 exponent range.
 - Fix: shared-exponent complex **floatexp** (`Fe { m: vec2<f32>, e: i32 }`, in
   `shaders/floatexp.wgsl`). The deep shader `perturbation_floatexp.wgsl` works in
-  two phases: iterate δ in floatexp until `e > -100`, then continue in plain f32
-  (δ₀ is negligible by that point).
+  two phases: iterate δ in floatexp until `e > -60`, then continue in plain f32
+  (δ₀ is negligible there). **δ can become tiny again**: at a zero of the
+  reference orbit (a nucleus orbit hits 0 once per period, where 2·X·δ
+  vanishes and δ ← δ² + δ₀) and after a rebase. A phase-2 step whose result
+  would drop below 2⁻⁶² is therefore redone in floatexp and the pixel returns
+  to phase 1. Switching at 2⁻¹⁰⁰ without that fallback let δ underflow to
+  exactly 0, and pixels followed the reference forever (black octagons and
+  smeared streaks at 2⁻²²⁰; `artifact_view_2026_09_23_matches_exact`,
+  ignored, needs a GPU, runs the real shader against exact orbits).
 - The pipeline is chosen per pass: `use_fe = upp_log2(depth) < FE_THRESHOLD (-100)`.
   The shallow f32 pipeline is left untouched.
 - `pack_fe(dx, dy, base_exp)`: seeds are built in **pixel units** (O(1e4), so the

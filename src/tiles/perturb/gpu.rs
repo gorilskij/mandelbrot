@@ -1209,4 +1209,79 @@ mod tests {
             }
         }
     }
+
+    /// Regression for the artifact view reported on 2026-09-23 (Cmd-C
+    /// string): black octagon and smeared streaks at 2^-220, 32768
+    /// iterations. The floatexp shader switched to f32 at δ ≈ 2^-100; at the
+    /// nucleus orbit's zero points δ ← δ² + δ₀ then underflowed to exactly 0
+    /// and pixels followed the reference forever. Renders a 150x100 sample of
+    /// the 3000x2000 view with the real shader on this machine's GPU and
+    /// compares with exact orbits (before the fix: 8461 wrong, 515 black;
+    /// after: 1184 wrong, all by f32 rounding, 0 black). Needs a GPU and
+    /// ~15 s: run with `--ignored`. With DIAG_OUT=dir it also writes the two
+    /// renders as raw RGB (150x100) for viewing.
+    #[test]
+    #[ignore]
+    fn artifact_view_2026_09_23_matches_exact() {
+        let clip = "0.36268061816918528044899172250760567988128488705999553580413024078293361870845608332075349484941,-0.64268799384608729642124986015130477562370908052480481690338843577039749867381572196329048271251|6.226537747227718e-67";
+        let coords: CoordinatesBox = clip.parse().unwrap();
+        let iters = 32768;
+        let (w, h) = (3000usize, 2000usize); // 1500x1000 logical at 2x
+        let (iw, ih) = (150usize, 100usize);
+        let view  = coords.view.inner;
+        let depth = crate::tiles::store::depth_for_view(view);
+        let prec  = working_precision(depth);
+        let ctx = PassBatchCtx {
+            coords: coords.clone(), depth,
+            x0: tile_index(&coords.origin.x, depth), y0: tile_index(&coords.origin.y, depth),
+            width: w, height: h, iterations: iters, progress: Default::default(),
+        };
+        let g = ViewGeom::new(&ctx);
+        let n = find_nucleus(&g.center, &g.radius, g.upp, iters, g.prec, &|| false).unwrap().expect("nucleus");
+        let r = Reference::new(n.c.clone(), iters, Some(n.period));
+        let (rx, ry) = ref_px(&r.c, &ctx);
+        let ts = IBig::from(TILE_SIZE as u64);
+        let (gx0, gy0) = (&ctx.x0 * &ts, &ctx.y0 * &ts);
+        let ratio = view / (g.upp as f64).exp2();
+        let o00 = crate::tiles::store::TileKey { depth, x: ctx.x0.clone(), y: ctx.y0.clone() }.origin();
+        let sx0 = (&o00.x - &coords.origin.x).to_f64().value() / view;
+        let sy0 = (&o00.y - &coords.origin.y).to_f64().value() / view;
+        let pix: Vec<(i64, i64)> = (0..ih).flat_map(|j| (0..iw).map(move |i| (i, j)))
+            .map(|(i, j)| {
+                let sx = (i as f64 + 0.5) * w as f64 / iw as f64;
+                let sy = (j as f64 + 0.5) * h as f64 / ih as f64;
+                (((sx - sx0) * ratio).round() as i64, ((sy - sy0) * ratio).round() as i64)
+            }).collect();
+
+        let exact: Vec<u32> = pix.par_iter().map(|&(col, row)| {
+            let c = Complex {
+                re: pixel_to_coord(&gx0 + IBig::from(col), depth, prec),
+                im: pixel_to_coord(&gy0 + IBig::from(row), depth, prec),
+            };
+            check_orbit(&calculate_orbit(c, iters).1).unwrap().map_or(0, |v| v.get() as u32)
+        }).collect();
+        let offs: Vec<(f64, f64)> = pix.iter().map(|&(col, row)| (col as f64 - rx, row as f64 - ry)).collect();
+        let gpu = GpuState::new();
+        let real = gpu.dispatch_offsets(&offs, g.upp, &r);
+
+        let wrong = real.iter().zip(&exact).filter(|(a, b)| a != b).count();
+        let off50 = real.iter().zip(&exact).filter(|(a, b)| a.abs_diff(**b) > 50).count();
+        let black = real.iter().filter(|&&v| v == 0).count();
+        eprintln!("GPU vs exact over {} px: wrong {wrong}, off by >50 {off50}, black {black} (exact black {})",
+            real.len(), exact.iter().filter(|&&v| v == 0).count());
+
+        if let Ok(out) = std::env::var("DIAG_OUT") {
+            let mut palette = vec![];
+            for (name, vals) in [("exact", &exact), ("gpu", &real)] {
+                let rgb: Vec<u8> = vals.iter().flat_map(|&v| {
+                    let c = crate::gpu_compositor::color_of_for_tests(v, &mut palette);
+                    [(c >> 16) as u8, (c >> 8) as u8, c as u8]
+                }).collect();
+                std::fs::write(format!("{out}/{name}.rgb"), rgb).unwrap();
+            }
+        }
+        assert_eq!(black, 0, "pixels lost their delta and followed the reference");
+        assert!(wrong * 10 < real.len(), "{wrong} wrong: more than f32 rounding");
+        assert!(off50 * 100 < real.len(), "{off50} pixels off by >50 iterations");
+    }
 }

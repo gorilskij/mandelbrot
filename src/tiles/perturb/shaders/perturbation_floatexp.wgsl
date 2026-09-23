@@ -4,8 +4,17 @@
 // zoom passes the f32 exponent floor.
 //
 // Two phases per pixel: iterate in floatexp while the delta is tiny; once it
-// grows into the normal f32 range, drop to plain f32 for the rest (the seed
-// delta_0 is negligible by then, exactly as the f64 CPU path treats it).
+// is comfortably inside the f32 range (> 2^F32_SWITCH_EXP), continue in plain
+// f32, where delta_0 is negligible (and underflows to 0).
+//
+// δ can become tiny again, though: at a zero of the reference orbit (a
+// nucleus orbit hits 0 once per period) the 2·X·δ term vanishes and
+// δ ← δ² + δ₀, and a rebase sets δ ← z² + δ₀. In f32 both terms would
+// underflow to exactly 0 and the pixel would silently follow the reference
+// forever (a nucleus: never escapes). So a phase-2 step whose result would
+// drop below F32_MIN_DELTA is redone in floatexp and the pixel goes back to
+// phase 1. (Seen as black octagons and smeared streaks at 2^-220 while
+// switching at 2^-100.)
 //
 // Both phases rebase as in perturbation.wgsl: when |z| < |δ|, δ ← z² + δ_0 and
 // the reference index restarts at 0.  `n` counts iterations, `m` indexes the
@@ -33,7 +42,10 @@ struct Uniforms {
 const GLITCH_BIT : u32 = 0x80000000u;
 // Once the delta's exponent exceeds this it is safely a normal f32, so we can
 // finish in plain f32. 2^-100 is far above the f32 floor (2^-126).
-const F32_SWITCH_EXP : i32 = -100;
+const F32_SWITCH_EXP : i32 = -60;
+// 2^-62: below this a phase-2 step goes back to floatexp (δ² stays a normal
+// f32 above it: 2^-124 > 2^-126).
+const F32_MIN_DELTA : f32 = 2.168404344971009e-19;
 
 // At the end of each interior window, update the contraction streak; true
 // once enough consecutive windows contracted (pixel is in the set).
@@ -66,6 +78,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     var have_prev = false;
     var streak = 0u;
 
+    loop {
     // Phase 1: floatexp while delta is too small for f32.
     loop {
         if (n >= uniforms.orbit_len) { break; }
@@ -100,7 +113,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         if (delta.e > F32_SWITCH_EXP) { break; }
     }
 
-    // Phase 2: plain f32 (delta now normal; d0 underflows to ~0, as on the CPU).
+    if (n >= uniforms.orbit_len) { break; }
+
+    // Phase 2: plain f32 (delta now normal; d0 underflows to ~0).
     var df  = fe_to_c(delta);
     let d0f = fe_to_c(d0);
     loop {
@@ -119,10 +134,11 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
                 return;
             }
         }
-        if (x2 < dot(df, df)) {
+        let rebase = x2 < dot(df, df);
+        var next : vec2<f32>;
+        if (rebase) {
             // Rebase: δ ← z² + δ_0, back to the start of the reference.
-            df = vec2<f32>(x.x * x.x - x.y * x.y, 2.0 * x.x * x.y) + d0f;
-            m = 0u;
+            next = vec2<f32>(x.x * x.x - x.y * x.y, 2.0 * x.x * x.y) + d0f;
         } else {
             let re = 2.0 * c.x * df.x - 2.0 * c.y * df.y
                    + df.x * df.x      - df.y * df.y
@@ -130,10 +146,25 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
             let im = 2.0 * c.x * df.y + 2.0 * c.y * df.x
                    + 2.0 * df.x * df.y
                    + d0f.y;
-            df = vec2<f32>(re, im);
-            m = m + 1u;
+            next = vec2<f32>(re, im);
         }
+        m = select(m + 1u, 0u, rebase);
         n = n + 1u;
+        if (max(abs(next.x), abs(next.y)) < F32_MIN_DELTA) {
+            // δ is tiny again: redo this step in floatexp (z formed there
+            // too, as X + δ may cancel below f32 range) and go back to phase 1.
+            let dfe = fe_from_c(df);
+            if (rebase) {
+                let z = fe_add(fe_from_c(c), dfe);
+                delta = fe_add(fe_mul(z, z), d0);
+            } else {
+                delta = fe_add(fe_add(fe_mul(dfe, fe_from_c(2.0 * c)), fe_mul(dfe, dfe)), d0);
+            }
+            break;
+        }
+        df = next;
+    }
+    if (n >= uniforms.orbit_len) { break; }
     }
 
     if (uniforms.is_full != 0u) {
