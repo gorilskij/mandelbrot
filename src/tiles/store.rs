@@ -238,8 +238,9 @@ pub struct TileStore {
     map: FlurryMap<TileKey, Arc<Tile>>,
     /// display frame counter, bumped by the compositor (drives LRU)
     frame: AtomicU64,
-    /// bumped whenever a render pass completes (tells the drawer to recompose)
-    progress: AtomicU64,
+    /// bumped whenever rendered pixels become displayable (tells the drawer
+    /// to recompose); shared with backends so they can report partial passes
+    progress: Arc<AtomicU64>,
     /// current render generation
     generation: AtomicU64,
     /// TEST: set by spacebar; the next render dumps everything and restarts
@@ -252,7 +253,7 @@ impl TileStore {
         Self {
             map: FlurryMap::new(),
             frame: AtomicU64::new(0),
-            progress: AtomicU64::new(0),
+            progress: Arc::new(AtomicU64::new(0)),
             generation: AtomicU64::new(0),
             reset: AtomicBool::new(false),
             max_tiles: (memory_budget_bytes / TILE_BYTES).max(64),
@@ -300,6 +301,12 @@ impl TileStore {
 
     pub fn progress(&self) -> u64 {
         self.progress.load(Ordering::Acquire)
+    }
+
+    /// Shared handle on the progress counter, for backends that finish
+    /// tiles part-way through a pass.
+    pub fn progress_counter(&self) -> Arc<AtomicU64> {
+        self.progress.clone()
     }
 
     pub fn next_frame(&self) -> u64 {

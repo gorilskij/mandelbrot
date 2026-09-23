@@ -22,7 +22,7 @@ use gpu::Gpu;
 use num::Complex;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use waker_interrupter::MultiInterrupter;
 
@@ -51,6 +51,9 @@ pub struct PassBatchCtx {
     pub width:      usize,
     pub height:     usize,
     pub iterations: usize,
+    /// The store's progress counter: bump it after finishing tiles
+    /// mid-pass so the compositor picks them up.
+    pub progress:   Arc<AtomicU64>,
 }
 
 /// One tile's entry in a batch.

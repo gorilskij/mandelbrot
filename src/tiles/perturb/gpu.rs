@@ -1,11 +1,17 @@
 //! GPU perturbation backend.
 //!
-//! For each progressive pass all visible tiles that still need it are batched
-//! into a single GPU compute dispatch.  Pixels that the perturbation
-//! approximation cannot resolve (glitches) are re-dispatched in subsequent
-//! passes with a new high-precision reference orbit, up to MAX_GLITCH_PASSES
-//! times.  Residual glitches are then resolved exactly on the CPU (in
-//! parallel, interruptibly); any left unresolved are not stored.
+//! For each progressive pass the pixels of all visible tiles that still need
+//! it are collected in cursor order and dispatched in chunks sized to take
+//! about TARGET_CHUNK_MS each, with an interrupt check between chunks
+//! (in-flight GPU work cannot be cancelled).  After each chunk its results
+//! are stored and every tile whose pixels are all done finishes the pass, so
+//! the image fills in outward from the cursor.
+//!
+//! Pixels that outlive the reference orbit (glitches) are re-dispatched
+//! against a better reference, up to MAX_GLITCH_PASSES times per chunk.
+//! Residual glitches are then resolved exactly on the CPU (in parallel,
+//! interruptibly); any left unresolved are not stored, and their tiles stay
+//! unfinished so the next generation retries them.
 //!
 //! References
 //! ----------
@@ -38,6 +44,7 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use waker_interrupter::MultiInterrupter;
 use wgpu::util::DeviceExt;
 
@@ -63,6 +70,15 @@ const MAX_GLITCH_PASSES: usize = 8;
 /// Glitched pixels whose exact orbits are computed (in parallel) to pick the
 /// next reference in a glitch round.
 const GLITCH_CANDIDATES: usize = 32;
+
+/// Target GPU time per dispatch.  In-flight work cannot be cancelled, so this
+/// bounds how long an interrupt waits; each dispatch also costs ~0.8 ms of
+/// fixed overhead, so much smaller chunks would waste GPU time.
+const TARGET_CHUNK_MS: f64 = 30.0;
+
+/// Floor on chunk size, so a bad cost estimate can never produce tiny,
+/// overhead-dominated dispatches.
+const MIN_CHUNK_PX: usize = 65_536;
 
 /// Use the floatexp pipeline once units-per-pixel drops below 2^FE_THRESHOLD.
 /// The f32 seed starts breaking down near 2^-126; -100 leaves a safe margin
@@ -201,6 +217,8 @@ pub struct GpuState {
     /// (centre, radius, iterations) of the last view whose centre-seeded
     /// nucleus search failed, so the passes of one view search only once.
     failed_search: Mutex<Option<(Complex<FBig>, FBig, usize)>>,
+    /// Measured cost of the last chunk, in ms per pixel; sizes the next one.
+    ms_per_px:   Mutex<f64>,
 }
 
 impl GpuState {
@@ -263,6 +281,7 @@ impl GpuState {
                 device, queue, pipeline, pipeline_fe, bgl, max_binding,
                 reference: Mutex::new(None),
                 failed_search: Mutex::new(None),
+                ms_per_px: Mutex::new(1e-4),
             }
         })
     }
@@ -357,6 +376,19 @@ impl GpuState {
         });
         if !keep { *cache = Some(r.clone()); }
         r
+    }
+
+    /// Pixels for the next chunk, from the last measured cost.
+    fn chunk_len(&self) -> usize {
+        ((TARGET_CHUNK_MS / *self.ms_per_px.lock()) as usize).max(MIN_CHUNK_PX)
+    }
+
+    /// Record a chunk's measured cost.  Tail chunks much smaller than the
+    /// floor are dominated by fixed overhead and would skew the estimate.
+    fn record_chunk(&self, n_px: usize, ms: f64) {
+        if n_px >= MIN_CHUNK_PX / 4 {
+            *self.ms_per_px.lock() = (ms / n_px as f64).max(1e-7);
+        }
     }
 
     /// Dispatch pixels given as offsets from `r` in pixel units.
@@ -581,7 +613,9 @@ impl Perturbator for Gpu {
         let use_fe = upp < FE_THRESHOLD;
 
         // ----------------------------------------------------------------
-        // Collect all pixels that need computing this pass.
+        // Collect all pixels that need computing this pass, in tile order.
+        // Tiles arrive sorted by distance from the cursor, so each tile's
+        // pixels are contiguous and chunks fill in outward from the cursor.
         // ----------------------------------------------------------------
         let mut pixel_refs: Vec<PixelRef> = Vec::new();
 
@@ -606,9 +640,22 @@ impl Perturbator for Gpu {
             }
         }
 
-        // All pixels already computed (e.g. retrying after an interrupt).
+        // A tile finishes this pass as soon as every pixel it needed has been
+        // stored — possibly mid-pass, so progress shows chunk by chunk.  A
+        // pixel left glitched is never stored, so its tile stays unfinished
+        // and the next generation retries it (never cache a guess).  Tiles
+        // that have not finished the previous pass cannot finish this one.
+        let mut remaining = vec![0usize; tiles.len()];
+        for pr in &pixel_refs { remaining[pr.tile_idx] += 1; }
+        let finish = |ti: usize| {
+            let tile = &tiles[ti].tile;
+            if tile.passes_done() >= pass { tile.finish_pass(pass + 1); }
+        };
+        for (ti, &n) in remaining.iter().enumerate() {
+            if n == 0 { finish(ti); }
+        }
         if pixel_refs.is_empty() {
-            for item in tiles { item.tile.finish_pass(pass + 1); }
+            ctx.progress.fetch_add(1, Ordering::Release);
             return;
         }
 
@@ -620,157 +667,136 @@ impl Perturbator for Gpu {
                 (pr.col as f64 - rx, pr.row as f64 - ry)
             }).collect()
         };
-
-        // ----------------------------------------------------------------
-        // Initial dispatch against the view's reference (ideally a nucleus,
-        // whose orbit never escapes, so nothing glitches).
-        // ----------------------------------------------------------------
+        // Exact coordinate of a pixel, for CPU-side orbits.
+        let ts = IBig::from(TILE_SIZE as u64);
         let geom = ViewGeom::new(ctx);
-        let t_collect = ms(t_pass); // DIAG
+        let pixel_coord = |i: usize| {
+            let pr   = &pixel_refs[i];
+            let tile = &tiles[pr.tile_idx].tile;
+            let c    = pr.pixel_idx % TILE_SIZE;
+            let r    = pr.pixel_idx / TILE_SIZE;
+            Complex {
+                re: pixel_to_coord(&tile.key.x * &ts + IBig::from(c as u64), ctx.depth, geom.prec),
+                im: pixel_to_coord(&tile.key.y * &ts + IBig::from(r as u64), ctx.depth, geom.prec),
+            }
+        };
+
+        // ----------------------------------------------------------------
+        // Reference for the view: ideally a nucleus, whose orbit never
+        // escapes, so nothing glitches.
+        // ----------------------------------------------------------------
         let t_ref = std::time::Instant::now(); // DIAG
-        let Some(reference) = state.initial_reference(ctx, &geom, int) else { return };
-        let t_ref = ms(t_ref); // DIAG
-
-        let t_disp = std::time::Instant::now(); // DIAG
-        let offs = offsets(&mut (0..pixel_refs.len()), &reference);
-        let mut raw = state.dispatch_offsets(&offs, upp, &reference);
-
-        let t_disp = ms(t_disp); // DIAG
-        log::info!(
-            "[diag gpu] pass {pass} timing: collect {} px {t_collect:.1} ms, reference {t_ref:.1} ms, \
-             initial dispatch {t_disp:.1} ms",
-            pixel_refs.len(),
-        );
+        let Some(mut reference) = state.initial_reference(ctx, &geom, int) else { return };
         // DIAG
         {
             let (rx, ry) = ref_px(&reference.c, ctx);
             log::info!(
-                "[diag gpu] pass {pass} depth {} upp 2^{upp} view {view:.4e} pipe {} | ref {} at px ({rx:.3}, {ry:.3}) | \
-                 off[0]={:?} off[last]={:?}",
-                ctx.depth, if use_fe { "fe" } else { "f32" }, reference.describe(),
-                offs[0], offs[offs.len() - 1],
+                "[diag gpu] pass {pass} depth {} upp 2^{upp} view {view:.4e} pipe {} | {} px | \
+                 ref {} at px ({rx:.3}, {ry:.3}) in {:.1} ms",
+                ctx.depth, if use_fe { "fe" } else { "f32" }, pixel_refs.len(),
+                reference.describe(), ms(t_ref),
             );
-            log::info!("[diag gpu] pass {pass} initial: {}", raw_stats(&raw));
         }
 
         // ----------------------------------------------------------------
-        // Glitch-correction passes: a pixel is glitched only when it outlived
-        // the reference's (escaping) orbit.  Re-dispatch those against a
-        // longer-lived reference chosen among them.
+        // Chunks: each dispatch is sized to take about TARGET_CHUNK_MS, so the
+        // interrupt is honoured within that time (in-flight GPU work cannot
+        // be cancelled) and results reach the screen as they arrive.
         // ----------------------------------------------------------------
-        for round in 0..MAX_GLITCH_PASSES {
+        let mut pos    = 0;
+        let mut chunks = 0usize; // DIAG
+        while pos < pixel_refs.len() {
             if int.interrupted() { break; }
+            let len   = state.chunk_len().min(pixel_refs.len() - pos);
+            let chunk = pos..pos + len;
 
-            let glitch_indices: Vec<usize> = raw.iter().enumerate()
-                .filter(|&(_, &r)| r & GLITCH_BIT != 0)
-                .map(|(i, _)| i)
-                .collect();
-            if glitch_indices.is_empty() { break; }
-
-            // Candidates spread evenly over the glitched pixels.
-            let ts   = IBig::from(TILE_SIZE as u64);
-            let step = glitch_indices.len().div_ceil(GLITCH_CANDIDATES);
-            let candidates = glitch_indices.iter().step_by(step).map(|&gi| {
-                let pr   = &pixel_refs[gi];
-                let tile = &tiles[pr.tile_idx].tile;
-                let c    = pr.pixel_idx % TILE_SIZE;
-                let r    = pr.pixel_idx / TILE_SIZE;
-                Complex {
-                    re: pixel_to_coord(&tile.key.x * &ts + IBig::from(c as u64), ctx.depth, geom.prec),
-                    im: pixel_to_coord(&tile.key.y * &ts + IBig::from(r as u64), ctx.depth, geom.prec),
-                }
-            }).collect();
-
-            let t_gref = std::time::Instant::now(); // DIAG
-            let Some(new_ref) = state.glitch_reference(ctx, &geom, candidates, int) else { break };
-            let t_gref = ms(t_gref); // DIAG
-
-            let t_gdisp = std::time::Instant::now(); // DIAG
-            let offs    = offsets(&mut glitch_indices.iter().copied(), &new_ref);
-            let new_raw = state.dispatch_offsets(&offs, upp, &new_ref);
-            for (j, &gi) in glitch_indices.iter().enumerate() {
-                raw[gi] = new_raw[j];
-            }
+            let t_disp = std::time::Instant::now();
+            let offs   = offsets(&mut chunk.clone(), &reference);
+            let mut raw = state.dispatch_offsets(&offs, upp, &reference);
+            let disp_ms = ms(t_disp);
+            state.record_chunk(len, disp_ms);
             log::info!(
-                "[diag gpu] pass {pass} glitch round {round}: {} glitched, new ref {} \
-                 (reference {t_gref:.1} ms, dispatch {:.1} ms) -> {}",
-                glitch_indices.len(), new_ref.describe(), ms(t_gdisp),
-                raw_stats(&new_raw),
+                "[diag gpu] pass {pass} chunk {chunks}: {len} px at {pos} in {disp_ms:.1} ms -> {}",
+                raw_stats(&raw),
             );
-        }
 
-        // ----------------------------------------------------------------
-        // Resolve any residual glitches exactly on the CPU.
-        //
-        // Each residual pixel gets its own exact orbit, so this can be slow
-        // (thousands of residuals at ~1 ms each when every reference escapes
-        // early).  It runs across the rayon pool and checks the interrupt per
-        // pixel, so a stale view is abandoned promptly.  Pixels left
-        // unresolved keep GLITCH_BIT and are not stored below, so the next
-        // generation retries them; the ones that did resolve are exact and
-        // safe to cache.
-        // ----------------------------------------------------------------
-        if !int.interrupted() {
-            let residual: Vec<usize> = raw.iter().enumerate()
-                .filter(|&(_, &r)| r & GLITCH_BIT != 0)
-                .map(|(i, _)| i)
-                .collect();
-            if !residual.is_empty() {
-                log::info!("[diag gpu] pass {pass}: resolving {} residual glitches on CPU", residual.len());
-            }
-            let ts   = IBig::from(TILE_SIZE as u64);
-            let prec = working_precision(ctx.depth);
-            let t_resid = std::time::Instant::now(); // DIAG
-            let resolved: Vec<(usize, u32)> = residual.par_iter()
-                .filter_map(|&i| {
-                    if int.interrupted() { return None; }
-                    let pr   = &pixel_refs[i];
-                    let tile = &tiles[pr.tile_idx].tile;
-                    let c    = pr.pixel_idx % TILE_SIZE;
-                    let rr   = pr.pixel_idx / TILE_SIZE;
-                    let coord = Complex {
-                        re: pixel_to_coord(&tile.key.x * &ts + IBig::from(c as u64),  ctx.depth, prec),
-                        im: pixel_to_coord(&tile.key.y * &ts + IBig::from(rr as u64), ctx.depth, prec),
-                    };
-                    let (_, orbit) = calculate_orbit(coord, ctx.iterations);
-                    Some((i, check_orbit(&orbit).unwrap().map_or(0, |n| n.get() as u32)))
-                })
-                .collect();
-            if !residual.is_empty() {
+            // Glitch rounds: a pixel is glitched only when it outlived the
+            // reference's (escaping) orbit.  Re-dispatch those against a
+            // longer-lived reference chosen among them.
+            for round in 0..MAX_GLITCH_PASSES {
+                if int.interrupted() { break; }
+                let glitched: Vec<usize> = raw.iter().enumerate()
+                    .filter(|&(_, &r)| r & GLITCH_BIT != 0)
+                    .map(|(j, _)| j)
+                    .collect();
+                if glitched.is_empty() { break; }
+
+                // Candidates spread evenly over the glitched pixels.
+                let step = glitched.len().div_ceil(GLITCH_CANDIDATES);
+                let candidates = glitched.iter().step_by(step).map(|&j| pixel_coord(pos + j)).collect();
+
+                let t_gref = std::time::Instant::now(); // DIAG
+                let Some(new_ref) = state.glitch_reference(ctx, &geom, candidates, int) else { break };
+                let t_gref = ms(t_gref); // DIAG
+
+                let t_gdisp = std::time::Instant::now(); // DIAG
+                let offs    = offsets(&mut glitched.iter().map(|&j| pos + j), &new_ref);
+                let new_raw = state.dispatch_offsets(&offs, upp, &new_ref);
+                for (k, &j) in glitched.iter().enumerate() {
+                    raw[j] = new_raw[k];
+                }
                 log::info!(
-                    "[diag gpu] pass {pass}: residual CPU resolve {}/{} in {:.1} ms",
-                    resolved.len(), residual.len(), ms(t_resid),
+                    "[diag gpu] pass {pass} chunk {chunks} glitch round {round}: {} glitched, new ref {} \
+                     (reference {t_gref:.1} ms, dispatch {:.1} ms) -> {}",
+                    glitched.len(), new_ref.describe(), ms(t_gdisp), raw_stats(&new_raw),
                 );
+                // Later chunks start from the better reference.
+                if new_ref.beats(&reference) { reference = new_ref; }
             }
-            for (i, r) in resolved { raw[i] = r; }
-        }
-        log::info!(
-            "[diag gpu] pass {pass} final{}: {}",
-            if int.interrupted() { " (interrupted)" } else { "" },
-            raw_stats(&raw),
-        );
 
-        // ----------------------------------------------------------------
-        // Scatter results into tile pixel stores.  A pixel still carrying
-        // GLITCH_BIT here means we were interrupted before resolving it; leave
-        // it unstored so the next generation retries it (never cache a guess).
-        // ----------------------------------------------------------------
-        for (i, pr) in pixel_refs.iter().enumerate() {
-            let r = raw[i];
-            if r & GLITCH_BIT != 0 { continue; }
-            let color = val_to_color(NonZeroUsize::new(r as usize));
-            tiles[pr.tile_idx].tile.store(pr.pixel_idx, color.into());
-        }
-
-        // Only advance pass counters if we weren't interrupted mid-glitch-loop.
-        if !int.interrupted() {
-            for item in tiles {
-                item.tile.finish_pass(pass + 1);
+            // Residual glitches: resolve exactly on the CPU, in parallel and
+            // interruptibly.  Unresolved ones keep GLITCH_BIT and are not
+            // stored; the resolved ones are exact and safe to cache.
+            if !int.interrupted() {
+                let residual: Vec<usize> = raw.iter().enumerate()
+                    .filter(|&(_, &r)| r & GLITCH_BIT != 0)
+                    .map(|(j, _)| j)
+                    .collect();
+                if !residual.is_empty() {
+                    let t_resid = std::time::Instant::now(); // DIAG
+                    let resolved: Vec<(usize, u32)> = residual.par_iter()
+                        .filter_map(|&j| {
+                            if int.interrupted() { return None; }
+                            let (_, orbit) = calculate_orbit(pixel_coord(pos + j), ctx.iterations);
+                            Some((j, check_orbit(&orbit).unwrap().map_or(0, |n| n.get() as u32)))
+                        })
+                        .collect();
+                    log::info!(
+                        "[diag gpu] pass {pass} chunk {chunks}: residual CPU resolve {}/{} in {:.1} ms",
+                        resolved.len(), residual.len(), ms(t_resid),
+                    );
+                    for (j, r) in resolved { raw[j] = r; }
+                }
             }
+
+            // Store results, finish completed tiles, and tell the compositor.
+            for (j, &r) in raw.iter().enumerate() {
+                if r & GLITCH_BIT != 0 { continue; }
+                let pr = &pixel_refs[pos + j];
+                let color = val_to_color(NonZeroUsize::new(r as usize));
+                tiles[pr.tile_idx].tile.store(pr.pixel_idx, color.into());
+                remaining[pr.tile_idx] -= 1;
+                if remaining[pr.tile_idx] == 0 { finish(pr.tile_idx); }
+            }
+            ctx.progress.fetch_add(1, Ordering::Release);
+
+            pos    += len;
+            chunks += 1;
         }
+
         log::info!(
-            "[diag gpu] pass {pass} total {:.1} ms{}",
-            ms(t_pass), if int.interrupted() { " (interrupted)" } else { "" },
+            "[diag gpu] pass {pass} total {:.1} ms, {chunks} chunks, {pos}/{} px{}",
+            ms(t_pass), pixel_refs.len(), if int.interrupted() { " (interrupted)" } else { "" },
         );
     }
 }
@@ -824,6 +850,7 @@ mod tests {
             width: w,
             height: h,
             iterations: iters,
+            progress: Default::default(),
         };
         let g = ViewGeom::new(&ctx);
         let n = find_nucleus(&g.center, &g.radius, g.upp, iters, g.prec, &|| false)
@@ -933,7 +960,7 @@ mod tests {
         let ctx = PassBatchCtx {
             coords: CoordinatesBox { origin: origin.clone(), view: View::new((upp as f64).exp2()) },
             depth, x0: tile_index(&origin.x, depth), y0: tile_index(&origin.y, depth),
-            width: 256, height: 256, iterations: iters,
+            width: 256, height: 256, iterations: iters, progress: Default::default(),
         };
         let g = ViewGeom::new(&ctx);
         let ts = IBig::from(TILE_SIZE as u64);

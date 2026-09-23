@@ -163,6 +163,7 @@ pub fn run_generation(
         width,
         height,
         iterations,
+        progress:   store.progress_counter(),
     };
 
     for pass in 0..NUM_PASSES {
