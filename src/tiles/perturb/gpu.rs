@@ -122,6 +122,15 @@ const INTERIOR_MIN_WINDOW: usize = 128;
 const INTERIOR_WINDOWS:    u32   = 2;
 const INTERIOR_Q:          f64   = 0.9;
 
+/// How far (in view half-diagonals) a cached full reference (a nucleus) may
+/// be from the view and still be reused, so zooming does not search again
+/// (1-4 s at 2^-320) until the nucleus is this far out. Measured
+/// (`diag_far_reference`, 2^-314..2^-330, 262144 iterations): a nucleus
+/// 3500 radii away was as accurate as at 13 (vs exact: 122 vs 138 of 600
+/// off by a few iterations, 3 vs 5 by >50) and as fast; nothing broke even
+/// at 10^6 radii. A view's own, deeper nucleus is still more accurate.
+const MAX_REF_REUSE_DIST: u32 = 1024;
+
 /// Use the floatexp pipeline once units-per-pixel drops below 2^FE_THRESHOLD.
 /// The f32 seed starts breaking down near 2^-126; -100 leaves a safe margin
 /// while keeping the fast f32 path for all shallower zooms.
@@ -267,9 +276,19 @@ impl ViewGeom {
 
     /// Whether `c` is close enough to the view to serve as its reference.
     fn near(&self, c: &Complex<FBig>) -> bool {
+        self.within(c, MAX_REF_DIST)
+    }
+
+    /// Whether the cached reference `r` may be reused for this view: a full
+    /// one (a nucleus) much further away than a search would look.
+    fn reusable(&self, r: &Reference) -> bool {
+        self.within(&r.c, if r.is_full { MAX_REF_REUSE_DIST } else { MAX_REF_DIST })
+    }
+
+    fn within(&self, c: &Complex<FBig>, radii: u32) -> bool {
         let dx = &c.re - &self.center.re;
         let dy = &c.im - &self.center.im;
-        let max = &self.radius * FBig::from(MAX_REF_DIST);
+        let max = &self.radius * FBig::from(radii);
         &dx * &dx + &dy * &dy <= &max * &max
     }
 }
@@ -407,7 +426,7 @@ impl GpuState {
         int: &MultiInterrupter,
     ) -> Option<Arc<Reference>> {
         let iters  = ctx.iterations;
-        let cached = self.reference.lock().clone().filter(|r| g.near(&r.c));
+        let cached = self.reference.lock().clone().filter(|r| g.reusable(r));
         if let Some(r) = &cached {
             if r.iterations == iters && r.is_full { return Some(r.clone()); }
             // A nucleus stays a nucleus when only the iteration count changed.
@@ -491,7 +510,7 @@ impl GpuState {
     fn remember(&self, r: Arc<Reference>, g: &ViewGeom) -> Arc<Reference> {
         let mut cache = self.reference.lock();
         let keep = cache.as_ref().is_some_and(|c| {
-            c.iterations == r.iterations && g.near(&c.c) && c.beats(&r)
+            c.iterations == r.iterations && g.reusable(c) && c.beats(&r)
         });
         if !keep { *cache = Some(r.clone()); }
         r
@@ -1855,5 +1874,70 @@ mod tests {
         let got = gpu.dispatch_offsets(&offs, g.upp, &gr);
         eprintln!("reference {} at ({rx:.3}, {ry:.3}): exact {exact}, got {:x?}", r.describe(), got);
         assert_eq!(got[0], exact);
+    }
+
+    /// Measurement: accuracy and speed with a far-away reference. The 2^-314
+    /// view's nucleus is reused at views zoomed in about its centre (the
+    /// reference ends up hundreds to ~10^6 view radii away), against exact
+    /// orbits and against each view's own nucleus. Exact values cached in
+    /// $DIAG_OUT (~10 s per view).
+    #[test]
+    #[ignore]
+    fn diag_far_reference() {
+        let base = "0.3626806181691852804489917225076056798812848870599955358041302416758614320764231653400389334599052087605123550187040027890282,-0.6426879938460872964212498601513047756237090805248048169033884352653961260155207050615760571472782180516346029887216862939575|3.290623677226253e-95";
+        let iters = 262144;
+        let (w, h) = (3000usize, 2000usize);
+        let b = sample_view_geometry(base, iters, (w, h), (1, 1));
+        let g0 = &b.geom;
+        let n0 = find_nucleus(&g0.center, &g0.radius, g0.upp, iters, g0.prec, &|| false).unwrap().expect("nucleus");
+        let far = Reference::new(n0.c.clone(), iters, Some(n0.period));
+        let gpu = GpuState::new();
+        let levels: Vec<f64> = std::env::var("DIAG_LEVELS").ok()
+            .map(|s| s.split(',').map(|x| x.parse().unwrap()).collect())
+            .unwrap_or(vec![-314.0, -318.0, -322.0, -326.0, -330.0]);
+        // DIAG_PIPE: whole generations at each level in turn with one
+        // backend (a zoom), timing each and scoring the stored pixels.
+        let pipe = std::env::var("DIAG_PIPE").is_ok().then(|| {
+            let _ = env_logger::builder().is_test(true).try_init();
+            (Gpu(Arc::new(GpuState::new())), crate::tiles::store::TileStore::new(crate::tiles::store::MEMORY_BUDGET_BYTES))
+        });
+        for l in levels {
+            let view = l.exp2();
+            let mut coords: CoordinatesBox = base.parse().unwrap();
+            let prec = working_precision(crate::tiles::store::depth_for_view(view)) + 64;
+            let off = |px: usize| FBig::try_from(px as f64 / 2.0 * view).unwrap();
+            coords.origin.x = (&g0.center.re - &off(w)).with_precision(prec).value();
+            coords.origin.y = (&g0.center.im - &off(h)).with_precision(prec).value();
+            coords.view.inner = view;
+            let clip = format!("{coords}");
+            let v = sample_view_cached(&format!("far{}", -l as i64), &clip, iters, (w, h), (30, 20));
+            let g = &v.geom;
+            if let Some((backend, store)) = &pipe {
+                let t = std::time::Instant::now();
+                let vals = run_pipeline(&v, backend, store, 1).remove(0);
+                let got: Vec<u32> = vals.iter().map(|x| x.unwrap_or(u32::MAX)).collect();
+                let (wrong, off50, black) = score(&got, &v.exact);
+                eprintln!("2^{l} pipeline: {:?}, missing {}, wrong {wrong} off>50 {off50} black {black}",
+                    t.elapsed(), vals.iter().filter(|x| x.is_none()).count());
+                continue;
+            }
+            let own = find_nucleus(&g.center, &g.radius, g.upp, iters, g.prec, &|| false).unwrap()
+                .map(|n| Reference::new(n.c, iters, Some(n.period)));
+            for (name, r) in [("far", Some(&far)), ("own", own.as_ref())] {
+                let Some(r) = r else { eprintln!("2^{l} {name}: none"); continue };
+                let (rx, ry) = ref_px(&r.c, &v.ctx);
+                let offs: Vec<(f64, f64)> = v.pix.iter().map(|&(c, rw)| (c as f64 - rx, rw as f64 - ry)).collect();
+                let radii = rx.hypot(ry) / (w as f64).hypot(h as f64) * 2.0;
+                let gr = gpu.prepare(r, log2_dc(&offs, g.upp), g.upp);
+                let t = std::time::Instant::now();
+                let got: Vec<u32> = offs.chunks(256).flat_map(|c| gpu.dispatch_offsets(c, g.upp, &gr)).collect();
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                let (wrong, off50, black) = score(&got, &v.exact);
+                let exact_black = v.exact.iter().filter(|&&x| x == 0).count();
+                let glitched = got.iter().filter(|&&x| x & GLITCH_BIT != 0).count();
+                eprintln!("2^{l} {name} ({}, {radii:.0} radii): wrong {wrong} off>50 {off50} black {black} (exact {exact_black}) glitched {glitched}, {ms:.0} ms, BLA {} levels",
+                    r.describe(), gr.bla_levels);
+            }
+        }
     }
 }

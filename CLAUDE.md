@@ -139,7 +139,11 @@ Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
   escapes too early to reveal the period, glitch rounds evaluate 32 sampled
   glitched pixels exactly (in parallel), take the longest-lived, and seed the
   search from it. The best reference is cached in `GpuState` across passes and
-  nearby views (`MAX_REF_DIST` view radii); failed centre and glitch-seeded
+  views: a full one (nucleus) is reused up to `MAX_REF_REUSE_DIST` (1024)
+  view radii away, so zooming rarely searches (measured, `diag_far_reference`:
+  3500 radii as accurate as 13, nothing breaks at 10⁶; a view's own deeper
+  nucleus is more accurate still); a searched-for nucleus must lie within
+  `MAX_REF_DIST` (16) radii. Failed centre and glitch-seeded
   searches (incl. a nucleus whose orbit escapes) are remembered for views
   whose centre lies in the failed view with a radius within 2×
   (`ViewGeom::covered_by`).
@@ -250,7 +254,8 @@ Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
   `bla_with_escaping_reference_matches_plain`,
   `zero_delta_escapes_with_reference`, plus `diag_*` measurements
   (`diag_bla_ab`, `diag_switch_threshold`, `diag_interior_detection`,
-  `diag_reference_precision`, `diag_deep_nucleus_search`: search timing
+  `diag_reference_precision`, `diag_far_reference`: accuracy with a reused
+  far-away nucleus, `diag_deep_nucleus_search`: search timing
   zooming below the 2⁻³¹⁴ view, `DIAG_LEVELS=-316,-320`, `DIAG_PIPE=1` for
   whole generations). Set `DIAG_OUT=dir`
   to cache exact values (the 2⁻³⁰⁵ ones take ~1 min) and dump renders as raw
