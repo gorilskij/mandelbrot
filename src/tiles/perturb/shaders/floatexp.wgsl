@@ -46,9 +46,13 @@ fn fe_add(a : Fe, b : Fe) -> Fe {
 }
 
 // |a| < |b|, compared as log2 of the squared magnitude (the exponents are far
-// outside f32 range, so the values themselves cannot be formed). Zero has
-// log2(0) = -inf and so is smaller than everything else.
+// outside f32 range, so the values themselves cannot be formed). Zero is
+// handled by its sentinel exponent: log2(0) is not -inf under Metal's fast
+// math (a pixel with δ₀ = 0, i.e. at its own reference, rebased on every
+// step and never escaped).
 fn fe_abs_lt(a : Fe, b : Fe) -> bool {
+    if (b.e == FE_ZERO_EXP) { return false; }
+    if (a.e == FE_ZERO_EXP) { return true; }
     return log2(dot(a.m, a.m)) + 2.0 * f32(a.e) < log2(dot(b.m, b.m)) + 2.0 * f32(b.e);
 }
 

@@ -1745,4 +1745,25 @@ mod tests {
         assert_eq!(black, exact_black, "pixels shadowed the reference");
         assert!(off50 * 100 < got.len(), "{off50} pixels off by >50 iterations");
     }
+
+    /// A pixel dispatched against its own (escaping) orbit, δ₀ = 0 exactly,
+    /// must escape with it, in both pipelines. Needs a GPU.
+    #[test]
+    #[ignore]
+    fn zero_delta_escapes_with_reference() {
+        let clip = "0.3626806181691852804489917225076056798812848870599955358041302416758614320764231653400389334599052087605123550187040027890282,-0.6426879938460872964212498601513047756237090805248048169033884352653961260155207050615760571472782180516346029887216862939575|3.290623677226253e-95";
+        let v = sample_view_geometry(clip, 262144, (3000, 2000), (1, 1));
+        let g = &v.geom;
+        let r = Reference::new(g.center.clone(), 262144, None);
+        let exact = check_orbit(&calculate_orbit(g.center.clone(), 262144).1).unwrap().map_or(0, |n| n.get() as u32);
+        let (rx, ry) = ref_px(&r.c, &v.ctx);
+        let gpu = GpuState::new();
+        let offs = [(0.0, 0.0), (1e-3, 0.0)];
+        let gr = gpu.prepare_with(&r, log2_dc(&offs, g.upp), g.upp, false);
+        eprintln!("BLA off: {:x?}", gpu.dispatch_offsets(&offs, g.upp, &gr));
+        let gr = gpu.prepare(&r, log2_dc(&offs, g.upp), g.upp);
+        let got = gpu.dispatch_offsets(&offs, g.upp, &gr);
+        eprintln!("reference {} at ({rx:.3}, {ry:.3}): exact {exact}, got {:x?}", r.describe(), got);
+        assert_eq!(got[0], exact);
+    }
 }

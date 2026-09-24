@@ -125,13 +125,25 @@ pub struct Block {
     pub log2_r: f64,
 }
 
+/// Relative margin below |X|² = 4 at which single steps become invalid
+/// (see `Block::step`); far above the 2^-23 by which |z| can exceed |X|.
+const BLA_ESCAPE_MARGIN: f64 = 1.0 / 65536.0;
+
 impl Block {
     fn invalid() -> Block {
         Block { a: Fx::ZERO, b: Fx::ZERO, log2_r: f64::NEG_INFINITY }
     }
 
-    /// The single step at reference value `x`.
+    /// The single step at reference value `x`. Invalid where the pixel could
+    /// escape: a jump skips the escape checks of every step it covers, and R
+    /// only bounds |δ| relative to |X| (|z| ≤ |X|·(1 + 2^-23)), so an
+    /// escaping reference's last steps must not be jumped. A pixel with δ
+    /// tiny (e.g. δ₀ = 0, at the reference itself) otherwise jumped over the
+    /// reference's escape and came back glitched, forever.
     fn step(x: Complex<f64>) -> Block {
+        if x.norm_sqr() > 4.0 * (1.0 - BLA_ESCAPE_MARGIN) {
+            return Block::invalid();
+        }
         let a = Fx::from_c(x * 2.0);
         Block { a, b: Fx::from_c(Complex { re: 1.0, im: 0.0 }), log2_r: BLA_EPS_LOG2 + a.log2_abs() }
     }

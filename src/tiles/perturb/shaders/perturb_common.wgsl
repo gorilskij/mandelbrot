@@ -32,7 +32,11 @@ struct BlaHit {
 // Searched upwards: a block's radius is at most its first half's (R =
 // min(R_x, …)), so once a level is invalid no longer block at m can be
 // valid. The common case, no valid block, costs one lookup (none for odd m).
-fn bla_find(m : u32, log2_d : f32, max_len : u32) -> BlaHit {
+//
+// log2_d is clamped above the invalid radius (-1e30, finite because of fast
+// math): at δ = 0 it is log2(0) = -inf, which passed invalid blocks too.
+fn bla_find(m : u32, log2_d_raw : f32, max_len : u32) -> BlaHit {
+    let log2_d = max(log2_d_raw, -1e29);
     let size_log2 = uniforms.bla_log2_size;
     var best = BlaHit(0u, 0u);
     if (uniforms.bla_levels < 2u || m >= (1u << size_log2)) { return best; }
