@@ -15,7 +15,8 @@ detection); the CPU one is older (per-group references, no BLA).
   resets). **Space** resets: drops every tile and the CPU reference lists (the
   GPU backend's cached reference survives, which is harmless). **↑/↓**
   doubles/halves the max iterations (default 2048; tiles are retargeted, not
-  recomputed, see below). **Cmd/Ctrl-C / V** copies/pastes `coords/iterations`
+  recomputed, see below). **←/→** change the sampling ratio s by 0.5
+  (0.5…4, default 1; see the compositor). **Cmd/Ctrl-C / V** copies/pastes `coords/iterations`
   (`x,y|units_per_pixel/iterations`, `x,y` = top-left corner). Letter shortcuts
   match the layout's character (`logical_key`), not the key position (the user
   types Dvorak).
@@ -72,7 +73,21 @@ detection); the CPU one is older (per-group references, no BLA).
   separate from the compute backend) on the render thread. Colours tiles at
   upload through a palette table (`color_of`, grown on demand), re-uploads a
   tile when its `version` changes, reconstructs sub-pass gaps from neighbours
-  (`reconstruct`), and draws the progress bar: a white fill proportional to
+  (`reconstruct`).
+  - **Sampling and antialiasing**: tiles are rendered at the depth where a
+    screen pixel spans r ∈ [s, 2s) tile pixels per axis (`TileStore::
+    min_ratio` / `depth_for_view`; s shared with the compute thread through
+    the store). Tile textures are sRGB with mip levels built on the CPU as
+    2×2 box averages in linear light (`mip_chain`; only the levels the
+    current s needs: none at s = 1). Tiles are drawn 1:1 into an offscreen
+    sRGB image (≤ 2× the surface per axis) from the level k that leaves
+    q = r/2^k ∈ [1, 2) texels per screen pixel, grid-aligned; the downsample
+    pass (`gpu_compositor_downsample.wgsl`) takes each screen pixel's exact
+    q×q area average (bilinear below q = 1) and encodes to sRGB (the surface
+    is not sRGB). Cost vs plain bilinear (startup view, 3000×2000): ~+2 ms
+    compositor GPU per frame (median 2.9 → 4.8 ms), compute ~3–5% slower
+    from sharing the GPU.
+  - The progress bar: a white fill proportional to
   the pixel work done (`BarAnim`): rising, it moves at the measured progress
   speed (so updates seconds apart don't show as jumps), catching up over
   about one update interval when far behind; falling (restart), a critically
@@ -318,8 +333,10 @@ coding):
 
 1. **Share one wgpu device** between the compositor and compute (the CPU/GPU
    overlap half of this item is done).
-2. **Compute fewer pixels**: depth by rounding instead of ceil (~2.3× the
-   screen's pixels today); needs an A/B look at quality first.
+2. **Compute fewer pixels**: now the sampling ratio s (0.5 = at most 1:1,
+   ~¼–1× the screen's pixels, vs 1–4× at s = 1); try it in the app. The
+   compositor's ~2 ms per frame could shrink by sizing the offscreen image
+   to what is used instead of 2× the surface.
 3. **Palette scrolling**: Cmd-scroll shifts the phase of the hue sine wave,
    Alt-scroll the lightness one (in `val_to_color`). Cheap: rebuild the
    compositor's palette table and re-upload, no recompute.
