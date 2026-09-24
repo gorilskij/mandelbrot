@@ -254,6 +254,17 @@ impl ViewGeom {
         }
     }
 
+    /// Whether a search from the view (centre, radius) would say about this
+    /// view what it said about its own: our centre lies within it and the
+    /// radii differ by less than 2×.
+    fn covered_by(&self, (center, radius, _): &(Complex<FBig>, FBig, usize)) -> bool {
+        let dx = &self.center.re - &center.re;
+        let dy = &self.center.im - &center.im;
+        &dx * &dx + &dy * &dy <= radius * radius
+            && &self.radius * FBig::from(2) > *radius
+            && &self.radius < &(radius * FBig::from(2))
+    }
+
     /// Whether `c` is close enough to the view to serve as its reference.
     fn near(&self, c: &Complex<FBig>) -> bool {
         let dx = &c.re - &self.center.re;
@@ -312,8 +323,12 @@ pub struct GpuState {
     /// Best reference found so far, reused across passes and nearby views.
     reference:   Mutex<Option<Arc<Reference>>>,
     /// (centre, radius, iterations) of the last view whose centre-seeded
-    /// nucleus search failed, so the passes of one view search only once.
+    /// nucleus search failed, so the passes of one view, and nearby views
+    /// (`ViewGeom::covered_by`), search only once.
     failed_search: Mutex<Option<(Complex<FBig>, FBig, usize)>>,
+    /// The same for searches seeded from glitched pixels (each costs as
+    /// much as a centre search; seen: ~1 s per glitch round, all failing).
+    failed_glitch_search: Mutex<Option<(Complex<FBig>, FBig, usize)>>,
     /// Measured cost of the last chunk, in ms per pixel; sizes the next one.
     ms_per_px:   Mutex<f64>,
 }
@@ -376,6 +391,7 @@ impl GpuState {
                 device, queue, pipeline, pipeline_fe, bgl, max_binding,
                 reference: Mutex::new(None),
                 failed_search: Mutex::new(None),
+                failed_glitch_search: Mutex::new(None),
                 ms_per_px: Mutex::new(1e-4),
             }
         })
@@ -402,7 +418,8 @@ impl GpuState {
         }
 
         let key = (g.center.clone(), g.radius.clone(), iters);
-        if self.failed_search.lock().as_ref() != Some(&key) {
+        let failed = self.failed_search.lock().as_ref().is_some_and(|f| f.2 == iters && g.covered_by(f));
+        if !failed {
             let t = std::time::Instant::now(); // DIAG
             match find_nucleus(&g.center, &g.radius, g.upp, iters, g.prec, &|| int.interrupted()) {
                 Err(_) => return None,
@@ -413,6 +430,7 @@ impl GpuState {
                         r.describe(), t.elapsed().as_secs_f64() * 1e3,
                     );
                     if r.is_full { return Some(self.remember(r, g)); }
+                    *self.failed_search.lock() = Some(key);
                 }
                 Ok(None) => {
                     log::info!(
@@ -449,14 +467,20 @@ impl GpuState {
                 .max_by_key(|r| r.orbit.len())?,
         );
         if int.interrupted() { return None; }
-        if !best.is_full {
-            match find_nucleus(&best.c, &g.radius, g.upp, iters, g.prec, &|| int.interrupted()) {
+        let failed = self.failed_glitch_search.lock().as_ref().is_some_and(|f| f.2 == iters && g.covered_by(f));
+        if !best.is_full && !failed {
+            let found = match find_nucleus(&best.c, &g.radius, g.upp, iters, g.prec, &|| int.interrupted()) {
                 Err(_) => return None,
                 Ok(Some(n)) if g.near(&n.c) => {
                     let r = Arc::new(Reference::new(n.c, iters, Some(n.period)));
+                    let full = r.is_full;
                     if r.beats(&best) { best = r; }
+                    full
                 }
-                Ok(_) => {}
+                Ok(_) => false,
+            };
+            if !found {
+                *self.failed_glitch_search.lock() = Some((g.center.clone(), g.radius.clone(), iters));
             }
         }
         Some(self.remember(best, g))
@@ -1746,27 +1770,6 @@ mod tests {
         assert!(off50 * 100 < got.len(), "{off50} pixels off by >50 iterations");
     }
 
-    /// A pixel dispatched against its own (escaping) orbit, δ₀ = 0 exactly,
-    /// must escape with it, in both pipelines. Needs a GPU.
-    #[test]
-    #[ignore]
-    fn zero_delta_escapes_with_reference() {
-        let clip = "0.3626806181691852804489917225076056798812848870599955358041302416758614320764231653400389334599052087605123550187040027890282,-0.6426879938460872964212498601513047756237090805248048169033884352653961260155207050615760571472782180516346029887216862939575|3.290623677226253e-95";
-        let v = sample_view_geometry(clip, 262144, (3000, 2000), (1, 1));
-        let g = &v.geom;
-        let r = Reference::new(g.center.clone(), 262144, None);
-        let exact = check_orbit(&calculate_orbit(g.center.clone(), 262144).1).unwrap().map_or(0, |n| n.get() as u32);
-        let (rx, ry) = ref_px(&r.c, &v.ctx);
-        let gpu = GpuState::new();
-        let offs = [(0.0, 0.0), (1e-3, 0.0)];
-        let gr = gpu.prepare_with(&r, log2_dc(&offs, g.upp), g.upp, false);
-        eprintln!("BLA off: {:x?}", gpu.dispatch_offsets(&offs, g.upp, &gr));
-        let gr = gpu.prepare(&r, log2_dc(&offs, g.upp), g.upp);
-        let got = gpu.dispatch_offsets(&offs, g.upp, &gr);
-        eprintln!("reference {} at ({rx:.3}, {ry:.3}): exact {exact}, got {:x?}", r.describe(), got);
-        assert_eq!(got[0], exact);
-    }
-
     /// Measurement: nucleus search below the 2^-314 view, zooming about its
     /// centre. Times the search, checks whether the nucleus orbit is full at
     /// the working precision, and at 2·log2|dz_p/dc| + 64 bits.
@@ -1831,5 +1834,26 @@ mod tests {
             eprintln!("2^{l}: p={} in {t_search:?}, prec {}, log2|dz_p| {l_dz:.0}, orbit {} ({:?})",
                 n.period, g.prec, r.describe(), t.elapsed());
         }
+    }
+
+    /// A pixel dispatched against its own (escaping) orbit, δ₀ = 0 exactly,
+    /// must escape with it, in both pipelines. Needs a GPU.
+    #[test]
+    #[ignore]
+    fn zero_delta_escapes_with_reference() {
+        let clip = "0.3626806181691852804489917225076056798812848870599955358041302416758614320764231653400389334599052087605123550187040027890282,-0.6426879938460872964212498601513047756237090805248048169033884352653961260155207050615760571472782180516346029887216862939575|3.290623677226253e-95";
+        let v = sample_view_geometry(clip, 262144, (3000, 2000), (1, 1));
+        let g = &v.geom;
+        let r = Reference::new(g.center.clone(), 262144, None);
+        let exact = check_orbit(&calculate_orbit(g.center.clone(), 262144).1).unwrap().map_or(0, |n| n.get() as u32);
+        let (rx, ry) = ref_px(&r.c, &v.ctx);
+        let gpu = GpuState::new();
+        let offs = [(0.0, 0.0), (1e-3, 0.0)];
+        let gr = gpu.prepare_with(&r, log2_dc(&offs, g.upp), g.upp, false);
+        eprintln!("BLA off: {:x?}", gpu.dispatch_offsets(&offs, g.upp, &gr));
+        let gr = gpu.prepare(&r, log2_dc(&offs, g.upp), g.upp);
+        let got = gpu.dispatch_offsets(&offs, g.upp, &gr);
+        eprintln!("reference {} at ({rx:.3}, {ry:.3}): exact {exact}, got {:x?}", r.describe(), got);
+        assert_eq!(got[0], exact);
     }
 }
