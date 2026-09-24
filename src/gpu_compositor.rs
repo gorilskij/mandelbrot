@@ -995,8 +995,8 @@ impl GpuCompositor {
     }
 
     /// Full-resolution texels for a tile during (or after) the sub-passes:
-    /// computed pixels as they are, each sub-pass gap as the mean colour of
-    /// its computed axis neighbours (the sub-pass order guarantees all four
+    /// computed pixels as they are, each sub-pass gap as the mean colour (in
+    /// linear light) of its computed axis neighbours (the sub-pass order guarantees all four
     /// from the first sub-pass on, fewer at the tile edge). A missing pixel
     /// from an already-displayed pass is being recomputed after the
     /// iteration count went up — formerly in the set — and is drawn black.
@@ -1020,14 +1020,7 @@ impl GpuCompositor {
                             (c > 0).then(|| known(r, c - 1)).flatten(),
                             (c + 1 < n).then(|| known(r, c + 1)).flatten(),
                         ];
-                        let (mut sum, mut k) = ([0u32; 3], 0);
-                        for v in neighbours.into_iter().flatten() {
-                            for (i, s) in sum.iter_mut().enumerate() {
-                                *s += (v >> (8 * i)) & 0xFF;
-                            }
-                            k += 1;
-                        }
-                        if k == 0 { 0 } else { (0..3).map(|i| (sum[i] / k) << (8 * i)).sum() }
+                        mean_colour(neighbours.into_iter().flatten())
                     }
                 };
                 data[r * n + c] = rgb_to_rgba8(rgb);
@@ -1051,6 +1044,25 @@ fn color_of(iteration: u32, palette: &mut Vec<u32>) -> u32 {
         palette.extend((palette.len()..len).map(|j| val_to_color(NonZeroUsize::new(j))));
     }
     palette[i]
+}
+
+/// Mean of 0x00RRGGBB sRGB colours, taken in linear light like every other
+/// average in the compositor (averaging the encoded values darkens); black
+/// if there are none.
+fn mean_colour(colours: impl Iterator<Item = u32>) -> u32 {
+    let (to_lin, to_srgb) = srgb_tables();
+    let (mut sum, mut k) = ([0f32; 3], 0);
+    for v in colours {
+        for (i, s) in sum.iter_mut().enumerate() {
+            *s += to_lin[((v >> (8 * i)) & 0xFF) as usize];
+        }
+        k += 1;
+    }
+    if k == 0 { return 0; }
+    (0..3).map(|i| {
+        let l = ((sum[i] / k as f32) * (LIN_STEPS - 1) as f32 + 0.5) as usize;
+        (to_srgb[l.min(LIN_STEPS - 1)] as u32) << (8 * i)
+    }).sum()
 }
 
 /// Mip level drawn at r tile pixels per screen pixel: the one leaving
@@ -1347,6 +1359,14 @@ mod tests {
                 .validate(&module)
                 .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         }
+    }
+
+    /// Sub-pass gaps are filled with their neighbours' mean in linear light.
+    #[test]
+    fn gap_fill_averages_in_linear_light() {
+        assert_eq!(mean_colour([0x000000, 0xFFFFFF].into_iter()), 0xBCBCBC); // 188, not 127
+        assert_eq!(mean_colour([0x405060; 4].into_iter()), 0x405060);
+        assert_eq!(mean_colour(std::iter::empty()), 0);
     }
 
     /// Only the levels drawn at s are uploaded: pin the range, and that every
