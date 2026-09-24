@@ -62,7 +62,7 @@ detection); the CPU one is older (per-group references, no BLA).
 - `src/tiles/perturb/gpu.rs` — GPU backend (details below). Its test module
   holds the GPU harnesses and regression tests (see Testing).
 - `src/tiles/perturb/nucleus.rs` — reference search: ball-period detection +
-  Newton to a nucleus, in FBig.
+  Newton to a nucleus, z in FBig, dz/dc as f64 mantissa + exponent (`Deriv`).
 - `src/tiles/perturb/bla.rs` — BLA table builder (CPU floatexp `Fx`).
 - `src/tiles/perturb/shaders/` — `floatexp.wgsl` (helpers), `perturb_common.wgsl`
   (BLA lookup/apply, jump limits, interior check), `perturbation.wgsl` (f32
@@ -73,9 +73,12 @@ detection); the CPU one is older (per-group references, no BLA).
   upload through a palette table (`color_of`, grown on demand), re-uploads a
   tile when its `version` changes, reconstructs sub-pass gaps from neighbours
   (`reconstruct`), and draws the progress bar: a white fill proportional to
-  the pixel work done, eased by a critically damped spring in both directions
-  (`BarAnim`); `render()` returns whether the bar is still moving, and the
-  render thread keeps drawing at vsync until it settles.
+  the pixel work done (`BarAnim`): rising, it moves at the measured progress
+  speed (so updates seconds apart don't show as jumps), catching up over
+  about one update interval when far behind; falling (restart), a critically
+  damped spring; never ahead of the real progress. `render()` returns
+  whether the bar is still moving, and the render thread keeps drawing at
+  vsync until it settles.
 
 ## Perturbation math
 
@@ -111,7 +114,10 @@ first invalid level ends the search; level 0 is never used) with exponential
 back-off after failed searches (reset on a jump or rebase), apply the block in
 floatexp, add log|A|² to the interior-detection derivative, and never jump
 across an interior window boundary or the iteration limit. No escape can be
-skipped: within R the pixel stays within ε of a never-escaping nucleus orbit.
+skipped: within R, |z| ≤ |X|·(1 + 2⁻²³), and single steps with |X| near or
+above 2 (an escaping reference's end) are invalid, so no block spans them.
+log2|δ| is clamped above the invalid radius (at δ = 0 it is −∞, which passed
+invalid blocks: a pixel at its own reference jumped over its escape).
 `USE_BLA` switches it off for A/B. Measured: the 2⁻³⁰⁵ reported view went from
 ~2 min to ~1.5 s per generation and became more accurate (fewer f32 rounding
 steps); shallow views ~5–10% slower.
@@ -131,8 +137,17 @@ Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
   escapes too early to reveal the period, glitch rounds evaluate 32 sampled
   glitched pixels exactly (in parallel), take the longest-lived, and seed the
   search from it. The best reference is cached in `GpuState` across passes and
-  nearby views (`MAX_REF_DIST` view radii); failed centre searches are
-  remembered per view.
+  nearby views (`MAX_REF_DIST` view radii); failed centre and glitch-seeded
+  searches (incl. a nucleus whose orbit escapes) are remembered for views
+  whose centre lies in the failed view with a radius within 2×
+  (`ViewGeom::covered_by`).
+- **Nucleus precision**: a component is only ~1/|dz_p/dc|² wide (2⁻⁶³⁰ at a
+  2⁻³²⁵ view, p≈49000), far below the view's precision; Newton converges at
+  the view's precision, then raises it to 2·log2|dz_p/dc| + 64 bits and
+  converges into the component. Without that the "nucleus" orbit escaped
+  after ~1.1 periods. Far from the root Newton walks with a constant step;
+  same-direction steps are multiplied (doubling) to get there sooner. At
+  2⁻³¹⁶…2⁻³³⁰ a search takes 0.7–3.6 s and still blocks pass 0.
 - References need not lie on the pixel grid: `ref_px` gives the reference's
   position in pixel units, computed exactly in FBig; pixel offsets are
   `col - ref_px` for both pipelines.
@@ -230,9 +245,12 @@ Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
   `view_2026_09_23b_pipeline_matches_exact` (2⁻³⁰⁵, whole pipeline incl.
   resets), `view_2026_09_23c_matches_exact` (2⁻³¹⁴, 262144 iterations),
   `dispatch_is_deterministic_even_when_killed`,
-  `bla_with_escaping_reference_matches_plain`, plus `diag_*`
-  measurements (`diag_bla_ab`, `diag_switch_threshold`,
-  `diag_interior_detection`, `diag_reference_precision`). Set `DIAG_OUT=dir`
+  `bla_with_escaping_reference_matches_plain`,
+  `zero_delta_escapes_with_reference`, plus `diag_*` measurements
+  (`diag_bla_ab`, `diag_switch_threshold`, `diag_interior_detection`,
+  `diag_reference_precision`, `diag_deep_nucleus_search`: search timing
+  zooming below the 2⁻³¹⁴ view, `DIAG_LEVELS=-316,-320`, `DIAG_PIPE=1` for
+  whole generations). Set `DIAG_OUT=dir`
   to cache exact values (the 2⁻³⁰⁵ ones take ~1 min) and dump renders as raw
   RGB.
 - **Visual bug with coordinates → reproduce first**: parse the Cmd-C string
