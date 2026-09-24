@@ -15,15 +15,17 @@ use std::time::Duration;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+/// Draws tiles 1:1 into the offscreen image, from the mip level `level`.
 const SHADER: &str = r#"
 struct VOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) level: f32,
 }
 
 @vertex
-fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VOut {
-    return VOut(vec4<f32>(pos, 0.0, 1.0), uv);
+fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>, @location(2) level: f32) -> VOut {
+    return VOut(vec4<f32>(pos, 0.0, 1.0), uv, level);
 }
 
 @group(0) @binding(0) var t: texture_2d<f32>;
@@ -31,9 +33,17 @@ fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VOut {
 
 @fragment
 fn fs(v: VOut) -> @location(0) vec4<f32> {
-    return textureSample(t, s, v.uv);
+    return textureSampleLevel(t, s, v.uv, v.level);
 }
 "#;
+
+/// Final pass: area-average the offscreen image down to the screen.
+const DOWNSAMPLE_SHADER: &str = include_str!("gpu_compositor_downsample.wgsl");
+
+/// Tile textures and the offscreen image are sRGB, so sampling, filtering and
+/// the downsample average in linear light (averaging the gamma-encoded
+/// values would darken every blend).
+const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 const BAR_SHADER: &str = r#"
 struct VOut {
@@ -184,6 +194,8 @@ const MAX_CLIMB: usize = 40;
 struct Vertex {
     pos: [f32; 2],
     uv: [f32; 2],
+    /// mip level to sample
+    level: f32,
 }
 
 #[repr(C)]
@@ -197,8 +209,21 @@ struct TileEntry {
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     tex_size: u32,
+    /// mip levels (`tex_size` down to 1)
+    levels: u32,
     /// `Tile::version` this texture was built from
     version: u32,
+}
+
+/// The image the tiles are drawn into, 1:1 in texels of the mip level in use,
+/// before being averaged down to the screen. Sized for the worst case
+/// (2 texels per screen pixel per axis, plus a margin) of the current surface.
+struct Offscreen {
+    view:   wgpu::TextureView,
+    width:  u32,
+    height: u32,
+    /// surface size it was made for
+    for_size: (u32, u32),
 }
 
 pub struct GpuCompositor {
@@ -208,6 +233,9 @@ pub struct GpuCompositor {
     surface_config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     bar_pipeline: wgpu::RenderPipeline,
+    downsample_pipeline: wgpu::RenderPipeline,
+    downsample_bgl: wgpu::BindGroupLayout,
+    offscreen: Option<Offscreen>,
     sampler: wgpu::Sampler,
     bgl: wgpu::BindGroupLayout,
     tiles: HashMap<TileKey, TileEntry>,
@@ -311,6 +339,11 @@ impl GpuCompositor {
                                 offset: 8,
                                 shader_location: 1,
                             },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32,
+                                offset: 16,
+                                shader_location: 2,
+                            },
                         ],
                     })],
                 },
@@ -319,7 +352,7 @@ impl GpuCompositor {
                     entry_point: Some("fs"),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format,
+                        format: TEXTURE_FORMAT,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -331,9 +364,12 @@ impl GpuCompositor {
                 cache: None,
             });
 
+            // Tiles are drawn 1:1 from an exact mip level (textureSampleLevel),
+            // so min/mag only matter for previews magnified from coarser data.
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
                 ..Default::default()
             });
 
@@ -387,6 +423,72 @@ impl GpuCompositor {
                 cache: None,
             });
 
+            let downsample_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("downsample"),
+                source: wgpu::ShaderSource::Wgsl(DOWNSAMPLE_SHADER.into()),
+            });
+            let downsample_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("downsample"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+            let downsample_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("downsample"),
+                bind_group_layouts: &[Some(&downsample_bgl)],
+                immediate_size: 0,
+            });
+            let downsample_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("downsample"),
+                layout: Some(&downsample_layout),
+                vertex: wgpu::VertexState {
+                    module: &downsample_shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &downsample_shader,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
             GpuCompositor {
                 device,
                 queue,
@@ -394,6 +496,9 @@ impl GpuCompositor {
                 surface_config,
                 pipeline,
                 bar_pipeline,
+                downsample_pipeline,
+                downsample_bgl,
+                offscreen: None,
                 bar: BarAnim::new(1.0),
                 palette: Vec::new(),
                 sampler,
@@ -425,8 +530,6 @@ impl GpuCompositor {
                 })],
                 ..Default::default()
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.draw(0..0, 0..1);
             pass.set_pipeline(&self.bar_pipeline);
             pass.draw(0..0, 0..1);
         }
@@ -466,10 +569,27 @@ impl GpuCompositor {
         let nx = ((width as f64 - base_sx) / tile_px).ceil().max(1.0) as i64;
         let ny = ((height as f64 - base_sy) / tile_px).ceil().max(1.0) as i64;
 
+        // Antialiasing: a screen pixel spans r = TILE_SIZE / tile_px tile
+        // pixels per axis (between s and 2s). Tiles are drawn 1:1 into an
+        // offscreen image from mip level k, which leaves q = r / 2^k in
+        // [1, 2) offscreen texels per screen pixel (for r < 1: k = 0, q = r),
+        // and the downsample pass averages each screen pixel's q×q texels.
+        let r = TILE_SIZE as f64 / tile_px;
+        let k = if r >= 1.0 { (r.log2().floor() as u32).min(TILE_SIZE.trailing_zeros()) } else { 0 };
+        let q = r / (1u32 << k) as f64;
+        let texels_per_tile = (TILE_SIZE >> k) as f64;
+        // The offscreen image starts at the texel containing the screen's
+        // top-left corner; its texel grid is the level-k tile texel grid.
+        let (ox, oy) = ((-base_sx * q).floor(), (-base_sy * q).floor());
+        let (frac_x, frac_y) = (-base_sx * q - ox, -base_sy * q - oy);
+
         struct Pending {
             src: TileKey,
+            /// destination rectangle in offscreen texels
             px0: f32, py0: f32, px1: f32, py1: f32,
             u0: f32, v0: f32, u1: f32, v1: f32,
+            /// ancestor levels climbed for a preview
+            climb: u32,
         }
 
         let mut pending: Vec<Pending> = Vec::new();
@@ -480,10 +600,10 @@ impl GpuCompositor {
                 x: &x0 + IBig::from(i),
                 y: &y0 + IBig::from(j),
             };
-            let px0 = (base_sx + i as f64 * tile_px) as f32;
-            let py0 = (base_sy + j as f64 * tile_px) as f32;
-            let px1 = px0 + tile_px as f32;
-            let py1 = py0 + tile_px as f32;
+            let px0 = (i as f64 * texels_per_tile - ox) as f32;
+            let py0 = (j as f64 * texels_per_tile - oy) as f32;
+            let px1 = px0 + texels_per_tile as f32;
+            let py1 = py0 + texels_per_tile as f32;
 
             // Climb ancestors to find best available source.
             let mut candidate = key;
@@ -491,7 +611,7 @@ impl GpuCompositor {
             let mut v0 = 0.0_f32;
             let mut frac = 1.0_f32;
 
-            for _ in 0..=MAX_CLIMB {
+            for climb in 0..=MAX_CLIMB as u32 {
                 if let Some(tile) = store.get(&candidate)
                     && tile.display_passes() > 0
                 {
@@ -500,6 +620,7 @@ impl GpuCompositor {
                         src: candidate,
                         px0, py0, px1, py1,
                         u0, v0, u1: u0 + frac, v1: v0 + frac,
+                        climb,
                     });
                     break;
                 }
@@ -515,32 +636,37 @@ impl GpuCompositor {
         for p in &pending {
             self.ensure_texture(&p.src, store);
         }
+        self.ensure_offscreen(width, height);
+        let off = self.offscreen.as_ref().expect("offscreen image");
 
-        // Build one vertex buffer with all quads (6 verts each).
-        let w = width as f32;
-        let h = height as f32;
+        // One vertex buffer with all quads (6 verts each), in the offscreen
+        // image's clip space.
+        let (ow, oh) = (off.width as f32, off.height as f32);
         let to_clip = |px: f32, py: f32| -> [f32; 2] {
-            [px / w * 2.0 - 1.0, 1.0 - py / h * 2.0]
+            [px / ow * 2.0 - 1.0, 1.0 - py / oh * 2.0]
         };
 
         let mut verts: Vec<Vertex> = Vec::with_capacity(pending.len() * 6);
         let mut draw_keys: Vec<(&TileKey, u32)> = Vec::with_capacity(pending.len());
 
         for p in &pending {
-            if !self.tiles.contains_key(&p.src) {
-                continue;
-            }
+            let Some(entry) = self.tiles.get(&p.src) else { continue };
+            // Source texel size in target-depth pixels: the pass stride, times
+            // 2 per ancestor level; the level whose texels are 2^k of those
+            // is drawn 1:1 (coarser data is magnified from level 0).
+            let stride_log2 = (TILE_SIZE / entry.tex_size as usize).trailing_zeros() as i32;
+            let level = (k as i32 - stride_log2 - p.climb as i32).clamp(0, entry.levels as i32 - 1) as f32;
             let base = verts.len() as u32;
             let [x0, y0] = to_clip(p.px0, p.py0);
             let [x1, y1] = to_clip(p.px1, p.py1);
             let (u0, v0, u1, v1) = (p.u0, p.v0, p.u1, p.v1);
             verts.extend_from_slice(&[
-                Vertex { pos: [x0, y0], uv: [u0, v0] },
-                Vertex { pos: [x1, y0], uv: [u1, v0] },
-                Vertex { pos: [x0, y1], uv: [u0, v1] },
-                Vertex { pos: [x1, y0], uv: [u1, v0] },
-                Vertex { pos: [x1, y1], uv: [u1, v1] },
-                Vertex { pos: [x0, y1], uv: [u0, v1] },
+                Vertex { pos: [x0, y0], uv: [u0, v0], level },
+                Vertex { pos: [x1, y0], uv: [u1, v0], level },
+                Vertex { pos: [x0, y1], uv: [u0, v1], level },
+                Vertex { pos: [x1, y0], uv: [u1, v0], level },
+                Vertex { pos: [x1, y1], uv: [u1, v1], level },
+                Vertex { pos: [x0, y1], uv: [u0, v1], level },
             ]);
             draw_keys.push((&p.src, base));
         }
@@ -560,37 +686,52 @@ impl GpuCompositor {
 
         let mut enc = self.device.create_command_encoder(&Default::default());
 
-        if verts.is_empty() {
-            {
-                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &frame_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    ..Default::default()
+        // Tiles → offscreen image.
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &off.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            if !verts.is_empty() {
+                let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
                 });
-                if let Some((vbuf, n)) = &bar {
-                    pass.set_pipeline(&self.bar_pipeline);
-                    pass.set_vertex_buffer(0, vbuf.slice(..));
-                    pass.draw(0..*n, 0..1);
+                pass.set_pipeline(&self.pipeline);
+                pass.set_vertex_buffer(0, vbuf.slice(..));
+                for (key, base) in &draw_keys {
+                    if let Some(entry) = self.tiles.get(*key) {
+                        pass.set_bind_group(0, &entry.bind_group, &[]);
+                        pass.draw(*base..*base + 6, 0..1);
+                    }
                 }
             }
-            self.queue.submit([enc.finish()]);
-            self.queue.present(frame);
-            return animating;
         }
 
-        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        // Offscreen image → screen (area average), then the progress bar.
+        let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::cast_slice(&verts),
-            usage: wgpu::BufferUsages::VERTEX,
+            contents: bytemuck::cast_slice(&[q as f32, 0.0, frac_x as f32, frac_y as f32]),
+            usage: wgpu::BufferUsages::UNIFORM,
         });
-
+        let downsample_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.downsample_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&off.view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+            ],
+        });
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -604,14 +745,9 @@ impl GpuCompositor {
                 })],
                 ..Default::default()
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_vertex_buffer(0, vbuf.slice(..));
-            for (key, base) in &draw_keys {
-                if let Some(entry) = self.tiles.get(*key) {
-                    pass.set_bind_group(0, &entry.bind_group, &[]);
-                    pass.draw(*base..*base + 6, 0..1);
-                }
-            }
+            pass.set_pipeline(&self.downsample_pipeline);
+            pass.set_bind_group(0, &downsample_bg, &[]);
+            pass.draw(0..3, 0..1);
 
             // Progress bar overlay.
             if let Some((vbuf, n)) = &bar {
@@ -627,6 +763,32 @@ impl GpuCompositor {
         // Drop GPU textures for tiles that have been evicted from the CPU store.
         self.tiles.retain(|key, _| store.get(key).is_some());
         animating
+    }
+
+    /// (Re)create the offscreen image for a `width`×`height` surface: at most
+    /// 2 texels per screen pixel per axis (q < 2), plus 2 for the fractional
+    /// start and rounding.
+    fn ensure_offscreen(&mut self, width: u32, height: u32) {
+        if self.offscreen.as_ref().is_some_and(|o| o.for_size == (width, height)) { return; }
+        let max = self.device.limits().max_texture_dimension_2d;
+        let (w, h) = ((2 * width + 2).min(max), (2 * height + 2).min(max));
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TEXTURE_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        log::info!("compositor: offscreen image {w}x{h} for a {width}x{height} surface"); // DIAG
+        self.offscreen = Some(Offscreen {
+            view: texture.create_view(&Default::default()),
+            width: w,
+            height: h,
+            for_size: (width, height),
+        });
     }
 
     fn ensure_texture(&mut self, key: &TileKey, store: &TileStore) {
@@ -655,39 +817,47 @@ impl GpuCompositor {
                 return;
             }
             if entry.tex_size == tex_size {
-                // Same resolution — overwrite pixels in-place.
-                let data = Self::texels(&tile, stride, tex_size, &mut self.palette);
-                self.queue.write_texture(
-                    entry.texture.as_image_copy(),
-                    bytemuck::cast_slice(&data),
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(tex_size * 4),
-                        rows_per_image: Some(tex_size),
-                    },
-                    wgpu::Extent3d { width: tex_size, height: tex_size, depth_or_array_layers: 1 },
-                );
+                // Same resolution — overwrite pixels in-place, every level.
+                let levels = mip_chain(Self::texels(&tile, stride, tex_size, &mut self.palette), tex_size);
+                for (level, data) in levels.iter().enumerate() {
+                    let size = tex_size >> level;
+                    self.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &entry.texture,
+                            mip_level: level as u32,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        bytemuck::cast_slice(data),
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(size * 4),
+                            rows_per_image: Some(size),
+                        },
+                        wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+                    );
+                }
                 self.tiles.get_mut(key).unwrap().version = version;
                 return;
             }
         }
 
         // Create a new texture (first upload or size changed due to new pass).
-        let data = Self::texels(&tile, stride, tex_size, &mut self.palette);
+        let levels = mip_chain(Self::texels(&tile, stride, tex_size, &mut self.palette), tex_size);
         let texture = self.device.create_texture_with_data(
             &self.queue,
             &wgpu::TextureDescriptor {
                 label: None,
                 size: wgpu::Extent3d { width: tex_size, height: tex_size, depth_or_array_layers: 1 },
-                mip_level_count: 1,
+                mip_level_count: levels.len() as u32,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format: TEXTURE_FORMAT,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
-            bytemuck::cast_slice(&data),
+            bytemuck::cast_slice(&levels.concat()),
         );
         let view = texture.create_view(&Default::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -704,7 +874,7 @@ impl GpuCompositor {
                 },
             ],
         });
-        self.tiles.insert(key.clone(), TileEntry { texture, bind_group, tex_size, version });
+        self.tiles.insert(key.clone(), TileEntry { texture, bind_group, tex_size, levels: levels.len() as u32, version });
     }
 
     /// Texels for a tile displayed at `stride`: the stride grid, or at
@@ -792,6 +962,60 @@ fn color_of(iteration: u32, palette: &mut Vec<u32>) -> u32 {
         palette.extend((palette.len()..len).map(|j| val_to_color(NonZeroUsize::new(j))));
     }
     palette[i]
+}
+
+/// Mip levels of a `size`×`size` sRGB RGBA8 image, `size` a power of two:
+/// level 0 is `level0`, each next level the 2×2 box average of the previous
+/// one, taken in linear light. Tiles are 128 px and levels halve, so every
+/// 2×2 block lies inside the tile: no seams at tile edges.
+fn mip_chain(level0: Vec<u32>, size: u32) -> Vec<Vec<u32>> {
+    let (to_lin, to_srgb) = srgb_tables();
+    let mut levels = vec![level0];
+    let mut n = size as usize;
+    while n > 1 {
+        let prev = levels.last().unwrap();
+        let m = n / 2;
+        let mut next = vec![0u32; m * m];
+        for r in 0..m {
+            for c in 0..m {
+                let px = [prev[2 * r * n + 2 * c], prev[2 * r * n + 2 * c + 1],
+                          prev[(2 * r + 1) * n + 2 * c], prev[(2 * r + 1) * n + 2 * c + 1]];
+                let mut out = 0xFF00_0000u32;
+                for ch in 0..3 {
+                    let sum: f32 = px.iter().map(|&p| to_lin[((p >> (8 * ch)) & 0xFF) as usize]).sum();
+                    let i = ((sum / 4.0) * (LIN_STEPS - 1) as f32 + 0.5) as usize;
+                    out |= (to_srgb[i.min(LIN_STEPS - 1)] as u32) << (8 * ch);
+                }
+                next[r * m + c] = out;
+            }
+        }
+        levels.push(next);
+        n = m;
+    }
+    levels
+}
+
+/// Resolution of the linear → sRGB table (12 bits: finer than 8-bit sRGB
+/// needs anywhere, including near black).
+const LIN_STEPS: usize = 4096;
+
+/// (sRGB byte → linear, linear in `LIN_STEPS` steps → sRGB byte).
+fn srgb_tables() -> &'static ([f32; 256], [u8; LIN_STEPS]) {
+    static TABLES: std::sync::OnceLock<([f32; 256], [u8; LIN_STEPS])> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        let mut to_lin = [0f32; 256];
+        for (i, v) in to_lin.iter_mut().enumerate() {
+            let c = i as f32 / 255.0;
+            *v = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+        }
+        let mut to_srgb = [0u8; LIN_STEPS];
+        for (i, v) in to_srgb.iter_mut().enumerate() {
+            let l = i as f32 / (LIN_STEPS - 1) as f32;
+            let c = if l <= 0.0031308 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
+            *v = (c * 255.0 + 0.5) as u8;
+        }
+        (to_lin, to_srgb)
+    })
 }
 
 /// 0x00RRGGBB → Rgba8Unorm [R, G, B, 255] as a little-endian u32.
@@ -1008,6 +1232,39 @@ mod tests {
     use super::*;
 
     const FRAME: f32 = 1.0 / 60.0;
+
+    /// The compositor's WGSL is only compiled when the window opens; check
+    /// that it parses and validates.
+    #[test]
+    fn shaders_validate() {
+        for (name, src) in [("tiles", SHADER), ("bar", BAR_SHADER), ("downsample", DOWNSAMPLE_SHADER)] {
+            let module = naga::front::wgsl::parse_str(src)
+                .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::default())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+    }
+
+    /// Mip levels average in linear light: a uniform tile stays uniform, and
+    /// a black/white checkerboard becomes the sRGB encoding of 50% linear
+    /// grey (188), not the gamma-space average (128).
+    #[test]
+    fn mips_average_in_linear_light() {
+        let rgba = |v: u32| v | (v << 8) | (v << 16) | 0xFF00_0000;
+        let uniform = mip_chain(vec![rgba(77); 8 * 8], 8);
+        assert_eq!(uniform.len(), 4); // 8, 4, 2, 1
+        assert!(uniform.iter().all(|l| l.iter().all(|&p| p == rgba(77))));
+
+        let checker: Vec<u32> = (0..64).map(|i| if (i / 8 + i % 8) % 2 == 0 { rgba(0) } else { rgba(255) }).collect();
+        let levels = mip_chain(checker, 8);
+        for level in &levels[1..] {
+            for &p in level {
+                assert_eq!(p & 0xFF, 188, "{p:08x}");
+                assert_eq!(p >> 24, 0xFF);
+            }
+        }
+    }
 
     #[test]
     fn bar_boundaries_are_pass_shares() {
