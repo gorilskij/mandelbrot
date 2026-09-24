@@ -59,15 +59,28 @@ const BAR_HEIGHT_PX: u32 = 10;
 const BAR_SMOOTH_SECS: f32 = 0.25;
 
 /// Weight of the newest update in the measured speed and update interval.
-const BAR_RATE_ALPHA: f32 = 0.5;
+const BAR_RATE_ALPHA: f32 = 0.3;
+
+/// Time constant with which the bar's speed follows the wanted speed
+/// (momentum: updates change the wanted speed in steps).
+const BAR_MOMENTUM_SECS: f32 = 1.0;
+
+/// Wanted lag behind the real progress, in update intervals' worth of
+/// progress; deviations are corrected over `BAR_CORRECT_INTERVALS` intervals.
+const BAR_LAG_INTERVALS: f32 = 2.0;
+const BAR_CORRECT_INTERVALS: f32 = 2.0;
+
+/// Braking: never faster than covering the remaining gap in this time.
+const BAR_BRAKE_SECS: f32 = 0.3;
 
 /// The drawn progress bar, never ahead of the real progress. Progress
 /// arrives in steps (one per GPU chunk or CPU pass), seconds apart at deep
 /// zooms, where a fixed-time spring caught up and then stood still: jumps.
-/// So rising, it moves at the measured speed (progress per second over
-/// recent updates), reaching each value about when the next one arrives,
-/// and catches up over about one update interval when far behind. Falling
-/// (a restart), it is a critically damped spring ("SmoothDamp").
+/// So rising, it aims for the measured speed (progress per second over
+/// recent updates), corrected to stay about `BAR_LAG_INTERVALS` of an
+/// update behind, and its actual speed follows that with momentum
+/// (switching speeds at each update was jagged). Falling (a restart), it
+/// is a critically damped spring ("SmoothDamp").
 struct BarAnim {
     shown: f32,
     vel:   f32,
@@ -119,13 +132,18 @@ impl BarAnim {
             self.last_change = Some(self.t);
             self.rate = None;
             self.interval = BAR_SMOOTH_SECS;
+            self.vel = 0.0;
         }
-        if dt > 0.0 && target > self.shown && self.rate.is_some() {
-            // Rising at the measured speed, faster when far behind.
+        if dt > 0.0 && target >= self.shown && self.rate.is_some() {
+            let (rate, interval) = (self.rate.unwrap(), self.interval.max(BAR_SMOOTH_SECS));
             let gap = target - self.shown;
-            let speed = self.rate.unwrap().max(gap / (1.5 * self.interval).max(BAR_SMOOTH_SECS));
-            self.shown = (self.shown + speed * dt).min(target);
-            self.vel = 0.0; // the spring below must not inherit it
+            // Done: no more updates to wait for, so no lag.
+            let lag = if target >= 1.0 { 0.0 } else { BAR_LAG_INTERVALS * rate * interval };
+            let wanted = (rate + (gap - lag) / (BAR_CORRECT_INTERVALS * interval))
+                .max(0.0)
+                .min(gap / BAR_BRAKE_SECS);
+            self.vel += (wanted - self.vel) * (1.0 - (-dt / BAR_MOMENTUM_SECS).exp());
+            self.shown = (self.shown + self.vel.max(0.0) * dt).min(target);
         } else if dt > 0.0 {
             let from   = self.shown;
             let omega  = 2.0 / BAR_SMOOTH_SECS;
@@ -1048,6 +1066,36 @@ mod tests {
         // Steady speed is 0.1 per 90 frames ≈ 0.0011/frame.
         assert!(still < 30, "stood still for {still} of 330 frames");
         assert!(max_step < 0.004, "max per-frame step {max_step}");
+    }
+
+    /// Irregular updates (uneven intervals and sizes, like real chunks and
+    /// glitch rounds): the bar's per-frame movement changes gradually, not
+    /// in hiccups at each update.
+    #[test]
+    fn bar_is_smooth_with_irregular_updates() {
+        let mut bar = BarAnim::new(0.0);
+        let intervals = [40, 120, 70, 150, 55, 100, 80, 130];
+        let sizes = [0.02, 0.07, 0.03, 0.08, 0.04, 0.05, 0.05, 0.06];
+        let (mut target, mut next, mut k) = (0.0_f32, 0, 0);
+        let mut moves = vec![];
+        let mut prev = 0.0_f32;
+        for frame in 0..1500 {
+            if frame == next && target < 1.0 {
+                target = (target + sizes[k % sizes.len()]).min(1.0);
+                next += intervals[k % intervals.len()];
+                k += 1;
+            }
+            let Some(shown) = bar.step(target, FRAME) else { break };
+            assert!(shown <= target + 1e-6, "ahead of progress");
+            if frame > 300 { moves.push(shown - prev); }
+            prev = shown;
+        }
+        let mean = moves.iter().sum::<f32>() / moves.len() as f32;
+        let jerk = moves.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max) / mean;
+        let still = moves.iter().filter(|&&m| m < 0.1 * mean).count();
+        eprintln!("mean move {mean:.5}/frame, max change {jerk:.2}x mean, nearly still {still}/{}", moves.len());
+        assert!(jerk < 0.15, "per-frame movement jumps by {jerk:.2}x its mean");
+        assert!(still * 10 < moves.len(), "nearly still for {still} frames");
     }
 
     /// A new view (or iteration change) drops the real progress: the bar

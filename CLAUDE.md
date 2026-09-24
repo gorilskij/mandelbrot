@@ -76,7 +76,9 @@ detection); the CPU one is older (per-group references, no BLA).
   the pixel work done (`BarAnim`): rising, it moves at the measured progress
   speed (so updates seconds apart don't show as jumps), catching up over
   about one update interval when far behind; falling (restart), a critically
-  damped spring; never ahead of the real progress. `render()` returns
+  damped spring; never ahead of the real progress. Rising has momentum and
+  trails the progress by ~2 update intervals, so irregular updates do not
+  make it jerk. `render()` returns
   whether the bar is still moving, and the render thread keeps drawing at
   vsync until it settles.
 
