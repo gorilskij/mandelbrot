@@ -342,10 +342,12 @@ coding):
 
 1. **Share one wgpu device** between the compositor and compute (the CPU/GPU
    overlap half of this item is done).
-2. **Compute fewer pixels**: now the sampling ratio s (0.5 = at most 1:1,
-   ~¼–1× the screen's pixels, vs 1–4× at s = 1); try it in the app. The
-   compositor's ~2 ms per frame could shrink by sizing the offscreen image
-   to what is used instead of 2× the surface.
+2. **Compute fewer pixels**: done as the sampling ratio s (0.5 = at most
+   1:1, ~¼–1× the screen's pixels, vs 1–4× at s = 1). Note only (the user
+   doesn't care for now): the offscreen image is always 2× the surface per
+   axis, but is fully used only just before a depth switch; sizing it to
+   the ratio in use would save ~1 ms of GPU bandwidth per frame. It is
+   scratch space, so this is no extra computation.
 3. **Palette scrolling**: Cmd-scroll shifts the phase of the hue sine wave,
    Alt-scroll the lightness one (in `val_to_color`). Cheap: rebuild the
    compositor's palette table and re-upload, no recompute.
