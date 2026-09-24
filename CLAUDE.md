@@ -281,25 +281,24 @@ Done: bounded chunked dispatch, nucleus references, rebasing, sub-passes,
 quadtree seeding, iteration retargeting, interior detection, BLA, the floatexp
 underflow, dropped-dispatch and floatexp-orbit fixes, deep nucleus search
 (precision, speed, caching, far reuse), BLA near an escaping reference, and
-the momentum progress bar. Still open (talk through before coding):
+the momentum progress bar. Decided: render order stays pass-major (each
+pass completes, rippling out from the cursor, before the next starts); the
+user rejected ring-by-ring refinement. Still open (talk through before
+coding):
 
-1. **Ring-by-ring refinement**: chunks are pass-major (all of pass N,
-   cursor-first, then pass N+1). Preferred: pass 0 everywhere first, then
-   refine ring by ring around the cursor, finishing each ring including its
-   glitch correction.
-2. **Overlap CPU and GPU work** (submit chunk k+1 before reading back chunk
+1. **Overlap CPU and GPU work** (submit chunk k+1 before reading back chunk
    k) and share one wgpu device between the compositor and compute.
-3. **Compute fewer pixels**: depth by rounding instead of ceil (~2.3× the
+2. **Compute fewer pixels**: depth by rounding instead of ceil (~2.3× the
    screen's pixels today); needs an A/B look at quality first.
-4. **Palette scrolling**: Cmd-scroll shifts the phase of the hue sine wave,
+3. **Palette scrolling**: Cmd-scroll shifts the phase of the hue sine wave,
    Alt-scroll the lightness one (in `val_to_color`). Cheap: rebuild the
    compositor's palette table and re-upload, no recompute.
-5. **Mantissa precision**: double-single delta arithmetic, or accept f32
+4. **Mantissa precision**: double-single delta arithmetic, or accept f32
    (much better with BLA). Undecided.
-6. **CPU backend** lacks the GPU's nucleus references, rebasing, BLA and
+5. **CPU backend** lacks the GPU's nucleus references, rebasing, BLA and
    interior detection; the GPU lacks the CPU's black-fill. Not solid
    guessing (fill a cell whose corners match): the user said not yet.
-7. **Background reference search** (TODO, agreed 2026-09-24): the nucleus
+6. **Background reference search** (TODO, agreed 2026-09-24): the nucleus
    search still blocks pass 0 for ~1-4 s at 2⁻³¹⁶…2⁻³⁴⁰ after a paste or
    fresh view, or once the cached nucleus is more than `MAX_REF_REUSE_DIST`
    radii out. Instead, start rendering at once with whatever reference is at
