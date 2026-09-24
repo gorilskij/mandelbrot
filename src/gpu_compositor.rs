@@ -54,20 +54,44 @@ fn fs(v: VOut) -> @location(0) vec4<f32> {
 
 const PROGRESS_BAR: bool = true;
 const BAR_HEIGHT_PX: u32 = 10;
-/// Smoothing time of the bar's spring: progress arrives in steps (one per GPU
-/// chunk or CPU pass), and jumps back when the view or iteration count
-/// changes; the spring turns both into smooth motion.
+/// Smoothing time of the bar's spring (falling, and rising before the speed
+/// is known): progress jumps back when the view or iteration count changes.
 const BAR_SMOOTH_SECS: f32 = 0.25;
 
-/// The drawn progress bar: a critically damped spring ("SmoothDamp") chasing
-/// the real progress in either direction, never overshooting it.
+/// Weight of the newest update in the measured speed and update interval.
+const BAR_RATE_ALPHA: f32 = 0.5;
+
+/// The drawn progress bar, never ahead of the real progress. Progress
+/// arrives in steps (one per GPU chunk or CPU pass), seconds apart at deep
+/// zooms, where a fixed-time spring caught up and then stood still: jumps.
+/// So rising, it moves at the measured speed (progress per second over
+/// recent updates), reaching each value about when the next one arrives,
+/// and catches up over about one update interval when far behind. Falling
+/// (a restart), it is a critically damped spring ("SmoothDamp").
 struct BarAnim {
     shown: f32,
     vel:   f32,
     last:  Option<std::time::Instant>,
+    /// Seconds of animation time (sum of `step`'s dt).
+    t:     f32,
+    /// Target at the last change, and when it changed (None: not yet seen,
+    /// so the first update only starts the clock).
+    last_target: f32,
+    last_change: Option<f32>,
+    /// Measured speed (progress/s) and update interval (s); None until a
+    /// rising update has been timed since the last restart.
+    rate:     Option<f32>,
+    interval: f32,
 }
 
 impl BarAnim {
+    fn new(shown: f32) -> Self {
+        Self {
+            shown, vel: 0.0, last: None, t: 0.0,
+            last_target: shown, last_change: None, rate: None, interval: BAR_SMOOTH_SECS,
+        }
+    }
+
     /// Advance towards `target` (0..=1) and return the fill to draw, or
     /// `None` once complete and settled (bar hidden).
     fn advance(&mut self, target: f32) -> Option<f32> {
@@ -79,7 +103,30 @@ impl BarAnim {
 
     /// `advance` with an explicit time step.
     fn step(&mut self, target: f32, dt: f32) -> Option<f32> {
-        if dt > 0.0 {
+        self.t += dt;
+        if target > self.last_target + 1e-6 {
+            if let Some(since) = self.last_change.map(|c| self.t - c).filter(|&s| s > 0.0) {
+                let rate = (target - self.last_target) / since;
+                let mix = |old: f32, new: f32| old + BAR_RATE_ALPHA * (new - old);
+                self.rate = Some(self.rate.map_or(rate, |r| mix(r, rate)));
+                self.interval = mix(self.interval, since);
+            }
+            self.last_target = target;
+            self.last_change = Some(self.t);
+        } else if target < self.last_target - 1e-6 {
+            // Restart: the old speed no longer applies.
+            self.last_target = target;
+            self.last_change = Some(self.t);
+            self.rate = None;
+            self.interval = BAR_SMOOTH_SECS;
+        }
+        if dt > 0.0 && target > self.shown && self.rate.is_some() {
+            // Rising at the measured speed, faster when far behind.
+            let gap = target - self.shown;
+            let speed = self.rate.unwrap().max(gap / (1.5 * self.interval).max(BAR_SMOOTH_SECS));
+            self.shown = (self.shown + speed * dt).min(target);
+            self.vel = 0.0; // the spring below must not inherit it
+        } else if dt > 0.0 {
             let from   = self.shown;
             let omega  = 2.0 / BAR_SMOOTH_SECS;
             let x      = omega * dt;
@@ -329,7 +376,7 @@ impl GpuCompositor {
                 surface_config,
                 pipeline,
                 bar_pipeline,
-                bar: BarAnim { shown: 1.0, vel: 0.0, last: None },
+                bar: BarAnim::new(1.0),
                 palette: Vec::new(),
                 sampler,
                 bgl,
@@ -957,7 +1004,7 @@ mod tests {
     /// never overtaken, and finishes then hides.
     #[test]
     fn bar_follows_steps_smoothly_and_hides() {
-        let mut bar = BarAnim { shown: 0.02, vel: 0.0, last: None };
+        let mut bar = BarAnim::new(0.02);
         let mut target = 0.02_f32;
         let mut prev = 0.02_f32;
         let mut max_step = 0.0_f32;
@@ -980,11 +1027,35 @@ mod tests {
         assert!(!bar.animating(1.0));
     }
 
+    /// Progress arriving seconds apart (deep zooms): once the speed is
+    /// measured the bar keeps moving between updates at about that speed,
+    /// instead of catching up and standing still.
+    #[test]
+    fn bar_moves_steadily_between_slow_updates() {
+        let mut bar = BarAnim::new(0.0);
+        let mut target = 0.0_f32;
+        let (mut prev, mut still, mut max_step) = (0.0_f32, 0, 0.0_f32);
+        for frame in 0..600 {
+            if frame % 90 == 0 { target = (target + 0.1).min(1.0); } // every 1.5 s
+            let shown = bar.step(target, FRAME).unwrap();
+            assert!(shown <= target + 1e-6, "ahead of progress");
+            if frame >= 270 { // after a few updates
+                if shown - prev < 1e-5 { still += 1; }
+                max_step = max_step.max(shown - prev);
+            }
+            prev = shown;
+        }
+        // Steady speed is 0.1 per 90 frames ≈ 0.0011/frame.
+        assert!(still < 30, "stood still for {still} of 330 frames");
+        assert!(max_step < 0.004, "max per-frame step {max_step}");
+    }
+
     /// A new view (or iteration change) drops the real progress: the bar
     /// eases down smoothly, never below the new value, and gets there.
     #[test]
     fn bar_eases_down_on_restart() {
-        let mut bar = BarAnim { shown: 0.8, vel: 0.3, last: None }; // moving up
+        let mut bar = BarAnim::new(0.8);
+        bar.vel = 0.3; // moving up
         let mut prev = 0.8_f32;
         let mut max_step = 0.0_f32;
         let mut reached = None;
