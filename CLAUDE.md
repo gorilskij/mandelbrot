@@ -168,7 +168,11 @@ Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
   (interruptibly) and redoes the deferred pixels against the nucleus, or,
   if none was found, sends them through the usual glitch rounds. After a
   paste at 2⁻³¹⁴…2⁻³²⁶: first pixels after ~110 ms instead of 1–2 s,
-  accuracy as with the view's own nucleus. A generation that started on the
+  accuracy as with the view's own nucleus. Total time per generation
+  (4 interleaved runs vs master): unchanged where a nucleus is found (pass 0
+  still ends waiting for it: 3.4–3.6 s), −21% where none is (2⁻³¹⁸:
+  6.9 → 5.4 s; the deferred pixels go through glitch rounds once instead of
+  per chunk). A generation that started on the
   provisional reference can differ from a later one by f32 rounding in a
   few pixels (1 of 15000 at 2⁻³⁰⁵).
 - References need not lie on the pixel grid: `ref_px` gives the reference's
@@ -324,3 +328,7 @@ coding):
 5. **CPU backend** lacks the GPU's nucleus references, rebasing, BLA and
    interior detection; the GPU lacks the CPU's black-fill. Not solid
    guessing (fill a cell whose corners match): the user said not yet.
+6. **Don't wait for the search at the end of pass 0** (optional, only if the
+   ~1–2 s wait still bothers the user): move on to later passes while
+   deferred pixels are pending. Tricky: a tile finishes a pass only once all
+   its pixels are stored, and later passes would defer more pixels too.
