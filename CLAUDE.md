@@ -11,7 +11,7 @@ detection); the CPU one is older (per-group references, no BLA).
 - `cargo run --release` (dev builds optimise dependencies too, see Cargo.toml).
   Logging defaults to `info` and is teed to `gpu.log` in the working directory
   (overwritten on each launch, gitignored); `RUST_LOG` overrides the level.
-- The app **starts on the CPU backend**; **Escape** switches CPU/GPU (and
+- The app **starts on the GPU backend**; **Escape** switches CPU/GPU (and
   resets). **Space** resets: drops every tile and the CPU reference lists (the
   GPU backend's cached reference survives, which is harmless). **↑/↓**
   doubles/halves the max iterations (default 2048; tiles are retargeted, not
