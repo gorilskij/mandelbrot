@@ -2,7 +2,7 @@ use crate::rendering::{CoordinatesBox, val_to_color};
 use std::num::NonZeroUsize;
 use crate::tiles::store::{
     GRID_STRIDES, NUM_GRID_PASSES, NUM_PASSES, TILE_LEN, TILE_SIZE, Tile, TileKey, TileStore,
-    depth_for_view, pass_of, pass_pixels, tile_index,
+    pass_of, pass_pixels, tile_index,
     units_per_pixel,
 };
 use bytemuck::{Pod, Zeroable};
@@ -455,7 +455,7 @@ impl GpuCompositor {
 
         let store_frame = store.next_frame();
         let view = coords.view.inner;
-        let depth = depth_for_view(view);
+        let depth = store.depth_for_view(view);
         let tile_px = TILE_SIZE as f64 * (units_per_pixel(depth) / view);
 
         let x0 = tile_index(&coords.origin.x, depth);

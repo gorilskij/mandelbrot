@@ -110,6 +110,12 @@ struct App {
     bounds: Option<(f64, f64, f64, f64)>,
 }
 
+/// Sampling ratio s (←/→): tile pixels per screen pixel, per axis, at
+/// least; see `TileStore::min_ratio`.
+const SAMPLING_STEP: f64 = 0.5;
+const SAMPLING_MIN:  f64 = 0.5;
+const SAMPLING_MAX:  f64 = 4.0;
+
 impl App {
     fn new() -> Self {
         let precision = 100;
@@ -256,7 +262,9 @@ impl App {
     fn update_title(&self) {
         let Some(window) = &self.window else { return };
         let view  = self.coords.view.inner;
-        let depth = crate::tiles::store::depth_for_view(view);
+        let ratio = self.drawer.as_ref().map_or(1.0, |d| d.store().min_ratio());
+        let depth = self.drawer.as_ref()
+            .map_or_else(|| crate::tiles::store::depth_for_view(view), |d| d.store().depth_for_view(view));
         let upp   = crate::tiles::store::upp_log2(depth);
         let gpu   = self.use_gpu.load(std::sync::atomic::Ordering::Relaxed);
         let pipe  = if !gpu { "cpu" }
@@ -264,9 +272,9 @@ impl App {
             else { "f32" };
         let (cx, cy) = self.center_coord_f64();
         window.set_title(&format!(
-            "Mandelbrot | {} | view {:.4e} (2^{:.2}) | depth {} upp 2^{} | iters {} | centre {:.17}, {:.17} \
+            "Mandelbrot | {} | view {:.4e} (2^{:.2}) | depth {} upp 2^{} | s {} | iters {} | centre {:.17}, {:.17} \
              | mods [{}] | key {}",
-            pipe, view, view.log2(), depth, upp, self.iterations, cx, cy,
+            pipe, view, view.log2(), depth, upp, ratio, self.iterations, cx, cy,
             mod_symbols(self.modifiers), self.key_debug,
         ));
     }
@@ -512,6 +520,17 @@ impl ApplicationHandler for App {
                         self.pending_update =
                             self.pending_update.max(UpdateKind::AroundCursor);
                         self.note_action("iterations ÷2");
+                    }
+                    KeyCode::ArrowLeft | KeyCode::ArrowRight => {
+                        if let Some(drawer) = &self.drawer {
+                            let step = if code == KeyCode::ArrowRight { SAMPLING_STEP } else { -SAMPLING_STEP };
+                            let s = (drawer.store().min_ratio() + step).clamp(SAMPLING_MIN, SAMPLING_MAX);
+                            drawer.store().set_min_ratio(s);
+                            info!("sampling ratio s = {s}");
+                            self.pending_update =
+                                self.pending_update.max(UpdateKind::AroundCursor);
+                            self.note_action(&format!("s = {s}"));
+                        }
                     }
                     _ if ctrl && letter == "c" => {
                         let data = ClipBoardData {

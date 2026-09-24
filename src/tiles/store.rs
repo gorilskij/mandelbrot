@@ -123,6 +123,7 @@ pub fn pixel_to_coord(pixel: IBig, depth: i64, prec: usize) -> FBig {
 /// The depth at which tiles should be rendered for a given view scale
 /// (units per screen pixel): the smallest depth whose tile resolution is at
 /// least the screen resolution, so tiles are displayed at scale (1/2, 1].
+/// With a sampling ratio s, `TileStore::depth_for_view` passes `view / s`.
 pub fn depth_for_view(view: f64) -> i64 {
     let d = (DEPTH_0_TILE_SPAN_LOG2 as f64 - TILE_POW as f64 - view.log2()).ceil();
     if d.is_nan() {
@@ -348,6 +349,9 @@ pub struct TileStore {
     /// TEST: set by spacebar; the next render dumps everything and restarts
     reset: AtomicBool,
     max_tiles: usize,
+    /// Sampling: the smallest number of tile pixels per screen pixel (per
+    /// axis) to render at, as f32 bits; see `depth_for_view`.
+    min_ratio: AtomicU32,
 }
 
 impl TileStore {
@@ -359,7 +363,25 @@ impl TileStore {
             generation: AtomicU64::new(0),
             reset: AtomicBool::new(false),
             max_tiles: (memory_budget_bytes / TILE_BYTES).max(64),
+            min_ratio: AtomicU32::new(1.0f32.to_bits()),
         }
+    }
+
+    /// Sampling ratio s: tiles are rendered at the depth where one screen
+    /// pixel spans between s and 2s tile pixels per axis (s = 1: between
+    /// 1:1 and 2:1; the compositor averages them down to the screen).
+    pub fn min_ratio(&self) -> f64 {
+        f32::from_bits(self.min_ratio.load(Ordering::Relaxed)) as f64
+    }
+
+    pub fn set_min_ratio(&self, s: f64) {
+        self.min_ratio.store((s as f32).to_bits(), Ordering::Relaxed);
+    }
+
+    /// The depth to render a view at (units per screen pixel) with the
+    /// current sampling ratio.
+    pub fn depth_for_view(&self, view: f64) -> i64 {
+        depth_for_view(view / self.min_ratio())
     }
 
     /// TEST: request a full reset (dump all tiles) on the next render.
@@ -532,6 +554,21 @@ mod tests {
             let d = depth_for_view(view);
             assert!(units_per_pixel(d) <= view, "view_log2 = {view_log2}");
             assert!(units_per_pixel(d) > view / 2.0, "view_log2 = {view_log2}");
+        }
+    }
+
+    /// With sampling ratio s, a screen pixel spans between s and 2s tile
+    /// pixels per axis.
+    #[test]
+    fn depth_follows_sampling_ratio() {
+        let store = TileStore::new(1 << 20);
+        for s in [0.5, 1.0, 1.5, 2.0, 2.5, 4.0] {
+            store.set_min_ratio(s);
+            for i in 0..200 {
+                let view = (-30.0 + i as f64 * 0.137).exp2();
+                let ratio = view / units_per_pixel(store.depth_for_view(view));
+                assert!(ratio >= s && ratio < 2.0 * s, "s {s}, view {view:e}: ratio {ratio}");
+            }
         }
     }
 

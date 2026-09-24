@@ -7,7 +7,7 @@ use crate::rendering::{CoordinatesBox, Pixels, calculate_orbit};
 use crate::support::Point;
 use crate::tiles::perturb::{PassBatchCtx, Perturbator, RefList, RefOrbit, TileItem};
 use crate::tiles::store::{
-    GROUP_POW, GROUP_TILES, NUM_PASSES, TILE_SIZE, TileKey, TileStore, depth_for_view,
+    GROUP_POW, GROUP_TILES, NUM_PASSES, TILE_SIZE, TileKey, TileStore,
     floor_div_pow2, pixel_to_coord, tile_index, units_per_pixel, working_precision,
 };
 use dashu::integer::IBig;
@@ -115,7 +115,7 @@ pub fn run_generation(
 
     let generation = store.begin_generation();
     let view       = coords.view.inner;
-    let depth      = depth_for_view(view);
+    let depth      = store.depth_for_view(view);
 
     info!(
         "render generation {generation}: depth {depth}, iterations {iterations} \
