@@ -557,27 +557,39 @@ impl GpuState {
 
     /// Dispatch pixels given as offsets from `r` in pixel units.
     fn dispatch_offsets(&self, offs: &[(f64, f64)], upp: i64, r: &GpuRef) -> Vec<u32> {
-        if upp < FE_THRESHOLD {
-            let d: Vec<[f32; 4]> = offs.iter().map(|&(x, y)| pack_fe(x, y, upp)).collect();
-            self.dispatch_fe(&d, r)
-        } else {
-            // upp >= FE_THRESHOLD, so 2^upp is a normal f64 and f32.
-            let scale = (upp as f64).exp2();
-            let d: Vec<[f32; 2]> = offs.iter()
-                .map(|&(x, y)| [(x * scale) as f32, (y * scale) as f32])
-                .collect();
-            self.dispatch_f32(&d, r)
+        let d = Deltas::pack(offs, upp);
+        self.dispatch(self.pipeline_for(&d), &d.bytes, d.n, d.elem(), r)
+    }
+
+    fn pipeline_for(&self, d: &Deltas) -> &wgpu::ComputePipeline {
+        if d.fe { &self.pipeline_fe } else { &self.pipeline }
+    }
+
+    /// Submit packed seeds against `r` without waiting for them, so the CPU
+    /// can post-process the previous chunk meanwhile; `finish` reads them
+    /// back.
+    fn submit_deltas(&self, d: Deltas, r: Arc<GpuRef>) -> PendingChunk {
+        let max_pixels = ((self.max_binding / d.elem()) * 9 / 10).max(1);
+        let parts = d.bytes.chunks(max_pixels * d.elem())
+            .filter_map(|b| self.submit_once(self.pipeline_for(&d), b, b.len() / d.elem(), &r))
+            .collect();
+        PendingChunk { deltas: d, gref: r, parts, t_submit: std::time::Instant::now() }
+    }
+
+    /// Wait for a submitted chunk and read it back, retrying pixels the GPU
+    /// did not run (see `dispatch_chunk`).
+    fn finish(&self, p: PendingChunk) -> Vec<u32> {
+        let (d, elem) = (&p.deltas, p.deltas.elem());
+        let mut out = Vec::with_capacity(d.n);
+        let mut at = 0;
+        for part in p.parts {
+            let n = part.n;
+            let bytes = &d.bytes[at * elem..(at + n) * elem];
+            let got = self.wait(part);
+            out.extend(self.retry_not_run(self.pipeline_for(d), bytes, n, &p.gref, got));
+            at += n;
         }
-    }
-
-    /// Plain-f32 dispatch: one `[f32; 2]` delta per pixel.
-    fn dispatch_f32(&self, deltas: &[[f32; 2]], r: &GpuRef) -> Vec<u32> {
-        self.dispatch(&self.pipeline, bytemuck::cast_slice(deltas), deltas.len(), 8, r)
-    }
-
-    /// floatexp dispatch: one `[f32; 4]` seed per pixel (mantissa.xy, exp, _).
-    fn dispatch_fe(&self, deltas: &[[f32; 4]], r: &GpuRef) -> Vec<u32> {
-        self.dispatch(&self.pipeline_fe, bytemuck::cast_slice(deltas), deltas.len(), 16, r)
+        out
     }
 
     /// Upload deltas + orbit, dispatch `pipeline`, and read back raw results.
@@ -618,6 +630,18 @@ impl GpuState {
         r:           &GpuRef,
     ) -> Vec<u32> {
         let out = self.dispatch_once(pipeline, delta_bytes, n_pixels, r);
+        self.retry_not_run(pipeline, delta_bytes, n_pixels, r, out)
+    }
+
+    /// Given the results `out` of a dispatch, redo the pixels it did not run.
+    fn retry_not_run(
+        &self,
+        pipeline:    &wgpu::ComputePipeline,
+        delta_bytes: &[u8],
+        n_pixels:    usize,
+        r:           &GpuRef,
+        out:         Vec<u32>,
+    ) -> Vec<u32> {
         let missing = out.iter().filter(|&&v| v == NOT_RUN).count();
         if missing == 0 {
             return out;
@@ -642,9 +666,20 @@ impl GpuState {
         n_pixels:    usize,
         r:           &GpuRef,
     ) -> Vec<u32> {
+        self.submit_once(pipeline, delta_bytes, n_pixels, r).map_or_else(Vec::new, |f| self.wait(f))
+    }
+
+    /// Submit a single dispatch (`None` for no pixels); `wait` reads it back.
+    fn submit_once(
+        &self,
+        pipeline:    &wgpu::ComputePipeline,
+        delta_bytes: &[u8],
+        n_pixels:    usize,
+        r:           &GpuRef,
+    ) -> Option<InFlight> {
         let n = n_pixels as u32;
         let (interior_window, interior_contraction) = r.interior;
-        if n == 0 { return Vec::new(); }
+        if n == 0 { return None; }
 
         let device = &self.device;
         let queue  = &self.queue;
@@ -711,17 +746,20 @@ impl GpuState {
         }
         enc.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
         let t_submit = std::time::Instant::now(); // DIAG
-        queue.submit([enc.finish()]);
-        log::info!("[diag gpu] dispatch chunk {n_pixels} px submitted, waiting..."); // DIAG
+        let index = queue.submit([enc.finish()]);
+        staging_buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        Some(InFlight { staging: staging_buf, index, n: n_pixels, t_submit })
+    }
 
-        let slice = staging_buf.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        log::info!(
-            "[diag gpu] dispatch chunk {n_pixels} px ({}x{} groups): gpu wait {:.1} ms",
-            gx, gy, t_submit.elapsed().as_secs_f64() * 1e3,
+    /// Wait for one submitted dispatch (only that one: later submissions
+    /// keep the GPU busy meanwhile) and read back its results.
+    fn wait(&self, f: InFlight) -> Vec<u32> {
+        self.device.poll(wgpu::PollType::Wait { submission_index: Some(f.index), timeout: None }).unwrap();
+        log::info!( // DIAG
+            "[diag gpu] dispatch {} px done {:.1} ms after submit", f.n, f.t_submit.elapsed().as_secs_f64() * 1e3,
         );
-
+        let staging_buf = f.staging;
+        let slice = staging_buf.slice(..);
         let data = slice.get_mapped_range().expect("staging buffer mapped");
         let results: Vec<u32> = data
             .as_chunks::<4>().0.iter()
@@ -731,6 +769,52 @@ impl GpuState {
         staging_buf.unmap();
         results
     }
+}
+
+/// Per-pixel seeds packed for one of the two pipelines: `[f32; 2]` deltas
+/// (plain f32) or `[f32; 4]` floatexp seeds (mantissa.xy, exp, _).
+struct Deltas {
+    bytes: Vec<u8>,
+    n:     usize,
+    fe:    bool,
+}
+
+impl Deltas {
+    /// Pack offsets in pixel units at depth `upp`.
+    fn pack(offs: &[(f64, f64)], upp: i64) -> Self {
+        let fe = upp < FE_THRESHOLD;
+        let bytes = if fe {
+            let d: Vec<[f32; 4]> = offs.iter().map(|&(x, y)| pack_fe(x, y, upp)).collect();
+            bytemuck::cast_slice(&d).to_vec()
+        } else {
+            // upp >= FE_THRESHOLD, so 2^upp is a normal f64 and f32.
+            let scale = (upp as f64).exp2();
+            let d: Vec<[f32; 2]> = offs.iter()
+                .map(|&(x, y)| [(x * scale) as f32, (y * scale) as f32])
+                .collect();
+            bytemuck::cast_slice(&d).to_vec()
+        };
+        Self { bytes, n: offs.len(), fe }
+    }
+
+    fn elem(&self) -> usize { if self.fe { 16 } else { 8 } }
+}
+
+/// One submitted dispatch, not yet read back.
+struct InFlight {
+    staging:  wgpu::Buffer,
+    index:    wgpu::SubmissionIndex,
+    n:        usize,
+    t_submit: std::time::Instant, // DIAG
+}
+
+/// A chunk submitted with `submit_offsets`: its seeds and reference are
+/// kept for retrying pixels the GPU did not run.
+struct PendingChunk {
+    deltas:   Deltas,
+    gref:     Arc<GpuRef>,
+    parts:    Vec<InFlight>,
+    t_submit: std::time::Instant,
 }
 
 fn bgl_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
@@ -882,7 +966,7 @@ impl Perturbator for Gpu {
             log2_dc(&[(max, 0.0)], upp)
         };
         let t_prep = std::time::Instant::now(); // DIAG
-        let mut gref = state.prepare(&reference, pass_dc(&reference), upp);
+        let mut gref = Arc::new(state.prepare(&reference, pass_dc(&reference), upp));
         log::info!("[diag gpu] pass {pass}: reference uploaded (BLA {} levels) in {:.1} ms", gref.bla_levels, ms(t_prep));
         // DIAG
         {
@@ -899,23 +983,43 @@ impl Perturbator for Gpu {
         // Chunks: each dispatch is sized to take about TARGET_CHUNK_MS, so the
         // interrupt is honoured within that time (in-flight GPU work cannot
         // be cancelled) and results reach the screen as they arrive.
+        //
+        // One chunk on the GPU at a time (two queued ones ran concurrently,
+        // each ~2x slower per pixel, and could not be timed), but the CPU
+        // work overlaps it: the next chunk's seeds are packed while waiting,
+        // and it is submitted as soon as this one is read back, before this
+        // one's glitch rounds, CPU resolve and storing (~30% of a pass with
+        // the GPU idle before). Its size comes from the chunk before this
+        // one, except right after the probe.
         // ----------------------------------------------------------------
-        let mut pos    = 0;
         let mut chunks = 0usize; // DIAG
-        while pos < pixel_refs.len() {
-            if int.interrupted() { break; }
-            let len   = if chunks == 0 { PROBE_CHUNK_PX } else { state.chunk_len() }
-                .min(pixel_refs.len() - pos);
-            let chunk = pos..pos + len;
-
-            let t_disp = std::time::Instant::now();
-            let offs   = offsets(&mut chunk.clone(), &reference);
-            let mut raw = state.dispatch_offsets(&offs, upp, &gref);
-            let disp_ms = ms(t_disp);
-            state.record_chunk(len, disp_ms);
+        let pack = |pos: usize, first: bool, r: &Reference| {
+            let len = if first { PROBE_CHUNK_PX } else { state.chunk_len() }.min(pixel_refs.len() - pos);
+            (pos, len, Deltas::pack(&offsets(&mut (pos..pos + len), r), upp))
+        };
+        let submit = |(pos, len, d): (usize, usize, Deltas), gref: &Arc<GpuRef>| {
+            (pos, len, state.submit_deltas(d, gref.clone()))
+        };
+        let mut current = (!int.interrupted()).then(|| submit(pack(0, true, &reference), &gref));
+        let mut pos = 0;
+        while let Some((at, len, pending)) = current.take() {
+            let more = at + len < pixel_refs.len();
+            let packed = (more && chunks > 0 && !int.interrupted()).then(|| pack(at + len, false, &reference));
+            let t_wait = std::time::Instant::now();
+            let t_submit = pending.t_submit;
+            let mut raw = state.finish(pending);
+            let done = std::time::Instant::now();
+            // Only a wait that blocked tells when the GPU finished.
+            if (done - t_wait).as_secs_f64() > 1e-4 {
+                state.record_chunk(len, (done - t_submit).as_secs_f64() * 1e3);
+            }
+            if more && !int.interrupted() {
+                current = Some(submit(packed.unwrap_or_else(|| pack(at + len, false, &reference)), &gref));
+            }
+            pos = at;
             log::info!(
-                "[diag gpu] pass {pass} chunk {chunks}: {len} px at {pos} in {disp_ms:.1} ms -> {}",
-                raw_stats(&raw),
+                "[diag gpu] pass {pass} chunk {chunks}: {len} px at {pos}, gpu {:.1} ms -> {}",
+                (done - t_submit).as_secs_f64() * 1e3, raw_stats(&raw),
             );
 
             // Glitch rounds: a pixel is glitched only when it outlived the
@@ -952,7 +1056,7 @@ impl Perturbator for Gpu {
                 // Later chunks start from the better reference.
                 if new_ref.beats(&reference) {
                     reference = new_ref;
-                    gref = state.prepare(&reference, pass_dc(&reference), upp);
+                    gref = Arc::new(state.prepare(&reference, pass_dc(&reference), upp));
                 }
             }
 

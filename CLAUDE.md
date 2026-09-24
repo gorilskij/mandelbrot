@@ -169,6 +169,15 @@ Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
   Per chunk: dispatch → glitch rounds (up to `MAX_GLITCH_PASSES=8`) → residual
   CPU resolve → store → finish every tile whose pixels are all stored → bump
   `ctx.progress` so the compositor redraws.
+- **CPU/GPU overlap**: one chunk on the GPU at a time, but the next chunk's
+  seeds are packed (`Deltas::pack`) while waiting, and it is submitted
+  (`submit_deltas`) as soon as the current one is read back (`finish`),
+  before the current one's glitch rounds, resolve and storing. ~17% faster
+  per generation at the 2⁻³⁰⁵ view (the GPU was idle ~30% of a pass). Don't
+  queue two chunks at once: Metal runs them concurrently, each ~2× slower per
+  pixel, and their times can't be measured, so chunk sizing broke (a 1.5M px,
+  148 ms dispatch). The next chunk is sized from the chunk before the current
+  one (except right after the probe).
 - **Keep dispatches short: macOS kills long GPU command buffers** (seen at a
   few hundred ms) and then drops some following ones, and wgpu reports
   neither; the output would silently keep its initial value. So besides the
@@ -280,14 +289,14 @@ Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
 Done: bounded chunked dispatch, nucleus references, rebasing, sub-passes,
 quadtree seeding, iteration retargeting, interior detection, BLA, the floatexp
 underflow, dropped-dispatch and floatexp-orbit fixes, deep nucleus search
-(precision, speed, caching, far reuse), BLA near an escaping reference, and
-the momentum progress bar. Decided: render order stays pass-major (each
+(precision, speed, caching, far reuse), BLA near an escaping reference, the
+momentum progress bar, and CPU/GPU overlap. Decided: render order stays pass-major (each
 pass completes, rippling out from the cursor, before the next starts); the
 user rejected ring-by-ring refinement. Still open (talk through before
 coding):
 
-1. **Overlap CPU and GPU work** (submit chunk k+1 before reading back chunk
-   k) and share one wgpu device between the compositor and compute.
+1. **Share one wgpu device** between the compositor and compute (the CPU/GPU
+   overlap half of this item is done).
 2. **Compute fewer pixels**: depth by rounding instead of ceil (~2.3× the
    screen's pixels today); needs an A/B look at quality first.
 3. **Palette scrolling**: Cmd-scroll shifts the phase of the hue sine wave,
