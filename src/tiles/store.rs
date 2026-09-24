@@ -83,8 +83,15 @@ pub fn pass_pixels(pass: u8) -> impl Iterator<Item = (usize, usize)> {
 pub const GROUP_POW: usize = 4;
 pub const GROUP_TILES: usize = 1 << GROUP_POW;
 
-/// memory budget for the tile cache; old tiles are dropped (LRU) beyond this
+/// Minimum memory budget for the tile cache; old tiles are dropped (LRU)
+/// beyond the budget, which grows with the view (`set_view_tiles`).
 pub const MEMORY_BUDGET_BYTES: usize = 1 << 30; // 1 GiB ~ 16k tiles
+
+/// The tile budget is at least this many times the current view's tiles:
+/// room for their ancestors (+1/3, for previews and seeding) and for recent
+/// views to go back to. No ceiling: the view itself is bounded, e.g. at s = 4
+/// a 3000x2000 window needs up to ~24k tiles (1.5 GiB), so ~4.5 GiB.
+const VIEW_BUDGET_FACTOR: usize = 3;
 const TILE_BYTES: usize = TILE_LEN * size_of::<u32>();
 
 /// log2 of units per pixel at a given depth
@@ -348,7 +355,10 @@ pub struct TileStore {
     generation: AtomicU64,
     /// TEST: set by spacebar; the next render dumps everything and restarts
     reset: AtomicBool,
-    max_tiles: usize,
+    /// Floor of the tile budget (`MEMORY_BUDGET_BYTES` in tiles).
+    min_tiles: usize,
+    /// Current tile budget: max(min_tiles, VIEW_BUDGET_FACTOR × view tiles).
+    max_tiles: AtomicUsize,
     /// Sampling: the smallest number of tile pixels per screen pixel (per
     /// axis) to render at, as f32 bits; see `depth_for_view`.
     min_ratio: AtomicU32,
@@ -362,7 +372,8 @@ impl TileStore {
             progress: Arc::new(AtomicU64::new(0)),
             generation: AtomicU64::new(0),
             reset: AtomicBool::new(false),
-            max_tiles: (memory_budget_bytes / TILE_BYTES).max(64),
+            min_tiles: (memory_budget_bytes / TILE_BYTES).max(64),
+            max_tiles: AtomicUsize::new((memory_budget_bytes / TILE_BYTES).max(64)),
             min_ratio: AtomicU32::new(1.0f32.to_bits()),
         }
     }
@@ -508,15 +519,23 @@ impl TileStore {
         self.frame.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// Size the budget for a view of `n` tiles: it grows with the view (a
+    /// high sampling ratio needs many more tiles) and shrinks back when the
+    /// view needs fewer, so memory is released by the next `evict_excess`.
+    pub fn set_view_tiles(&self, n: usize) {
+        self.max_tiles.store(self.min_tiles.max(VIEW_BUDGET_FACTOR * n), Ordering::Relaxed);
+    }
+
     /// Drop least-recently-displayed tiles until the cache fits the budget.
     /// Tiles belonging to the current render generation are never dropped.
     pub fn evict_excess(&self) {
         let generation = self.generation.load(Ordering::Acquire);
         let guard = self.map.guard();
-        if self.map.len() <= self.max_tiles {
+        let max_tiles = self.max_tiles.load(Ordering::Relaxed);
+        if self.map.len() <= max_tiles {
             return;
         }
-        let excess = self.map.len() - self.max_tiles;
+        let excess = self.map.len() - max_tiles;
 
         let mut candidates: Vec<(u64, TileKey)> = self.map
             .iter(&guard)
@@ -555,6 +574,29 @@ mod tests {
             assert!(units_per_pixel(d) <= view, "view_log2 = {view_log2}");
             assert!(units_per_pixel(d) > view / 2.0, "view_log2 = {view_log2}");
         }
+    }
+
+    /// The budget follows the view: a large view raises it (so its ancestors
+    /// and recent views are kept), a small one lowers it again and the next
+    /// eviction releases the excess, never the current generation's tiles.
+    #[test]
+    fn budget_follows_the_view() {
+        let store = TileStore::new(64 * TILE_BYTES); // floor: 64 tiles
+        let key = |d: i64, i: i64| TileKey { depth: d, x: IBig::from(i), y: IBig::ZERO };
+        let generation = store.begin_generation();
+        for i in 0..100 { store.get_or_insert(&key(3, i), 100, generation); }
+        store.set_view_tiles(100);
+        store.evict_excess();
+        assert_eq!(store.map.len(), 100); // budget 300: nothing to drop
+
+        let generation = store.begin_generation();
+        for i in 0..10 {
+            store.get_or_insert(&key(5, i), 100, generation).render_gen.store(generation, Ordering::Relaxed);
+        }
+        store.set_view_tiles(10); // budget back to the 64-tile floor
+        store.evict_excess();
+        assert_eq!(store.map.len(), 64);
+        for i in 0..10 { assert!(store.get(&key(5, i)).is_some(), "current tile {i} evicted"); }
     }
 
     /// With sampling ratio s, a screen pixel spans between s and 2s tile

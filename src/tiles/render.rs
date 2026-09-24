@@ -152,6 +152,7 @@ pub fn run_generation(
     }
     tiles.sort_unstable_by_key(|(dist, _)| *dist);
 
+    store.set_view_tiles((nx * ny) as usize);
     store.evict_excess();
     if seeded > 0 { store.bump_progress(); }
     info!("rendering {} tiles ({seeded} seeded from parent/children)", tiles.len());
