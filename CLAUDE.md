@@ -141,8 +141,11 @@ Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
   search from it. The best reference is cached in `GpuState` across passes and
   views: a full one (nucleus) is reused up to `MAX_REF_REUSE_DIST` (1024)
   view radii away, so zooming rarely searches (measured, `diag_far_reference`:
-  3500 radii as accurate as 13, nothing breaks at 10⁶; a view's own deeper
-  nucleus is more accurate still); a searched-for nucleus must lie within
+  3500 radii as accurate as 13; a view's own deeper nucleus is more accurate
+  still). Not much further: pixel offsets have a 24-bit mantissa, so pixel
+  positions are quantized to ~distance·2⁻²⁴ (4 px at 2²⁶ px: 26 of 600 wrong
+  vs 0; views further out only looked fine because they were nearly
+  uniform). A searched-for nucleus must lie within
   `MAX_REF_DIST` (16) radii. Failed centre and glitch-seeded
   searches (incl. a nucleus whose orbit escapes) are remembered for views
   whose centre lies in the failed view with a radius within 2×
@@ -153,7 +156,21 @@ Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
   converges into the component. Without that the "nucleus" orbit escaped
   after ~1.1 periods. Far from the root Newton walks with a constant step;
   same-direction steps are multiplied (doubling) to get there sooner. At
-  2⁻³¹⁶…2⁻³³⁰ a search takes 0.7–3.6 s and still blocks pass 0.
+  2⁻³¹⁶…2⁻³³⁰ a search takes 0.7–3.6 s.
+- **Background search** (`SearchJob`, `start_search`, `search_result`): when
+  no cached nucleus is within reach, the centre search runs in a background
+  thread (keyed by view like the failed-search memory; a search for another
+  view cancels it) and the pass starts at once on a provisional reference,
+  the view centre's orbit. Pixels that escape before it are exact and
+  stored immediately; glitched ones are **deferred** (not stored, no glitch
+  rounds). Between chunks the pass polls the search and switches to the
+  nucleus for later chunks; at the end of the pass it waits for the search
+  (interruptibly) and redoes the deferred pixels against the nucleus, or,
+  if none was found, sends them through the usual glitch rounds. After a
+  paste at 2⁻³¹⁴…2⁻³²⁶: first pixels after ~110 ms instead of 1–2 s,
+  accuracy as with the view's own nucleus. A generation that started on the
+  provisional reference can differ from a later one by f32 rounding in a
+  few pixels (1 of 15000 at 2⁻³⁰⁵).
 - References need not lie on the pixel grid: `ref_px` gives the reference's
   position in pixel units, computed exactly in FBig; pixel offsets are
   `col - ref_px` for both pipelines.
@@ -290,7 +307,7 @@ Done: bounded chunked dispatch, nucleus references, rebasing, sub-passes,
 quadtree seeding, iteration retargeting, interior detection, BLA, the floatexp
 underflow, dropped-dispatch and floatexp-orbit fixes, deep nucleus search
 (precision, speed, caching, far reuse), BLA near an escaping reference, the
-momentum progress bar, and CPU/GPU overlap. Decided: render order stays pass-major (each
+momentum progress bar, CPU/GPU overlap, and background nucleus search. Decided: render order stays pass-major (each
 pass completes, rippling out from the cursor, before the next starts); the
 user rejected ring-by-ring refinement. Still open (talk through before
 coding):
@@ -307,11 +324,3 @@ coding):
 5. **CPU backend** lacks the GPU's nucleus references, rebasing, BLA and
    interior detection; the GPU lacks the CPU's black-fill. Not solid
    guessing (fill a cell whose corners match): the user said not yet.
-6. **Background reference search** (TODO, agreed 2026-09-24): the nucleus
-   search still blocks pass 0 for ~1-4 s at 2⁻³¹⁶…2⁻³⁴⁰ after a paste or
-   fresh view, or once the cached nucleus is more than `MAX_REF_REUSE_DIST`
-   radii out. Instead, start rendering at once with whatever reference is at
-   hand (the cached nucleus however far, measured fine, or the view centre,
-   which needs more glitch correction) and switch to the found nucleus for
-   later passes/chunks. Pixels already stored with the provisional reference
-   stay as they are.
