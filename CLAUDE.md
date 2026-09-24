@@ -275,11 +275,13 @@ Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
   `f64`, which reaches far deeper. Ask before changing it.
 - Commit each logical step separately.
 
-## Open threads (as of 2026-09-23)
+## Open threads (as of 2026-09-24)
 
 Done: bounded chunked dispatch, nucleus references, rebasing, sub-passes,
 quadtree seeding, iteration retargeting, interior detection, BLA, the floatexp
-underflow, dropped-dispatch and floatexp-orbit fixes. Still open (talk through before coding):
+underflow, dropped-dispatch and floatexp-orbit fixes, deep nucleus search
+(precision, speed, caching, far reuse), BLA near an escaping reference, and
+the momentum progress bar. Still open (talk through before coding):
 
 1. **Ring-by-ring refinement**: chunks are pass-major (all of pass N,
    cursor-first, then pass N+1). Preferred: pass 0 everywhere first, then
@@ -297,3 +299,11 @@ underflow, dropped-dispatch and floatexp-orbit fixes. Still open (talk through b
 6. **CPU backend** lacks the GPU's nucleus references, rebasing, BLA and
    interior detection; the GPU lacks the CPU's black-fill. Not solid
    guessing (fill a cell whose corners match): the user said not yet.
+7. **Background reference search** (TODO, agreed 2026-09-24): the nucleus
+   search still blocks pass 0 for ~1-4 s at 2⁻³¹⁶…2⁻³⁴⁰ after a paste or
+   fresh view, or once the cached nucleus is more than `MAX_REF_REUSE_DIST`
+   radii out. Instead, start rendering at once with whatever reference is at
+   hand (the cached nucleus however far, measured fine, or the view centre,
+   which needs more glitch correction) and switch to the found nucleus for
+   later passes/chunks. Pixels already stored with the provisional reference
+   stay as they are.
