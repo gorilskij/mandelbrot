@@ -1766,4 +1766,70 @@ mod tests {
         eprintln!("reference {} at ({rx:.3}, {ry:.3}): exact {exact}, got {:x?}", r.describe(), got);
         assert_eq!(got[0], exact);
     }
+
+    /// Measurement: nucleus search below the 2^-314 view, zooming about its
+    /// centre. Times the search, checks whether the nucleus orbit is full at
+    /// the working precision, and at 2·log2|dz_p/dc| + 64 bits.
+    #[test]
+    #[ignore]
+    fn diag_deep_nucleus_search() {
+        let base = "0.3626806181691852804489917225076056798812848870599955358041302416758614320764231653400389334599052087605123550187040027890282,-0.6426879938460872964212498601513047756237090805248048169033884352653961260155207050615760571472782180516346029887216862939575|3.290623677226253e-95";
+        let iters = 262144;
+        let (w, h) = (3000usize, 2000usize);
+        let b = sample_view_geometry(base, iters, (w, h), (1, 1));
+        let levels: Vec<f64> = std::env::var("DIAG_LEVELS").ok()
+            .map(|s| s.split(',').map(|x| x.parse().unwrap()).collect())
+            .unwrap_or(vec![-316.0, -320.0, -325.0, -330.0]);
+        for l in levels {
+            let view = l.exp2();
+            let mut coords: CoordinatesBox = base.parse().unwrap();
+            let prec = working_precision(crate::tiles::store::depth_for_view(view)) + 64;
+            let off = |px: usize| FBig::try_from(px as f64 / 2.0 * view).unwrap();
+            coords.origin.x = (&b.geom.center.re - &off(w)).with_precision(prec).value();
+            coords.origin.y = (&b.geom.center.im - &off(h)).with_precision(prec).value();
+            coords.view.inner = view;
+            let clip = format!("{coords}");
+            let v = sample_view_geometry(&clip, iters, (w, h), (1, 1));
+            let g = &v.geom;
+            if std::env::var("DIAG_PIPE").is_ok() {
+                let _ = env_logger::builder().is_test(true).try_init();
+                let backend = Gpu(Arc::new(GpuState::new()));
+                let store = crate::tiles::store::TileStore::new(crate::tiles::store::MEMORY_BUDGET_BYTES);
+                let t = std::time::Instant::now();
+                run_pipeline(&v, &backend, &store, 1);
+                eprintln!("2^{l}: one generation in {:?}", t.elapsed());
+                continue;
+            }
+            for mult in [1u32, 4, 16] {
+                let r = &g.radius * FBig::from(mult);
+                let t = std::time::Instant::now();
+                let p = crate::tiles::perturb::nucleus::ball_period(&g.center, &r, iters, g.prec, &|| false).unwrap();
+                let t_ball = t.elapsed();
+                let t = std::time::Instant::now();
+                let res = p.map(|p| {
+                    let tol = FBig::ONE << (g.upp - 40) as isize;
+                    let md = &g.radius * FBig::from(MAX_REF_DIST);
+                    newton_nucleus(&g.center, p, g.prec, &(&tol * &tol), &(&md * &md), &|| false).unwrap().is_some()
+                });
+                eprintln!("    x{mult}: period {p:?} ({t_ball:?}), newton ok {res:?} ({:?})", t.elapsed());
+            }
+            let t = std::time::Instant::now();
+            let n = find_nucleus(&g.center, &g.radius, g.upp, iters, g.prec, &|| false).unwrap();
+            let t_search = t.elapsed();
+            let Some(n) = n else { eprintln!("2^{l}: no nucleus ({t_search:?})"); continue };
+            // log2 |dz_p/dc| at the nucleus (z_0 = 0 convention).
+            let (mut z, mut dz) = (Complex { re: FBig::ZERO, im: FBig::ZERO }, Complex { re: FBig::ZERO, im: FBig::ZERO });
+            let c = &n.c;
+            for _ in 0..n.period {
+                let zdz = &z * &dz;
+                dz = Complex { re: (zdz.re << 1) + FBig::ONE, im: zdz.im << 1 };
+                z = &z * &z + c;
+            }
+            let l_dz = (&dz.re * &dz.re + &dz.im * &dz.im).to_f64().value().log2() / 2.0;
+            let t = std::time::Instant::now();
+            let r = Reference::new(n.c.clone(), iters, Some(n.period));
+            eprintln!("2^{l}: p={} in {t_search:?}, prec {}, log2|dz_p| {l_dz:.0}, orbit {} ({:?})",
+                n.period, g.prec, r.describe(), t.elapsed());
+        }
+    }
 }

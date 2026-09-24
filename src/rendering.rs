@@ -59,10 +59,10 @@ impl FromStr for CoordinatesBox {
     }
 }
 
-fn is_bad_value(v: &Complex<FBig>) -> bool {
+fn is_bad_value(v: &Complex<FBig>, k: &FBig) -> bool {
     // implicitly also checks that neither is NaN
-    let k: FBig = FBig::try_from(100_000.0).unwrap();
-    !(-&k <= v.re && v.re <= k && -&k <= v.im && v.im <= k)
+    let nk = -k;
+    !(nk <= v.re && &v.re <= k && nk <= v.im && &v.im <= k)
 }
 
 /// Working float type for perturbation (reference projection + delta
@@ -80,9 +80,14 @@ pub fn calculate_orbit(x_0: Complex<FBig>, iterations: usize) -> (Orbit<FBig>, O
     let mut x_n = x_0.clone();
     out.push(x_n.clone());
     let mut is_full = true;
+    let k = FBig::try_from(100_000.0).unwrap();
     for _ in 0..iterations {
-        x_n = &x_n * &x_n + &x_0;
-        if is_bad_value(&x_n) {
+        // x² + c with two multiplications
+        x_n = Complex {
+            re: (&x_n.re + &x_n.im) * (&x_n.re - &x_n.im) + &x_0.re,
+            im: ((&x_n.re * &x_n.im) << 1) + &x_0.im,
+        };
+        if is_bad_value(&x_n, &k) {
             is_full = false;
             break;
         }
