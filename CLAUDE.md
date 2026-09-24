@@ -354,7 +354,13 @@ coding):
 5. **CPU backend** lacks the GPU's nucleus references, rebasing, BLA and
    interior detection; the GPU lacks the CPU's black-fill. Not solid
    guessing (fill a cell whose corners match): the user said not yet.
-6. **Don't wait for the search at the end of pass 0** (optional, only if the
+6. **Compositor draw calls at high s** (user: don't forget): one draw call
+   and bind group per tile, ~16k per frame at s = 4 (and thousands of
+   re-uploads per frame in the early passes). s = 4 is "slow af" mostly from
+   the 16–64× work, but this may add to it; measure first (do compute
+   chunks still shrink to the minimum at s = 4?). Fix would be a texture
+   atlas / array to batch tiles.
+7. **Don't wait for the search at the end of pass 0** (optional, only if the
    ~1–2 s wait still bothers the user): move on to later passes while
    deferred pixels are pending. Tricky: a tile finishes a pass only once all
    its pixels are stored, and later passes would defer more pixels too.
