@@ -209,7 +209,10 @@ struct TileEntry {
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     tex_size: u32,
-    /// mip levels (`tex_size` down to 1)
+    /// Mip levels of the tile's data held by the texture: `base` (the
+    /// texture's level 0) and up to one coarser one; finer levels are never
+    /// drawn at the current s and are not uploaded.
+    base: u32,
     levels: u32,
     /// `Tile::version` this texture was built from
     version: u32,
@@ -645,7 +648,7 @@ impl GpuCompositor {
         // [1, 2) offscreen texels per screen pixel (for r < 1: k = 0, q = r),
         // and the downsample pass averages each screen pixel's q×q texels.
         let r = TILE_SIZE as f64 / tile_px;
-        let k = if r >= 1.0 { (r.log2().floor() as u32).min(TILE_SIZE.trailing_zeros()) } else { 0 };
+        let k = mip_level_for(r);
         let q = r / (1u32 << k) as f64;
         let texels_per_tile = (TILE_SIZE >> k) as f64;
         // The offscreen image starts at the texel containing the screen's
@@ -703,8 +706,11 @@ impl GpuCompositor {
         }
 
         // Upload any stale tile textures before recording the render pass.
+        let (k_min, k_max) = drawn_levels(store.min_ratio());
+        let k_min = k_min.min(k);
+        let span = k_max.saturating_sub(k_min) + 1;
         for p in &pending {
-            self.ensure_texture(&p.src, store, k.saturating_sub(p.climb));
+            self.ensure_texture(&p.src, store, k_min.saturating_sub(p.climb), span);
         }
         self.ensure_offscreen(width, height);
         let off = self.offscreen.as_ref().expect("offscreen image");
@@ -725,7 +731,8 @@ impl GpuCompositor {
             // 2 per ancestor level; the level whose texels are 2^k of those
             // is drawn 1:1 (coarser data is magnified from level 0).
             let stride_log2 = (TILE_SIZE / entry.tex_size as usize).trailing_zeros() as i32;
-            let level = (k as i32 - stride_log2 - p.climb as i32).clamp(0, entry.levels as i32 - 1) as f32;
+            let level = (k as i32 - stride_log2 - p.climb as i32 - entry.base as i32)
+                .clamp(0, entry.levels as i32 - 1) as f32;
             let base = verts.len() as u32;
             let [x0, y0] = to_clip(p.px0, p.py0);
             let [x1, y1] = to_clip(p.px1, p.py1);
@@ -861,11 +868,13 @@ impl GpuCompositor {
         });
     }
 
-    /// Upload `key`'s tile if it changed, with mip levels at least up to the
-    /// one drawn when full-resolution texels are sampled at `level`
-    /// (level 0 only at s <= 1, where no mips are needed: they cost CPU time
-    /// on every upload).
-    fn ensure_texture(&mut self, key: &TileKey, store: &TileStore, level: u32) {
+    /// Upload `key`'s tile if it changed, as the `span` (1 or 2) mip levels
+    /// drawn when full-resolution texels are sampled at `level` or up to one
+    /// coarser (at s = 1 level 0 only; at s = 3 levels 1 and 2; at s = 4
+    /// level 2, a sixteenth of the texels). Other levels are never drawn at
+    /// the current s, so they are neither kept on the GPU nor uploaded; a
+    /// change of s re-uploads.
+    fn ensure_texture(&mut self, key: &TileKey, store: &TileStore, level: u32, span: u32) {
         let tile = match store.get(key) {
             Some(t) => t,
             None => return,
@@ -885,21 +894,24 @@ impl GpuCompositor {
             GRID_STRIDES[passes_done as usize - 1]
         };
         let tex_size = (TILE_SIZE / stride) as u32;
-        let levels_wanted = (level.saturating_sub(stride.trailing_zeros()) + 1).min(tex_size.trailing_zeros() + 1);
+        let max_level = tex_size.trailing_zeros();
+        let base = level.saturating_sub(stride.trailing_zeros()).min(max_level);
+        let levels = (max_level - base + 1).min(span);
 
         if let Some(entry) = self.tiles.get(key) {
-            if entry.version == version && entry.levels >= levels_wanted {
+            let same_shape = entry.tex_size == tex_size && entry.base == base && entry.levels == levels;
+            if entry.version == version && same_shape {
                 return;
             }
-            if entry.tex_size == tex_size && entry.levels >= levels_wanted {
-                // Same resolution — overwrite pixels in-place, every level.
-                let levels = mip_chain(Self::texels(&tile, stride, tex_size, &mut self.palette), tex_size, entry.levels);
-                for (level, data) in levels.iter().enumerate() {
-                    let size = tex_size >> level;
+            if same_shape {
+                // Same shape — overwrite pixels in-place, every level.
+                let data = mip_chain(Self::texels(&tile, stride, tex_size, &mut self.palette), tex_size, base + levels);
+                for (i, data) in data[base as usize..].iter().enumerate() {
+                    let size = tex_size >> (base as usize + i);
                     self.queue.write_texture(
                         wgpu::TexelCopyTextureInfo {
                             texture: &entry.texture,
-                            mip_level: level as u32,
+                            mip_level: i as u32,
                             origin: wgpu::Origin3d::ZERO,
                             aspect: wgpu::TextureAspect::All,
                         },
@@ -918,14 +930,15 @@ impl GpuCompositor {
         }
 
         // Create a new texture (first upload, size changed due to a new pass,
-        // or more mip levels needed).
-        let levels = mip_chain(Self::texels(&tile, stride, tex_size, &mut self.palette), tex_size, levels_wanted);
+        // or other mip levels needed).
+        let data = mip_chain(Self::texels(&tile, stride, tex_size, &mut self.palette), tex_size, base + levels);
+        let size = tex_size >> base;
         let texture = self.device.create_texture_with_data(
             &self.queue,
             &wgpu::TextureDescriptor {
                 label: None,
-                size: wgpu::Extent3d { width: tex_size, height: tex_size, depth_or_array_layers: 1 },
-                mip_level_count: levels.len() as u32,
+                size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+                mip_level_count: levels,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: TEXTURE_FORMAT,
@@ -933,7 +946,7 @@ impl GpuCompositor {
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
-            bytemuck::cast_slice(&levels.concat()),
+            bytemuck::cast_slice(&data[base as usize..].concat()),
         );
         let view = texture.create_view(&Default::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -950,7 +963,7 @@ impl GpuCompositor {
                 },
             ],
         });
-        self.tiles.insert(key.clone(), TileEntry { texture, bind_group, tex_size, levels: levels.len() as u32, version });
+        self.tiles.insert(key.clone(), TileEntry { texture, bind_group, tex_size, base, levels, version });
     }
 
     /// Texels for a tile displayed at `stride`: the stride grid, or at
@@ -1038,6 +1051,20 @@ fn color_of(iteration: u32, palette: &mut Vec<u32>) -> u32 {
         palette.extend((palette.len()..len).map(|j| val_to_color(NonZeroUsize::new(j))));
     }
     palette[i]
+}
+
+/// Mip level drawn at r tile pixels per screen pixel: the one leaving
+/// q = r / 2^k in [1, 2) (0 for r < 1).
+fn mip_level_for(r: f64) -> u32 {
+    if r >= 1.0 { (r.log2().floor() as u32).min(TILE_SIZE.trailing_zeros()) } else { 0 }
+}
+
+/// Range of mip levels drawn at sampling ratio s, where r is in [s, 2s):
+/// floor(log2 s), or one more unless s is a power of two.
+fn drawn_levels(s: f64) -> (u32, u32) {
+    let lo = mip_level_for(s);
+    let hi = mip_level_for(2.0 * s * (1.0 - 1e-9));
+    (lo, hi)
 }
 
 /// The first `count` mip levels of a `size`×`size` sRGB RGBA8 image, `size`
@@ -1319,6 +1346,20 @@ mod tests {
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::default())
                 .validate(&module)
                 .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+    }
+
+    /// Only the levels drawn at s are uploaded: pin the range, and that every
+    /// r in [s, 2s) falls inside it.
+    #[test]
+    fn drawn_levels_cover_the_ratio_range() {
+        for (s, want) in [(0.5, (0, 0)), (1.0, (0, 0)), (1.5, (0, 1)), (2.0, (1, 1)),
+                          (2.5, (1, 2)), (3.0, (1, 2)), (3.5, (1, 2)), (4.0, (2, 2))] {
+            assert_eq!(drawn_levels(s), want, "s = {s}");
+            for i in 0..100 {
+                let k = mip_level_for(s * (1.0 + i as f64 / 100.0));
+                assert!((want.0..=want.1).contains(&k), "s = {s}, k = {k}");
+            }
         }
     }
 
