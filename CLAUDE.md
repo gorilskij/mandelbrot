@@ -37,6 +37,12 @@ detection); the CPU one is older (per-group references, no BLA).
   groups of `GROUP_TILES=16`² tiles,
   `units_per_pixel(depth) = 2^upp_log2(depth)`, `upp_log2 = -5 - depth`,
   `pixel_to_coord` (exact FBig coordinate of a global pixel).
+  - **Tile budget** (LRU eviction at the start of each generation, never the
+    current generation's tiles): max(1 GiB, 3× the current view's tiles),
+    no ceiling (`set_view_tiles`). A high s needs many tiles (s = 4: up to
+    ~24k for 3000×2000, ~4.5 GiB with the factor); with a fixed 1 GiB the
+    view alone filled it, evicting parents and recent views (black previews
+    while moving, no reuse). Lowering s shrinks it again.
   - **Passes** (`NUM_PASSES=7`): grid passes `GRID_STRIDES=[16,8,4,2]`, then
     the stride-1 step split into 3 equal sub-passes (cell centres first, so
     every later gap has all 4 axis neighbours). `pass_pixels(pass)` is the
@@ -78,8 +84,11 @@ detection); the CPU one is older (per-group references, no BLA).
     screen pixel spans r ∈ [s, 2s) tile pixels per axis (`TileStore::
     min_ratio` / `depth_for_view`; s shared with the compute thread through
     the store). Tile textures are sRGB with mip levels built on the CPU as
-    2×2 box averages in linear light (`mip_chain`; only the levels the
-    current s needs: none at s = 1). Tiles are drawn 1:1 into an offscreen
+    2×2 box averages in linear light (`mip_chain`), holding only the one or
+    two levels drawn at the current s (`drawn_levels`: level 0 at s ≤ 1,
+    level 2 at s = 4, i.e. 1/16 of the texels; finer per use for parent
+    previews); the CPU store keeps full resolution and a change of s
+    re-uploads. Tiles are drawn 1:1 into an offscreen
     sRGB image (≤ 2× the surface per axis) from the level k that leaves
     q = r/2^k ∈ [1, 2) texels per screen pixel, grid-aligned; the downsample
     pass (`gpu_compositor_downsample.wgsl`) takes each screen pixel's exact
