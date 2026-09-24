@@ -127,8 +127,11 @@ const INTERIOR_Q:          f64   = 0.9;
 /// (1-4 s at 2^-320) until the nucleus is this far out. Measured
 /// (`diag_far_reference`, 2^-314..2^-330, 262144 iterations): a nucleus
 /// 3500 radii away was as accurate as at 13 (vs exact: 122 vs 138 of 600
-/// off by a few iterations, 3 vs 5 by >50) and as fast; nothing broke even
-/// at 10^6 radii. A view's own, deeper nucleus is still more accurate.
+/// off by a few iterations, 3 vs 5 by >50) and as fast. The limit is f32:
+/// pixel offsets have a 24-bit mantissa, so positions are quantized to
+/// ~distance·2^-24; 1024 radii (~2^21 px) is ~0.1 px, while at 56000 radii
+/// (2^26 px, 4 px) 26 of 600 were wrong vs 0 with the view's own nucleus.
+/// (Views further out scored 0 only because they were nearly uniform.)
 const MAX_REF_REUSE_DIST: u32 = 1024;
 
 /// Use the floatexp pipeline once units-per-pixel drops below 2^FE_THRESHOLD.
@@ -348,6 +351,8 @@ pub struct GpuState {
     /// The same for searches seeded from glitched pixels (each costs as
     /// much as a centre search; seen: ~1 s per glitch round, all failing).
     failed_glitch_search: Mutex<Option<(Complex<FBig>, FBig, usize)>>,
+    /// Nucleus search running in the background (see `SearchJob`).
+    search:      Mutex<Option<SearchJob>>,
     /// Measured cost of the last chunk, in ms per pixel; sizes the next one.
     ms_per_px:   Mutex<f64>,
 }
@@ -411,62 +416,102 @@ impl GpuState {
                 reference: Mutex::new(None),
                 failed_search: Mutex::new(None),
                 failed_glitch_search: Mutex::new(None),
+                search: Mutex::new(None),
                 ms_per_px: Mutex::new(1e-4),
             }
         })
     }
 
-    /// Reference for a pass: a cached one if it is still near and full,
-    /// otherwise a nucleus near the view centre, otherwise the longer of the
-    /// centre's orbit and the cached one.  `None` if interrupted.
+    /// Reference for a pass, without waiting for a nucleus search: a cached
+    /// full one within `MAX_REF_REUSE_DIST`, else a background search's
+    /// result for this view, else (starting that search) a provisional one:
+    /// the longer of the view centre's orbit and a cached one within reach.
+    /// Not a cached nucleus further out: pixel offsets have a 24-bit
+    /// mantissa, so positions are quantized to ~distance·2^-24 (4 px at 2^26
+    /// px, seen as 26 of 600 wrong vs 0). The flag says whether a search is
+    /// still running for this view (`search_result` tells when it is done).
+    /// `None` if interrupted.
     fn initial_reference(
         &self,
         ctx: &PassBatchCtx,
         g:   &ViewGeom,
         int: &MultiInterrupter,
-    ) -> Option<Arc<Reference>> {
+    ) -> Option<(Arc<Reference>, bool)> {
         let iters  = ctx.iterations;
-        let cached = self.reference.lock().clone().filter(|r| g.reusable(r));
+        let mut cached = self.reference.lock().clone();
         if let Some(r) = &cached {
-            if r.iterations == iters && r.is_full { return Some(r.clone()); }
+            if r.iterations == iters && r.is_full && g.reusable(r) { return Some((r.clone(), false)); }
             // A nucleus stays a nucleus when only the iteration count changed.
-            if r.period.is_some() && r.iterations != iters {
+            if r.period.is_some() && r.iterations != iters && g.reusable(r) {
                 let r = Arc::new(Reference::new(r.c.clone(), iters, r.period));
-                if r.is_full { return Some(self.remember(r, g)); }
+                if int.interrupted() { return None; }
+                if r.is_full { return Some((self.remember(r, g), false)); }
             }
         }
+        cached = cached.filter(|r| r.iterations == iters);
 
-        let key = (g.center.clone(), g.radius.clone(), iters);
-        let failed = self.failed_search.lock().as_ref().is_some_and(|f| f.2 == iters && g.covered_by(f));
-        if !failed {
-            let t = std::time::Instant::now(); // DIAG
-            match find_nucleus(&g.center, &g.radius, g.upp, iters, g.prec, &|| int.interrupted()) {
-                Err(_) => return None,
-                Ok(Some(n)) => {
-                    let r = Arc::new(Reference::new(n.c, iters, Some(n.period)));
-                    log::info!(
-                        "[diag gpu] reference: {} from view centre in {:.1} ms",
-                        r.describe(), t.elapsed().as_secs_f64() * 1e3,
-                    );
-                    if r.is_full { return Some(self.remember(r, g)); }
-                    *self.failed_search.lock() = Some(key);
-                }
-                Ok(None) => {
-                    log::info!(
-                        "[diag gpu] reference: no nucleus from view centre ({:.1} ms)",
-                        t.elapsed().as_secs_f64() * 1e3,
-                    );
-                    *self.failed_search.lock() = Some(key);
-                }
+        match self.search_result(g, iters) {
+            Some(Some(r)) => return Some((self.remember(r, g), false)),
+            Some(None) => { // failed: remember, fall back below
+                *self.failed_search.lock() = Some((g.center.clone(), g.radius.clone(), iters));
+            }
+            None => {
+                let failed = self.failed_search.lock().as_ref().is_some_and(|f| f.2 == iters && g.covered_by(f));
+                if !failed { self.start_search(g, iters); }
             }
         }
+        let pending = self.search_result(g, iters).is_none() && self.search_covers(g, iters);
 
         let centre = Arc::new(Reference::new(g.center.clone(), iters, None));
+        if int.interrupted() { return None; }
         let best = match cached {
-            Some(r) if r.iterations == iters && r.beats(&centre) => r,
+            Some(r) if r.beats(&centre) && g.reusable(&r) => r,
             _ => centre,
         };
-        Some(self.remember(best, g))
+        Some((self.remember(best, g), pending))
+    }
+
+    /// Whether the background search (running or done) is for this view.
+    fn search_covers(&self, g: &ViewGeom, iters: usize) -> bool {
+        self.search.lock().as_ref().is_some_and(|j| j.key.2 == iters && g.covered_by(&j.key))
+    }
+
+    /// The background search's outcome for this view: `None` if there is
+    /// none or it is still running, `Some(None)` if it found no full nucleus.
+    fn search_result(&self, g: &ViewGeom, iters: usize) -> Option<Option<Arc<Reference>>> {
+        let job = self.search.lock();
+        let job = job.as_ref().filter(|j| j.key.2 == iters && g.covered_by(&j.key))?;
+        job.result.lock().clone()
+    }
+
+    /// Start a nucleus search for this view in a background thread, unless
+    /// one for it is already running or done; cancels one for another view.
+    fn start_search(&self, g: &ViewGeom, iters: usize) {
+        let mut job = self.search.lock();
+        if job.as_ref().is_some_and(|j| j.key.2 == iters && g.covered_by(&j.key)) { return; }
+        if let Some(old) = job.take() { old.cancel.store(true, Ordering::Relaxed); }
+        let key = (g.center.clone(), g.radius.clone(), iters);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = Arc::new(Mutex::new(None));
+        let (center, radius, upp, prec) = (g.center.clone(), g.radius.clone(), g.upp, g.prec);
+        let (c2, r2) = (cancel.clone(), result.clone());
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now(); // DIAG
+            let cancelled = || c2.load(Ordering::Relaxed);
+            let found = match find_nucleus(&center, &radius, upp, iters, prec, &cancelled) {
+                Err(_) => return,
+                Ok(n) => n.map(|n| Arc::new(Reference::new(n.c, iters, Some(n.period)))),
+            };
+            if cancelled() { return; }
+            log::info!(
+                "[diag gpu] background search: {} in {:.1} ms",
+                found.as_ref().map_or("no nucleus".to_string(), |r| r.describe()),
+                t.elapsed().as_secs_f64() * 1e3,
+            );
+            *r2.lock() = Some(found.filter(|r| r.is_full));
+        });
+        log::info!("[diag gpu] background search started");
+        *job = Some(SearchJob { key, cancel, result });
     }
 
     /// Pick a new reference among glitched pixels: exact orbits for
@@ -800,6 +845,16 @@ impl Deltas {
     fn elem(&self) -> usize { if self.fe { 16 } else { 8 } }
 }
 
+/// A nucleus search for one view (centre, radius, iterations) running in a
+/// background thread, so rendering can start with a provisional reference.
+/// `result`: `None` while running, then `Some(None)` (no full nucleus) or
+/// `Some(Some(r))`.
+struct SearchJob {
+    key:    (Complex<FBig>, FBig, usize),
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    result: Arc<Mutex<Option<Option<Arc<Reference>>>>>,
+}
+
 /// One submitted dispatch, not yet read back.
 struct InFlight {
     staging:  wgpu::Buffer,
@@ -956,7 +1011,7 @@ impl Perturbator for Gpu {
         // escapes, so nothing glitches.
         // ----------------------------------------------------------------
         let t_ref = std::time::Instant::now(); // DIAG
-        let Some(mut reference) = state.initial_reference(ctx, &geom, int) else { return };
+        let Some((mut reference, mut searching)) = state.initial_reference(ctx, &geom, int) else { return };
         // Bound on |δ₀| over the whole pass, for the BLA table's radii.
         let pass_dc = |r: &Reference| {
             let (rx, ry) = ref_px(&r.c, ctx);
@@ -973,55 +1028,30 @@ impl Perturbator for Gpu {
             let (rx, ry) = ref_px(&reference.c, ctx);
             log::info!(
                 "[diag gpu] pass {pass} depth {} upp 2^{upp} view {view:.4e} pipe {} | {} px | \
-                 ref {} at px ({rx:.3}, {ry:.3}) in {:.1} ms",
+                 ref {} at px ({rx:.3}, {ry:.3}){} in {:.1} ms",
                 ctx.depth, if use_fe { "fe" } else { "f32" }, pixel_refs.len(),
-                reference.describe(), ms(t_ref),
+                reference.describe(), if searching { " (provisional)" } else { "" }, ms(t_ref),
             );
         }
 
-        // ----------------------------------------------------------------
-        // Chunks: each dispatch is sized to take about TARGET_CHUNK_MS, so the
-        // interrupt is honoured within that time (in-flight GPU work cannot
-        // be cancelled) and results reach the screen as they arrive.
-        //
-        // One chunk on the GPU at a time (two queued ones ran concurrently,
-        // each ~2x slower per pixel, and could not be timed), but the CPU
-        // work overlaps it: the next chunk's seeds are packed while waiting,
-        // and it is submitted as soon as this one is read back, before this
-        // one's glitch rounds, CPU resolve and storing (~30% of a pass with
-        // the GPU idle before). Its size comes from the chunk before this
-        // one, except right after the probe.
-        // ----------------------------------------------------------------
-        let mut chunks = 0usize; // DIAG
-        let pack = |pos: usize, first: bool, r: &Reference| {
-            let len = if first { PROBE_CHUNK_PX } else { state.chunk_len() }.min(pixel_refs.len() - pos);
-            (pos, len, Deltas::pack(&offsets(&mut (pos..pos + len), r), upp))
-        };
-        let submit = |(pos, len, d): (usize, usize, Deltas), gref: &Arc<GpuRef>| {
-            (pos, len, state.submit_deltas(d, gref.clone()))
-        };
-        let mut current = (!int.interrupted()).then(|| submit(pack(0, true, &reference), &gref));
-        let mut pos = 0;
-        while let Some((at, len, pending)) = current.take() {
-            let more = at + len < pixel_refs.len();
-            let packed = (more && chunks > 0 && !int.interrupted()).then(|| pack(at + len, false, &reference));
-            let t_wait = std::time::Instant::now();
-            let t_submit = pending.t_submit;
-            let mut raw = state.finish(pending);
-            let done = std::time::Instant::now();
-            // Only a wait that blocked tells when the GPU finished.
-            if (done - t_wait).as_secs_f64() > 1e-4 {
-                state.record_chunk(len, (done - t_submit).as_secs_f64() * 1e3);
+        // Dispatch pixels `ids` against `r`, in chunks of ~TARGET_CHUNK_MS
+        // (glitched or deferred pixels can be many: keep dispatches short).
+        // Pixels left when interrupted come back as NOT_RUN.
+        let dispatch_ids = |ids: &[usize], r: &Reference, gr: &GpuRef| -> Vec<u32> {
+            let mut out = Vec::with_capacity(ids.len());
+            for part in ids.chunks(state.chunk_len()) {
+                if int.interrupted() { out.resize(ids.len(), NOT_RUN); break; }
+                let t = std::time::Instant::now();
+                out.extend(state.dispatch_offsets(&offsets(&mut part.iter().copied(), r), upp, gr));
+                state.record_chunk(part.len(), ms(t));
             }
-            if more && !int.interrupted() {
-                current = Some(submit(packed.unwrap_or_else(|| pack(at + len, false, &reference)), &gref));
-            }
-            pos = at;
-            log::info!(
-                "[diag gpu] pass {pass} chunk {chunks}: {len} px at {pos}, gpu {:.1} ms -> {}",
-                (done - t_submit).as_secs_f64() * 1e3, raw_stats(&raw),
-            );
+            out
+        };
 
+        // Glitch rounds, residual CPU resolve and storing for pixels `ids`
+        // (indices into `pixel_refs`) with GPU results `raw`.
+        let resolve_and_store = |ids: &[usize], raw: &mut [u32], reference: &mut Arc<Reference>,
+                                 gref: &mut Arc<GpuRef>, remaining: &mut [usize], label: &str| {
             // Glitch rounds: a pixel is glitched only when it outlived the
             // reference's (escaping) orbit.  Re-dispatch those against a
             // longer-lived reference chosen among them.
@@ -1035,28 +1065,29 @@ impl Perturbator for Gpu {
 
                 // Candidates spread evenly over the glitched pixels.
                 let step = glitched.len().div_ceil(GLITCH_CANDIDATES);
-                let candidates = glitched.iter().step_by(step).map(|&j| pixel_coord(pos + j)).collect();
+                let candidates = glitched.iter().step_by(step).map(|&j| pixel_coord(ids[j])).collect();
 
                 let t_gref = std::time::Instant::now(); // DIAG
                 let Some(new_ref) = state.glitch_reference(ctx, &geom, candidates, int) else { break };
                 let t_gref = ms(t_gref); // DIAG
 
                 let t_gdisp = std::time::Instant::now(); // DIAG
-                let offs    = offsets(&mut glitched.iter().map(|&j| pos + j), &new_ref);
+                let g_ids: Vec<usize> = glitched.iter().map(|&j| ids[j]).collect();
+                let offs = offsets(&mut g_ids.iter().copied(), &new_ref);
                 let new_gref = state.prepare(&new_ref, log2_dc(&offs, upp), upp);
-                let new_raw = state.dispatch_offsets(&offs, upp, &new_gref);
+                let new_raw = dispatch_ids(&g_ids, &new_ref, &new_gref);
                 for (k, &j) in glitched.iter().enumerate() {
                     raw[j] = new_raw[k];
                 }
                 log::info!(
-                    "[diag gpu] pass {pass} chunk {chunks} glitch round {round}: {} glitched, new ref {} \
+                    "[diag gpu] pass {pass} {label} glitch round {round}: {} glitched, new ref {} \
                      (reference {t_gref:.1} ms, dispatch {:.1} ms) -> {}",
                     glitched.len(), new_ref.describe(), ms(t_gdisp), raw_stats(&new_raw),
                 );
                 // Later chunks start from the better reference.
-                if new_ref.beats(&reference) {
-                    reference = new_ref;
-                    gref = Arc::new(state.prepare(&reference, pass_dc(&reference), upp));
+                if new_ref.beats(reference) {
+                    *reference = new_ref;
+                    *gref = Arc::new(state.prepare(reference, pass_dc(reference), upp));
                 }
             }
 
@@ -1073,12 +1104,12 @@ impl Perturbator for Gpu {
                     let resolved: Vec<(usize, u32)> = residual.par_iter()
                         .filter_map(|&j| {
                             if int.interrupted() { return None; }
-                            let (_, orbit) = calculate_orbit(pixel_coord(pos + j), ctx.iterations);
+                            let (_, orbit) = calculate_orbit(pixel_coord(ids[j]), ctx.iterations);
                             Some((j, check_orbit(&orbit).unwrap().map_or(0, |n| n.get() as u32)))
                         })
                         .collect();
                     log::info!(
-                        "[diag gpu] pass {pass} chunk {chunks}: residual CPU resolve {}/{} in {:.1} ms",
+                        "[diag gpu] pass {pass} {label}: residual CPU resolve {}/{} in {:.1} ms",
                         resolved.len(), residual.len(), ms(t_resid),
                     );
                     for (j, r) in resolved { raw[j] = r; }
@@ -1089,15 +1120,116 @@ impl Perturbator for Gpu {
             for (j, &r) in raw.iter().enumerate() {
                 // Never cache a guess: glitched or not run by the GPU.
                 if r == NOT_RUN || r & GLITCH_BIT != 0 { continue; }
-                let pr = &pixel_refs[pos + j];
+                let pr = &pixel_refs[ids[j]];
                 tiles[pr.tile_idx].tile.store(pr.pixel_idx, r.into()); // escape iteration, 0 = in set
                 remaining[pr.tile_idx] -= 1;
                 if remaining[pr.tile_idx] == 0 { finish(pr.tile_idx); }
             }
             ctx.progress.fetch_add(1, Ordering::Release);
+        };
+
+        // ----------------------------------------------------------------
+        // Chunks: each dispatch is sized to take about TARGET_CHUNK_MS, so the
+        // interrupt is honoured within that time (in-flight GPU work cannot
+        // be cancelled) and results reach the screen as they arrive.
+        //
+        // One chunk on the GPU at a time (two queued ones ran concurrently,
+        // each ~2x slower per pixel, and could not be timed), but the CPU
+        // work overlaps it: the next chunk's seeds are packed while waiting,
+        // and it is submitted as soon as this one is read back, before this
+        // one's glitch rounds, CPU resolve and storing (~30% of a pass with
+        // the GPU idle before). Its size comes from the chunk before this
+        // one, except right after the probe.
+        //
+        // While a nucleus search runs in the background and the reference is
+        // a provisional escaping point, glitched pixels are deferred rather
+        // than sent through glitch rounds (seconds of CPU orbits and
+        // searches): once the nucleus arrives, later chunks use it and the
+        // deferred pixels are redone against it at the end of the pass.
+        // ----------------------------------------------------------------
+        let mut chunks = 0usize; // DIAG
+        let pack = |pos: usize, first: bool, r: &Reference| {
+            let len = if first { PROBE_CHUNK_PX } else { state.chunk_len() }.min(pixel_refs.len() - pos);
+            (pos, len, Deltas::pack(&offsets(&mut (pos..pos + len), r), upp))
+        };
+        let submit = |(pos, len, d): (usize, usize, Deltas), gref: &Arc<GpuRef>| {
+            (pos, len, state.submit_deltas(d, gref.clone()))
+        };
+        let iters = ctx.iterations;
+        // Take the background search's result once it is in.
+        let poll_search = |searching: &mut bool, reference: &mut Arc<Reference>, gref: &mut Arc<GpuRef>| {
+            if !*searching { return; }
+            let Some(found) = state.search_result(&geom, iters) else {
+                // Replaced by a search for another view: nothing to wait for.
+                if !state.search_covers(&geom, iters) { *searching = false; }
+                return;
+            };
+            *searching = false;
+            if let Some(r) = found.filter(|r| !reference.is_full || r.beats(reference)) {
+                log::info!("[diag gpu] pass {pass}: switching to {} from the background search", r.describe());
+                *reference = r;
+                *gref = Arc::new(state.prepare(reference, pass_dc(reference), upp));
+            }
+        };
+        let mut deferred: Vec<usize> = Vec::new();
+        let mut current = (!int.interrupted()).then(|| submit(pack(0, true, &reference), &gref));
+        let mut pos = 0;
+        while let Some((at, len, pending)) = current.take() {
+            let more = at + len < pixel_refs.len();
+            let packed = (more && chunks > 0 && !int.interrupted()).then(|| pack(at + len, false, &reference));
+            let t_wait = std::time::Instant::now();
+            let t_submit = pending.t_submit;
+            let mut raw = state.finish(pending);
+            let done = std::time::Instant::now();
+            // Only a wait that blocked tells when the GPU finished.
+            if (done - t_wait).as_secs_f64() > 1e-4 {
+                state.record_chunk(len, (done - t_submit).as_secs_f64() * 1e3);
+            }
+            let old_ref = reference.clone();
+            poll_search(&mut searching, &mut reference, &mut gref);
+            if more && !int.interrupted() {
+                // Repack if the reference just changed.
+                let packed = packed.filter(|_| Arc::ptr_eq(&old_ref, &reference));
+                current = Some(submit(packed.unwrap_or_else(|| pack(at + len, false, &reference)), &gref));
+            }
+            pos = at;
+            log::info!(
+                "[diag gpu] pass {pass} chunk {chunks}: {len} px at {pos}, gpu {:.1} ms -> {}",
+                (done - t_submit).as_secs_f64() * 1e3, raw_stats(&raw),
+            );
+
+            let ids: Vec<usize> = (at..at + len).collect();
+            if searching && !old_ref.is_full {
+                // Defer glitched pixels until the nucleus arrives.
+                for (j, r) in raw.iter_mut().enumerate() {
+                    if *r != NOT_RUN && *r & GLITCH_BIT != 0 { deferred.push(ids[j]); *r = NOT_RUN; }
+                }
+            }
+            resolve_and_store(&ids, &mut raw, &mut reference, &mut gref, &mut remaining, &format!("chunk {chunks}"));
 
             pos    += len;
             chunks += 1;
+        }
+
+        // Deferred pixels: wait for the search (interruptibly), then redo
+        // them against its nucleus; if it found none, glitch rounds as usual.
+        if !deferred.is_empty() && !int.interrupted() {
+            let t_wait = std::time::Instant::now(); // DIAG
+            while searching && !int.interrupted() {
+                poll_search(&mut searching, &mut reference, &mut gref);
+                if searching { std::thread::sleep(std::time::Duration::from_millis(5)); }
+            }
+            if int.interrupted() { return; }
+            let mut raw = if reference.is_full {
+                dispatch_ids(&deferred, &reference, &gref)
+            } else {
+                vec![GLITCH_BIT; deferred.len()] // no nucleus: glitch rounds
+            };
+            log::info!(
+                "[diag gpu] pass {pass}: {} deferred px, waited {:.1} ms for the search, ref {} -> {}",
+                deferred.len(), ms(t_wait), reference.describe(), raw_stats(&raw),
+            );
+            resolve_and_store(&deferred, &mut raw, &mut reference, &mut gref, &mut remaining, "deferred");
         }
 
         log::info!(
@@ -1651,7 +1783,8 @@ mod tests {
     /// Whole pipeline (tiles, passes, chunks, caches) with the real GPU
     /// backend, fresh and after a Space-style reset; every generation must
     /// match exact orbits up to f32 rounding (before: 1070, 5169, 6979 black
-    /// of 15000; after: 109, the exact count, every time). ~2 min per
+    /// of 15000; after: 109, the exact count, every time) and agree with each
+    /// other up to a few pixels of f32 rounding. ~2 min per
     /// generation without BLA, ~1.5 s with it (DIAG_GENS, default 2); exact
     /// values cached in $DIAG_OUT (computing them takes ~1 min).
     #[test]
@@ -1677,7 +1810,15 @@ mod tests {
             assert_eq!(black, exact_black, "generation {g}: in-set pixels that escape");
             assert!(off50 * 100 < got.len(), "generation {g}: {off50} off by >50");
         }
-        assert!(gens.windows(2).all(|w| w[0] == w[1]), "generations differ");
+        // The first generation starts on a provisional reference (the view
+        // centre) while the nucleus search runs in the background, so a few
+        // pixels round differently in f32 than after a reset (seen: 1 of
+        // 15000). The bug this guards against changed thousands.
+        for w in gens.windows(2) {
+            let differ = w[0].iter().zip(&w[1]).filter(|(a, b)| a != b).count();
+            eprintln!("generations differ in {differ} px");
+            assert!(differ * 1000 < v.pix.len(), "generations differ in {differ} px");
+        }
     }
 
     /// Same input dispatched repeatedly must give identical output, also as
@@ -2017,6 +2158,11 @@ mod tests {
             let v = sample_view_cached(&format!("far{}", -l as i64), &clip, iters, (w, h), (30, 20));
             let g = &v.geom;
             if let Some((backend, store)) = &pipe {
+                // DIAG_FRESH: a new backend per level, like pasting the view.
+                let fresh = std::env::var("DIAG_FRESH").is_ok().then(|| {
+                    (Gpu(Arc::new(GpuState::new())), crate::tiles::store::TileStore::new(crate::tiles::store::MEMORY_BUDGET_BYTES))
+                });
+                let (backend, store) = fresh.as_ref().map_or((backend, store), |(b, s)| (b, s));
                 let t = std::time::Instant::now();
                 let vals = run_pipeline(&v, backend, store, 1).remove(0);
                 let got: Vec<u32> = vals.iter().map(|x| x.unwrap_or(u32::MAX)).collect();
