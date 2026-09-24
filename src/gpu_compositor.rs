@@ -511,6 +511,76 @@ impl GpuCompositor {
     /// Force Metal/Vulkan to compile both render pipelines now so the first
     /// real frame doesn't stall. A zero-vertex draw is enough to trigger it.
     pub fn warmup(&mut self) {
+        // Tile and downsample pipelines: an empty tile pass into the
+        // offscreen image and a real downsample pass into a scratch target.
+        self.ensure_offscreen(self.surface_config.width, self.surface_config.height);
+        if let Some(off) = &self.offscreen {
+            let tex = |format, usage| self.device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            });
+            let scratch = tex(self.surface_config.format, wgpu::TextureUsages::RENDER_ATTACHMENT);
+            let scratch_view = scratch.create_view(&Default::default());
+            let dummy_tile = tex(TEXTURE_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING);
+            let dummy_tile_view = dummy_tile.create_view(&Default::default());
+            let tile_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&dummy_tile_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            });
+            let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[1.0f32, 0.0, 0.0, 0.0]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let downsample_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.downsample_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&off.view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+                ],
+            });
+            let dummy_verts = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[Vertex { pos: [0.0; 2], uv: [0.0; 2], level: 0.0 }]),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            for (view, tiles) in [(&off.view, true), (&scratch_view, false)] {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                        depth_slice: None,
+                    })],
+                    ..Default::default()
+                });
+                if tiles {
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &tile_bg, &[]);
+                    pass.set_vertex_buffer(0, dummy_verts.slice(..));
+                    pass.draw(0..0, 0..1);
+                } else {
+                    pass.set_pipeline(&self.downsample_pipeline);
+                    pass.set_bind_group(0, &downsample_bg, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+            self.queue.submit([enc.finish()]);
+        }
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             _ => return,
@@ -634,7 +704,7 @@ impl GpuCompositor {
 
         // Upload any stale tile textures before recording the render pass.
         for p in &pending {
-            self.ensure_texture(&p.src, store);
+            self.ensure_texture(&p.src, store, k.saturating_sub(p.climb));
         }
         self.ensure_offscreen(width, height);
         let off = self.offscreen.as_ref().expect("offscreen image");
@@ -791,7 +861,11 @@ impl GpuCompositor {
         });
     }
 
-    fn ensure_texture(&mut self, key: &TileKey, store: &TileStore) {
+    /// Upload `key`'s tile if it changed, with mip levels at least up to the
+    /// one drawn when full-resolution texels are sampled at `level`
+    /// (level 0 only at s <= 1, where no mips are needed: they cost CPU time
+    /// on every upload).
+    fn ensure_texture(&mut self, key: &TileKey, store: &TileStore, level: u32) {
         let tile = match store.get(key) {
             Some(t) => t,
             None => return,
@@ -811,14 +885,15 @@ impl GpuCompositor {
             GRID_STRIDES[passes_done as usize - 1]
         };
         let tex_size = (TILE_SIZE / stride) as u32;
+        let levels_wanted = (level.saturating_sub(stride.trailing_zeros()) + 1).min(tex_size.trailing_zeros() + 1);
 
         if let Some(entry) = self.tiles.get(key) {
-            if entry.version == version {
+            if entry.version == version && entry.levels >= levels_wanted {
                 return;
             }
-            if entry.tex_size == tex_size {
+            if entry.tex_size == tex_size && entry.levels >= levels_wanted {
                 // Same resolution — overwrite pixels in-place, every level.
-                let levels = mip_chain(Self::texels(&tile, stride, tex_size, &mut self.palette), tex_size);
+                let levels = mip_chain(Self::texels(&tile, stride, tex_size, &mut self.palette), tex_size, entry.levels);
                 for (level, data) in levels.iter().enumerate() {
                     let size = tex_size >> level;
                     self.queue.write_texture(
@@ -842,8 +917,9 @@ impl GpuCompositor {
             }
         }
 
-        // Create a new texture (first upload or size changed due to new pass).
-        let levels = mip_chain(Self::texels(&tile, stride, tex_size, &mut self.palette), tex_size);
+        // Create a new texture (first upload, size changed due to a new pass,
+        // or more mip levels needed).
+        let levels = mip_chain(Self::texels(&tile, stride, tex_size, &mut self.palette), tex_size, levels_wanted);
         let texture = self.device.create_texture_with_data(
             &self.queue,
             &wgpu::TextureDescriptor {
@@ -964,15 +1040,15 @@ fn color_of(iteration: u32, palette: &mut Vec<u32>) -> u32 {
     palette[i]
 }
 
-/// Mip levels of a `size`×`size` sRGB RGBA8 image, `size` a power of two:
-/// level 0 is `level0`, each next level the 2×2 box average of the previous
-/// one, taken in linear light. Tiles are 128 px and levels halve, so every
-/// 2×2 block lies inside the tile: no seams at tile edges.
-fn mip_chain(level0: Vec<u32>, size: u32) -> Vec<Vec<u32>> {
+/// The first `count` mip levels of a `size`×`size` sRGB RGBA8 image, `size`
+/// a power of two: level 0 is `level0`, each next level the 2×2 box average
+/// of the previous one, taken in linear light. Tiles are 128 px and levels
+/// halve, so every 2×2 block lies inside the tile: no seams at tile edges.
+fn mip_chain(level0: Vec<u32>, size: u32, count: u32) -> Vec<Vec<u32>> {
     let (to_lin, to_srgb) = srgb_tables();
     let mut levels = vec![level0];
     let mut n = size as usize;
-    while n > 1 {
+    while n > 1 && levels.len() < count as usize {
         let prev = levels.last().unwrap();
         let m = n / 2;
         let mut next = vec![0u32; m * m];
@@ -1252,12 +1328,13 @@ mod tests {
     #[test]
     fn mips_average_in_linear_light() {
         let rgba = |v: u32| v | (v << 8) | (v << 16) | 0xFF00_0000;
-        let uniform = mip_chain(vec![rgba(77); 8 * 8], 8);
+        let uniform = mip_chain(vec![rgba(77); 8 * 8], 8, 4);
         assert_eq!(uniform.len(), 4); // 8, 4, 2, 1
         assert!(uniform.iter().all(|l| l.iter().all(|&p| p == rgba(77))));
 
         let checker: Vec<u32> = (0..64).map(|i| if (i / 8 + i % 8) % 2 == 0 { rgba(0) } else { rgba(255) }).collect();
-        let levels = mip_chain(checker, 8);
+        let levels = mip_chain(checker, 8, 4);
+        assert_eq!(mip_chain(vec![rgba(1); 64], 8, 1).len(), 1);
         for level in &levels[1..] {
             for &p in level {
                 assert_eq!(p & 0xFF, 188, "{p:08x}");
