@@ -335,7 +335,9 @@ Done: bounded chunked dispatch, nucleus references, rebasing, sub-passes,
 quadtree seeding, iteration retargeting, interior detection, BLA, the floatexp
 underflow, dropped-dispatch and floatexp-orbit fixes, deep nucleus search
 (precision, speed, caching, far reuse), BLA near an escaping reference, the
-momentum progress bar, CPU/GPU overlap, and background nucleus search. Decided: render order stays pass-major (each
+momentum progress bar, CPU/GPU overlap, background nucleus search, GPU as
+the default backend, and the sampling ratio s with area-averaging
+antialiasing (incl. a tile budget that follows the view). Decided: render order stays pass-major (each
 pass completes, rippling out from the cursor, before the next starts); the
 user rejected ring-by-ring refinement. Still open (talk through before
 coding):
