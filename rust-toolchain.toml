@@ -1,0 +1,9 @@
+[toolchain]
+# The web build needs nightly (-Z build-std, see web/build.sh) and rust-src for
+# it; `targets` makes rustup install the wasm target on first use (the
+# Cloudflare Pages builder starts from a clean toolchain).
+# TODO: move the pin forward now and then. The `+atomics` target feature is
+# being phased out, so a newer nightly may need changes to the web build.
+channel = "nightly-2026-09-25"
+components = ["rust-src"]
+targets = ["wasm32-unknown-unknown"]
