@@ -1,4 +1,5 @@
 use crate::rendering::{CoordinatesBox, PalettePhase, val_to_color};
+use crate::drawing::maybe_pixel::MaybePixel;
 use std::num::NonZeroUsize;
 use crate::tiles::store::{
     GRID_STRIDES, NUM_GRID_PASSES, NUM_PASSES, TILE_LEN, TILE_SIZE, Tile, TileKey, TileStore,
@@ -46,6 +47,14 @@ const DOWNSAMPLE_SHADER: &str = include_str!("gpu_compositor_downsample.wgsl");
 /// the downsample average in linear light (averaging the gamma-encoded
 /// values would darken every blend).
 const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// Tile colour textures are stored as this and sampled through a
+/// `TEXTURE_FORMAT` view: storage textures can't be sRGB, so the colouring
+/// pass writes the sRGB encoding itself.
+const COLOUR_STORAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// Colours tiles from their iteration counts (see the file).
+const RECOLOUR_SHADER: &str = include_str!("gpu_compositor_recolour.wgsl");
 
 const BAR_SHADER: &str = r#"
 struct VOut {
@@ -208,8 +217,12 @@ struct BarVertex {
 }
 
 struct TileEntry {
-    texture: wgpu::Texture,
+    /// the tile's data texels (see `iteration_texels`)
+    iters: wgpu::Texture,
+    /// draws the colour texture (sampled as sRGB)
     bind_group: wgpu::BindGroup,
+    /// colouring pass, per mip level held
+    recolour: Vec<wgpu::BindGroup>,
     tex_size: u32,
     /// Mip levels of the tile's data held by the texture: `base` (the
     /// texture's level 0) and up to one coarser one; finer levels are never
@@ -231,8 +244,10 @@ struct Upload {
     base: u32,
     levels: u32,
     version: u32,
-    /// overwrite the existing texture in place
+    /// keep the existing textures
     same_shape: bool,
+    /// upload the iteration data (else only recolour)
+    contents: bool,
 }
 
 /// The image the tiles are drawn into, 1:1 in texels of the mip level in use,
@@ -260,7 +275,9 @@ pub struct GpuCompositor {
     bgl: wgpu::BindGroupLayout,
     tiles: HashMap<TileKey, TileEntry>,
     bar: BarAnim,
-    palette: Palette,
+    recolour: Recolour,
+    palette_phase: PalettePhase,
+    palette_gpu: PaletteGpu,
     /// Bumped on every palette change, so every texture is recoloured.
     palette_gen: u32,
 }
@@ -509,6 +526,9 @@ impl GpuCompositor {
                 cache: None,
             });
 
+            let recolour = Recolour::new(&device);
+            let palette_gpu = PaletteGpu::new(&device, &recolour.palette_bgl, 256);
+
             GpuCompositor {
                 device,
                 queue,
@@ -520,7 +540,9 @@ impl GpuCompositor {
                 downsample_bgl,
                 offscreen: None,
                 bar: BarAnim::new(1.0),
-                palette: Palette { phase: PalettePhase::default(), table: Vec::new() },
+                palette_phase: PalettePhase::default(),
+                palette_gpu,
+                recolour,
                 palette_gen: 0,
                 sampler,
                 bgl,
@@ -641,8 +663,8 @@ impl GpuCompositor {
     /// Recolour with `phase`: every texture is rebuilt on the next frame,
     /// from the tiles' stored iterations (no recomputation).
     pub fn set_palette(&mut self, phase: PalettePhase) {
-        if phase != self.palette.phase {
-            self.palette = Palette { phase, table: Vec::new() };
+        if phase != self.palette_phase {
+            self.palette_phase = phase;
             self.palette_gen = self.palette_gen.wrapping_add(1);
         }
     }
@@ -742,7 +764,7 @@ impl GpuCompositor {
             .filter(|p| seen.insert(&p.src))
             .filter_map(|p| self.stale_texture(&p.src, store, k_min.saturating_sub(p.climb), span))
             .collect();
-        self.upload_textures(uploads);
+        let recolour = self.upload_textures(uploads);
         self.ensure_offscreen(width, height);
         let off = self.offscreen.as_ref().expect("offscreen image");
 
@@ -865,7 +887,7 @@ impl GpuCompositor {
             }
         }
 
-        self.queue.submit([enc.finish()]);
+        self.queue.submit(recolour.into_iter().chain([enc.finish()]));
         self.queue.present(frame);
 
         // Drop GPU textures for tiles that have been evicted from the CPU store.
@@ -899,7 +921,7 @@ impl GpuCompositor {
         });
     }
 
-    /// What `key`'s tile needs uploaded, if it changed (or the palette did),
+    /// What `key`'s tile needs uploaded and recoloured, if it changed (or the palette did),
     /// as the `span` (1 or 2) mip levels drawn when full-resolution texels
     /// are sampled at `level` or up to one coarser (at s = 1 level 0 only; at
     /// s = 3 levels 1 and 2; at s = 4 level 2, a sixteenth of the texels).
@@ -926,79 +948,106 @@ impl GpuCompositor {
         let base = level.saturating_sub(stride.trailing_zeros()).min(max_level);
         let levels = (max_level - base + 1).min(span);
 
-        let same_shape = self.tiles.get(key).is_some_and(|entry| {
-            entry.tex_size == tex_size && entry.base == base && entry.levels == levels
-        });
-        let current = same_shape && self.tiles.get(key).is_some_and(|entry| {
-            entry.version == version && entry.palette_gen == self.palette_gen
-        });
-        (!current).then(|| Upload { key: key.clone(), tile, stride, tex_size, base, levels, version, same_shape })
+        let entry = self.tiles.get(key);
+        let same_shape = entry.is_some_and(|e| e.tex_size == tex_size && e.base == base && e.levels == levels);
+        let contents = !same_shape || entry.is_some_and(|e| e.version != version);
+        let recolour = contents || entry.is_some_and(|e| e.palette_gen != self.palette_gen);
+        recolour.then(|| Upload { key: key.clone(), tile, stride, tex_size, base, levels, version, same_shape, contents })
     }
 
-    /// Colour the stale tiles (in parallel: after a palette change that is
-    /// every tile on screen) and upload them.
-    fn upload_textures(&mut self, uploads: Vec<Upload>) {
-        if let Some(max) = uploads.iter().map(|u| u.tile.iterations.load(Ordering::Relaxed)).max() {
-            self.palette.grow(max);
-        }
-        let palette = &self.palette;
-        let data: Vec<Vec<Vec<u32>>> = uploads
+    /// Bring the stale tiles' textures up to date: upload the iteration
+    /// data of those whose contents changed, then colour them all on the GPU
+    /// (after a palette change: every tile on screen, from the iteration
+    /// data already there). Returns the colouring commands, to be submitted
+    /// before the frame that draws them.
+    fn upload_textures(&mut self, uploads: Vec<Upload>) -> Option<wgpu::CommandBuffer> {
+        let max = uploads.iter().map(|u| u.tile.iterations.load(Ordering::Relaxed)).max()?;
+        self.sync_palette(max);
+        let data: Vec<Option<Vec<u32>>> = uploads
             .par_iter()
-            .map(|u| mip_chain(Self::texels(&u.tile, u.stride, u.tex_size, palette), u.tex_size, u.base + u.levels))
+            .map(|u| u.contents.then(|| iteration_texels(&u.tile, u.stride, u.tex_size)))
             .collect();
+        let keys: Vec<TileKey> = uploads.iter().map(|u| u.key.clone()).collect();
         for (u, data) in uploads.into_iter().zip(data) {
-            self.upload_texture(u, data);
+            self.update_entry(u, data);
         }
+
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.recolour.pipeline);
+            pass.set_bind_group(0, &self.palette_gpu.bind_group, &[]);
+            for key in &keys {
+                let entry = &self.tiles[key];
+                for (i, bg) in entry.recolour.iter().enumerate() {
+                    let groups = (entry.tex_size >> (entry.base + i as u32)).div_ceil(8);
+                    pass.set_bind_group(1, bg, &[]);
+                    pass.dispatch_workgroups(groups, groups, 1);
+                }
+            }
+        }
+        Some(enc.finish())
     }
 
-    /// Upload one tile's mip `data` (every level from full resolution).
-    fn upload_texture(&mut self, u: Upload, data: Vec<Vec<u32>>) {
+    /// (Re)create `u`'s textures if their shape changed and upload its
+    /// iteration `data` if given (a changed tile, not just a recolour).
+    fn update_entry(&mut self, u: Upload, data: Option<Vec<u32>>) {
         let Upload { key, tex_size, base, levels, version, same_shape, .. } = u;
-        if same_shape {
-            // Same shape — overwrite pixels in-place, every level.
-            let entry = self.tiles.get_mut(&key).unwrap();
-            for (i, data) in data[base as usize..].iter().enumerate() {
-                let size = tex_size >> (base as usize + i);
-                self.queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &entry.texture,
-                        mip_level: i as u32,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    bytemuck::cast_slice(data),
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(size * 4),
-                        rows_per_image: Some(size),
-                    },
-                    wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
-                );
-            }
-            entry.version = version;
-            entry.palette_gen = self.palette_gen;
-            return;
+        if !same_shape {
+            let entry = self.create_entry(tex_size, base, levels);
+            self.tiles.insert(key.clone(), entry);
         }
+        let entry = self.tiles.get_mut(&key).unwrap();
+        if let Some(data) = data {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &entry.iters,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&data),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(tex_size * 4),
+                    rows_per_image: Some(tex_size),
+                },
+                wgpu::Extent3d { width: tex_size, height: tex_size, depth_or_array_layers: 1 },
+            );
+        }
+        entry.version = version;
+        entry.palette_gen = self.palette_gen;
+    }
 
-        // Create a new texture (first upload, size changed due to a new pass,
-        // or other mip levels needed).
+    /// Textures for a tile with `tex_size`² data texels whose mip levels
+    /// `base..base + levels` are drawn: the iteration data, and the colour
+    /// texture (written by the colouring pass, sampled as sRGB).
+    fn create_entry(&self, tex_size: u32, base: u32, levels: u32) -> TileEntry {
+        let iters = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: tex_size, height: tex_size, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
         let size = tex_size >> base;
-        let texture = self.device.create_texture_with_data(
-            &self.queue,
-            &wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
-                mip_level_count: levels,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: TEXTURE_FORMAT,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            bytemuck::cast_slice(&data[base as usize..].concat()),
-        );
-        let view = texture.create_view(&Default::default());
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            mip_level_count: levels,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COLOUR_STORAGE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[TEXTURE_FORMAT],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(TEXTURE_FORMAT),
+            ..Default::default()
+        });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.bgl,
@@ -1013,72 +1062,58 @@ impl GpuCompositor {
                 },
             ],
         });
-        let palette_gen = self.palette_gen;
-        self.tiles.insert(key, TileEntry { texture, bind_group, tex_size, base, levels, version, palette_gen });
+        let iters_view = iters.create_view(&Default::default());
+        let recolour = (0..levels)
+            .map(|i| self.recolour.bind_group(&self.device, &iters_view, &texture, i))
+            .collect();
+        TileEntry { iters, bind_group, recolour, tex_size, base, levels, version: 0, palette_gen: 0 }
     }
 
-    /// Texels for a tile displayed at `stride`: the stride grid, or at
-    /// stride 1 the reconstructed full-resolution tile.
-    /// Texels for a tile displayed at `stride`: the stride grid, or at
-    /// stride 1 the reconstructed full-resolution tile.
-    fn texels(tile: &Tile, stride: usize, tex_size: u32, palette: &Palette) -> Vec<u32> {
-        if stride == 1 {
-            Self::reconstruct(tile, palette)
-        } else {
-            Self::sample_pixels(tile, stride, tex_size, palette)
+    /// Make the GPU palette cover iterations up to `max` (plus one: escapes
+    /// are reported up to max + 1) at the current phase.
+    fn sync_palette(&mut self, max: usize) {
+        let len = (max + 2).next_power_of_two().max(256);
+        let grow = len > self.palette_gpu.len;
+        if !grow && self.palette_gpu.phase == Some(self.palette_phase) {
+            return;
         }
+        let len = len.max(self.palette_gpu.len);
+        let phase = self.palette_phase;
+        let table: Vec<u32> = (0..len)
+            .into_par_iter()
+            .map(|j| val_to_color(NonZeroUsize::new(j), phase))
+            .collect();
+        if grow {
+            self.palette_gpu = PaletteGpu::new(&self.device, &self.recolour.palette_bgl, len);
+        }
+        self.queue.write_buffer(&self.palette_gpu.buffer, 0, bytemuck::cast_slice(&table));
+        self.palette_gpu.phase = Some(phase);
     }
+}
 
-    /// Sample the stride grid from tile pixels into an Rgba8Unorm buffer.
-    /// A missing grid pixel is one being recomputed after the iteration
-    /// count went up, i.e. formerly in the set: drawn black, as it was.
-    /// Data races are intentional — see store.rs.
-    fn sample_pixels(tile: &Tile, stride: usize, tex_size: u32, palette: &Palette) -> Vec<u32> {
-        let n = tex_size as usize;
-        let mut data = vec![0u32; n * n];
-        for row in 0..n {
-            for col in 0..n {
-                let px = tile.load(row * stride * TILE_SIZE + col * stride).get();
-                data[row * n + col] = rgb_to_rgba8(px.map_or(0, |v| palette.color(v)));
-            }
+/// Iteration data texels for a tile displayed at `stride`: the stride grid,
+/// or at stride 1 the whole tile, as `gpu_compositor_recolour.wgsl` takes
+/// them. A pixel missing from an already-displayed pass (a grid pixel, or
+/// at stride 1 one with `pass_of` < the displayed passes) is being
+/// recomputed after the iteration count went up — formerly in the set — so
+/// it is 0 (black, as it was); a sub-pass pixel not computed yet stays
+/// `MaybePixel::NONE_RAW`, a gap filled from its neighbours.
+/// Data races are intentional — see store.rs.
+fn iteration_texels(tile: &Tile, stride: usize, tex_size: u32) -> Vec<u32> {
+    let n = tex_size as usize;
+    let shown = tile.display_passes();
+    let mut data = vec![0u32; n * n];
+    for r in 0..n {
+        for c in 0..n {
+            let (tr, tc) = (r * stride, c * stride);
+            data[r * n + c] = match tile.load(tr * TILE_SIZE + tc).get() {
+                Some(v) => v,
+                None if stride > 1 || pass_of(tr, tc) < shown => 0,
+                None => MaybePixel::NONE_RAW,
+            };
         }
-        data
     }
-
-    /// Full-resolution texels for a tile during (or after) the sub-passes:
-    /// computed pixels as they are, each sub-pass gap as the mean colour (in
-    /// linear light) of its computed axis neighbours (the sub-pass order guarantees all four
-    /// from the first sub-pass on, fewer at the tile edge). A missing pixel
-    /// from an already-displayed pass is being recomputed after the
-    /// iteration count went up — formerly in the set — and is drawn black.
-    fn reconstruct(tile: &Tile, palette: &Palette) -> Vec<u32> {
-        let n = TILE_SIZE;
-        let shown = tile.display_passes();
-        let known = |r: usize, c: usize| match tile.load(r * n + c).get() {
-            Some(v) => Some(palette.color(v)),
-            None if pass_of(r, c) < shown => Some(0),
-            None => None,
-        };
-        let mut data = vec![0u32; n * n];
-        for r in 0..n {
-            for c in 0..n {
-                let rgb = match known(r, c) {
-                    Some(rgb) => rgb,
-                    None => {
-                        let neighbours = [
-                            (r > 0).then(|| known(r - 1, c)).flatten(),
-                            (r + 1 < n).then(|| known(r + 1, c)).flatten(),
-                            (c > 0).then(|| known(r, c - 1)).flatten(),
-                            (c + 1 < n).then(|| known(r, c + 1)).flatten(),
-                        ];
-                        mean_colour(neighbours.into_iter().flatten())
-                    }
-                };
-                data[r * n + c] = rgb_to_rgba8(rgb);
-            }
-        }
-        data
-    }
+    data
 }
 
 #[cfg(test)]
@@ -1086,51 +1121,120 @@ pub fn color_of_for_tests(iteration: u32) -> u32 {
     val_to_color(NonZeroUsize::new(iteration as usize), PalettePhase::default())
 }
 
-/// Colour per escape iteration (`val_to_color`) at the current phase: tiles
-/// store iterations and are coloured here, at upload. The table is grown
-/// before the (parallel) colouring, which only reads it.
-struct Palette {
-    phase: PalettePhase,
-    table: Vec<u32>,
+/// The colouring pass (`gpu_compositor_recolour.wgsl`): iteration data →
+/// colour texture levels, reading the palette (group 0, shared) and one
+/// tile's textures (group 1, per mip level).
+struct Recolour {
+    pipeline: wgpu::ComputePipeline,
+    palette_bgl: wgpu::BindGroupLayout,
+    tile_bgl: wgpu::BindGroupLayout,
 }
 
-impl Palette {
-    /// Cover iterations up to `max`.
-    fn grow(&mut self, max: usize) {
-        if max >= self.table.len() {
-            let len = (max + 1).next_power_of_two().max(256);
-            let phase = self.phase;
-            self.table.extend((self.table.len()..len).map(|j| val_to_color(NonZeroUsize::new(j), phase)));
-        }
+impl Recolour {
+    fn new(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("recolour"),
+            source: wgpu::ShaderSource::Wgsl(RECOLOUR_SHADER.into()),
+        });
+        let palette_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("palette"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let tile_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("recolour tile"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: COLOUR_STORAGE_FORMAT,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("recolour"),
+            bind_group_layouts: &[Some(&palette_bgl), Some(&tile_bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("recolour"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Self { pipeline, palette_bgl, tile_bgl }
     }
 
-    /// Colour (0x00RRGGBB) of a stored pixel value: the escape iteration, 0
-    /// for in the set. Computed directly past the table's end.
-    fn color(&self, iteration: u32) -> u32 {
-        match self.table.get(iteration as usize) {
-            Some(&c) => c,
-            None => val_to_color(NonZeroUsize::new(iteration as usize), self.phase),
-        }
+    /// Group 1 for colouring mip level `level` of `colour` from `iters`.
+    fn bind_group(&self, device: &wgpu::Device, iters: &wgpu::TextureView, colour: &wgpu::Texture, level: u32) -> wgpu::BindGroup {
+        let out = colour.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(COLOUR_STORAGE_FORMAT),
+            base_mip_level: level,
+            mip_level_count: Some(1),
+            ..Default::default()
+        });
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.tile_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(iters) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&out) },
+            ],
+        })
     }
 }
 
-/// Mean of 0x00RRGGBB sRGB colours, taken in linear light like every other
-/// average in the compositor (averaging the encoded values darkens); black
-/// if there are none.
-fn mean_colour(colours: impl Iterator<Item = u32>) -> u32 {
-    let (to_lin, to_srgb) = srgb_tables();
-    let (mut sum, mut k) = ([0f32; 3], 0);
-    for v in colours {
-        for (i, s) in sum.iter_mut().enumerate() {
-            *s += to_lin[((v >> (8 * i)) & 0xFF) as usize];
-        }
-        k += 1;
+/// The palette on the GPU: colour (0x00RRGGBB) per escape iteration
+/// (`val_to_color`), read by the colouring pass.
+struct PaletteGpu {
+    buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    /// entries
+    len: usize,
+    /// phase the contents were built with (None: not yet)
+    phase: Option<PalettePhase>,
+}
+
+impl PaletteGpu {
+    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, len: usize) -> Self {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("palette"),
+            size: (len * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("palette"),
+            layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+        });
+        Self { buffer, bind_group, len, phase: None }
     }
-    if k == 0 { return 0; }
-    (0..3).map(|i| {
-        let l = ((sum[i] / k as f32) * (LIN_STEPS - 1) as f32 + 0.5) as usize;
-        (to_srgb[l.min(LIN_STEPS - 1)] as u32) << (8 * i)
-    }).sum()
 }
 
 /// Mip level drawn at r tile pixels per screen pixel: the one leaving
@@ -1145,68 +1249,6 @@ fn drawn_levels(s: f64) -> (u32, u32) {
     let lo = mip_level_for(s);
     let hi = mip_level_for(2.0 * s * (1.0 - 1e-9));
     (lo, hi)
-}
-
-/// The first `count` mip levels of a `size`×`size` sRGB RGBA8 image, `size`
-/// a power of two: level 0 is `level0`, each next level the 2×2 box average
-/// of the previous one, taken in linear light. Tiles are 128 px and levels
-/// halve, so every 2×2 block lies inside the tile: no seams at tile edges.
-fn mip_chain(level0: Vec<u32>, size: u32, count: u32) -> Vec<Vec<u32>> {
-    let (to_lin, to_srgb) = srgb_tables();
-    let mut levels = vec![level0];
-    let mut n = size as usize;
-    while n > 1 && levels.len() < count as usize {
-        let prev = levels.last().unwrap();
-        let m = n / 2;
-        let mut next = vec![0u32; m * m];
-        for r in 0..m {
-            for c in 0..m {
-                let px = [prev[2 * r * n + 2 * c], prev[2 * r * n + 2 * c + 1],
-                          prev[(2 * r + 1) * n + 2 * c], prev[(2 * r + 1) * n + 2 * c + 1]];
-                let mut out = 0xFF00_0000u32;
-                for ch in 0..3 {
-                    let sum: f32 = px.iter().map(|&p| to_lin[((p >> (8 * ch)) & 0xFF) as usize]).sum();
-                    let i = ((sum / 4.0) * (LIN_STEPS - 1) as f32 + 0.5) as usize;
-                    out |= (to_srgb[i.min(LIN_STEPS - 1)] as u32) << (8 * ch);
-                }
-                next[r * m + c] = out;
-            }
-        }
-        levels.push(next);
-        n = m;
-    }
-    levels
-}
-
-/// Resolution of the linear → sRGB table (12 bits: finer than 8-bit sRGB
-/// needs anywhere, including near black).
-const LIN_STEPS: usize = 4096;
-
-/// (sRGB byte → linear, linear in `LIN_STEPS` steps → sRGB byte).
-fn srgb_tables() -> &'static ([f32; 256], [u8; LIN_STEPS]) {
-    static TABLES: std::sync::OnceLock<([f32; 256], [u8; LIN_STEPS])> = std::sync::OnceLock::new();
-    TABLES.get_or_init(|| {
-        let mut to_lin = [0f32; 256];
-        for (i, v) in to_lin.iter_mut().enumerate() {
-            let c = i as f32 / 255.0;
-            *v = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
-        }
-        let mut to_srgb = [0u8; LIN_STEPS];
-        for (i, v) in to_srgb.iter_mut().enumerate() {
-            let l = i as f32 / (LIN_STEPS - 1) as f32;
-            let c = if l <= 0.0031308 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
-            *v = (c * 255.0 + 0.5) as u8;
-        }
-        (to_lin, to_srgb)
-    })
-}
-
-/// 0x00RRGGBB → Rgba8Unorm [R, G, B, 255] as a little-endian u32.
-fn rgb_to_rgba8(raw: u32) -> u32 {
-    let b = raw & 0xFF;
-    let g = (raw >> 8) & 0xFF;
-    let r = (raw >> 16) & 0xFF;
-    r | (g << 8) | (b << 16) | (0xFF << 24)
 }
 
 /// Fraction of the rendering work done for the visible tiles, weighting each
@@ -1433,21 +1475,13 @@ mod tests {
     /// that it parses and validates.
     #[test]
     fn shaders_validate() {
-        for (name, src) in [("tiles", SHADER), ("bar", BAR_SHADER), ("downsample", DOWNSAMPLE_SHADER)] {
+        for (name, src) in [("tiles", SHADER), ("bar", BAR_SHADER), ("downsample", DOWNSAMPLE_SHADER), ("recolour", RECOLOUR_SHADER)] {
             let module = naga::front::wgsl::parse_str(src)
                 .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::default())
                 .validate(&module)
                 .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         }
-    }
-
-    /// Sub-pass gaps are filled with their neighbours' mean in linear light.
-    #[test]
-    fn gap_fill_averages_in_linear_light() {
-        assert_eq!(mean_colour([0x000000, 0xFFFFFF].into_iter()), 0xBCBCBC); // 188, not 127
-        assert_eq!(mean_colour([0x405060; 4].into_iter()), 0x405060);
-        assert_eq!(mean_colour(std::iter::empty()), 0);
     }
 
     /// Only the levels drawn at s are uploaded: pin the range, and that every
@@ -1464,25 +1498,185 @@ mod tests {
         }
     }
 
-    /// Mip levels average in linear light: a uniform tile stays uniform, and
-    /// a black/white checkerboard becomes the sRGB encoding of 50% linear
-    /// grey (188), not the gamma-space average (128).
+    /// DIAG: time a recolour (palette change) of a whole screen of full
+    /// tiles on this machine's GPU: `DIAG_TILES` tiles (default 24000, a
+    /// 3000x2000 view at s = 4) drawn from mip level `DIAG_BASE` (default 2).
     #[test]
-    fn mips_average_in_linear_light() {
-        let rgba = |v: u32| v | (v << 8) | (v << 16) | 0xFF00_0000;
-        let uniform = mip_chain(vec![rgba(77); 8 * 8], 8, 4);
-        assert_eq!(uniform.len(), 4); // 8, 4, 2, 1
-        assert!(uniform.iter().all(|l| l.iter().all(|&p| p == rgba(77))));
+    #[ignore]
+    fn diag_recolour_speed() {
+        let env = |k: &str, d: u32| std::env::var(k).ok().map_or(d, |v| v.parse().unwrap());
+        let (n_tiles, base) = (env("DIAG_TILES", 24000), env("DIAG_BASE", 2));
+        let (device, queue) = pollster::block_on(async {
+            let adapter = wgpu::Instance::default()
+                .request_adapter(&Default::default()).await.expect("no GPU adapter");
+            adapter.request_device(&Default::default()).await.expect("no device")
+        });
+        let r = Recolour::new(&device);
+        let palette = PaletteGpu::new(&device, &r.palette_bgl, 4096);
+        let table: Vec<u32> = (0..4096).map(|j| val_to_color(NonZeroUsize::new(j), PalettePhase::default())).collect();
+        queue.write_buffer(&palette.buffer, 0, bytemuck::cast_slice(&table));
+        let n = TILE_SIZE as u32;
+        let data: Vec<u32> = (0..n * n).map(|i| (i * 7919) % 2000).collect();
+        let bgs: Vec<wgpu::BindGroup> = (0..n_tiles).map(|_| {
+            let iters = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Uint,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(iters.as_image_copy(), bytemuck::cast_slice(&data),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n * 4), rows_per_image: Some(n) },
+                iters.size());
+            let size = n >> base;
+            let colour = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: COLOUR_STORAGE_FORMAT,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[TEXTURE_FORMAT],
+            });
+            r.bind_group(&device, &iters.create_view(&Default::default()), &colour, 0)
+        }).collect();
+        queue.submit([]);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        for round in 0..3 {
+            let t = std::time::Instant::now();
+            let mut enc = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&r.pipeline);
+                pass.set_bind_group(0, &palette.bind_group, &[]);
+                let g = (n >> base).div_ceil(8);
+                if std::env::var("DIAG_ONE_DISPATCH").is_ok() {
+                    // the same work as one dispatch (every tile's invocations
+                    // write the first tile): the pure GPU cost
+                    pass.set_bind_group(1, &bgs[0], &[]);
+                    pass.dispatch_workgroups(g, g, n_tiles);
+                } else {
+                    for bg in &bgs {
+                        pass.set_bind_group(1, bg, &[]);
+                        pass.dispatch_workgroups(g, g, 1);
+                    }
+                }
+            }
+            let cmd = enc.finish();
+            let encoded = t.elapsed();
+            queue.submit([cmd]);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            eprintln!("round {round}: {n_tiles} tiles from level {base}: encode {encoded:?}, total {:?}", t.elapsed());
+        }
+    }
 
-        let checker: Vec<u32> = (0..64).map(|i| if (i / 8 + i % 8) % 2 == 0 { rgba(0) } else { rgba(255) }).collect();
-        let levels = mip_chain(checker, 8, 4);
-        assert_eq!(mip_chain(vec![rgba(1); 64], 8, 1).len(), 1);
-        for level in &levels[1..] {
-            for &p in level {
-                assert_eq!(p & 0xFF, 188, "{p:08x}");
-                assert_eq!(p >> 24, 0xFF);
+    /// The colouring pass on this machine's GPU (`--ignored`): mip levels
+    /// and sub-pass gaps average in linear light, so a black/white
+    /// checkerboard becomes the sRGB encoding of 50% linear grey (188), not
+    /// the gamma-space average (128); a uniform tile stays uniform.
+    #[test]
+    #[ignore]
+    fn recolour_averages_in_linear_light() {
+        let (device, queue) = pollster::block_on(async {
+            let adapter = wgpu::Instance::default()
+                .request_adapter(&Default::default()).await.expect("no GPU adapter");
+            adapter.request_device(&Default::default()).await.expect("no device")
+        });
+        let r = Recolour::new(&device);
+        // palette: 0 black, 1 white, 2 grey 77
+        let palette = PaletteGpu::new(&device, &r.palette_bgl, 256);
+        let mut table = vec![0u32; 256];
+        table[1] = 0xFFFFFF;
+        table[2] = 0x4D4D4D;
+        queue.write_buffer(&palette.buffer, 0, bytemuck::cast_slice(&table));
+
+        // One 8×8 data tile, drawn at `levels` from `base`: every output byte.
+        let run = |data: &[u32], base: u32, levels: u32| -> Vec<Vec<u8>> {
+            let n = 8u32;
+            let iters = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Uint,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(iters.as_image_copy(), bytemuck::cast_slice(data),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n * 4), rows_per_image: Some(n) },
+                iters.size());
+            let size = n >> base;
+            let colour = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+                mip_level_count: levels, sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: COLOUR_STORAGE_FORMAT,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[TEXTURE_FORMAT],
+            });
+            let iters_view = iters.create_view(&Default::default());
+            let mut enc = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&r.pipeline);
+                pass.set_bind_group(0, &palette.bind_group, &[]);
+                for i in 0..levels {
+                    let bg = r.bind_group(&device, &iters_view, &colour, i);
+                    pass.set_bind_group(1, &bg, &[]);
+                    let g = (size >> i).div_ceil(8);
+                    pass.dispatch_workgroups(g, g, 1);
+                }
+            }
+            // read back every level (rows padded to 256 bytes)
+            let bufs: Vec<(wgpu::Buffer, u32)> = (0..levels).map(|i| {
+                let m = size >> i;
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None, size: 256 * m as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                enc.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo { texture: &colour, mip_level: i, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(m) } },
+                    wgpu::Extent3d { width: m, height: m, depth_or_array_layers: 1 });
+                (buf, m)
+            }).collect();
+            queue.submit([enc.finish()]);
+            bufs.iter().map(|(buf, m)| {
+                buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                let bytes = buf.slice(..).get_mapped_range().unwrap();
+                (0..*m as usize).flat_map(|row| bytes[row * 256..row * 256 + *m as usize * 4].to_vec()).collect()
+            }).collect()
+        };
+        let is_grey = |px: &[u8], v: u8| px[0] == v && px[1] == v && px[2] == v && px[3] == 255;
+
+        // uniform grey stays 77 at every level, from level 0 and from level 1
+        for (base, levels) in [(0, 4), (1, 2)] {
+            for level in run(&[2; 64], base, levels) {
+                assert!(level.chunks(4).all(|px| is_grey(px, 77)), "{level:?}");
             }
         }
+        // checkerboard: level 0 as is, every coarser level 188
+        let checker: Vec<u32> = (0..64).map(|i| ((i / 8 + i % 8) % 2) as u32).collect();
+        let levels = run(&checker, 0, 4);
+        assert!(levels[0].chunks(4).enumerate().all(|(i, px)| is_grey(px, if checker[i] == 1 { 255 } else { 0 })));
+        for level in &levels[1..] {
+            assert!(level.chunks(4).all(|px| is_grey(px, 188)), "{level:?}");
+        }
+        assert!(run(&checker, 2, 1)[0].chunks(4).all(|px| is_grey(px, 188)));
+        // a gap between two black and two white neighbours: 188; a gap with
+        // no computed neighbour: black
+        let mut gaps = vec![0u32; 64];
+        gaps[3 * 8 + 4] = 1; gaps[5 * 8 + 4] = 1;
+        gaps[4 * 8 + 4] = MaybePixel::NONE_RAW;
+        gaps[0] = MaybePixel::NONE_RAW; gaps[1] = MaybePixel::NONE_RAW; gaps[8] = MaybePixel::NONE_RAW;
+        let l0 = &run(&gaps, 0, 1)[0];
+        assert!(is_grey(&l0[(4 * 8 + 4) * 4..][..4], 188), "{:?}", &l0[(4 * 8 + 4) * 4..][..4]);
+        assert!(is_grey(&l0[0..4], 0));
     }
 
     #[test]
