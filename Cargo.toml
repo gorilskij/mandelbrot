@@ -15,8 +15,9 @@ ordered-float = "5.5.0"
 parking_lot = "0.12.5"
 rand = "0.10.3"
 rayon = "1.12.0"
-#waker_interrupter = { git = "https://github.com/gorilskij/waker_interrupter" }
-waker_interrupter = { path = "../waker_interrupter" }
+# TODO: publish waker_interrupter (e.g. on crates.io) and depend on a version.
+# For local work on it: waker_interrupter = { path = "../waker_interrupter" }
+waker_interrupter = { git = "https://github.com/gorilskij/waker_interrupter" }
 web-time = "1"
 wgpu = "30.0.1"
 winit = "0.30"
