@@ -177,6 +177,18 @@ not yet checked in a browser.
 - The window is the page's `<canvas id="canvas">`; its size comes from the
   layout until winit's resize observer fires (`initial_size`).
 - Memory: 3 GiB ceiling for the tiles (see the tile budget); native has none.
+- **Deploy**: served at `games.gorilskij.com/mandelbrot/` by the site's
+  router Worker (`~/code/site/gorilskij.com`, `GAMES` in
+  `router/src/index.js`) proxying the Cloudflare Pages project `mandelbrot`
+  (GitHub-connected; build `bash web/cf-build.sh`, output `web/dist`),
+  like hex_snake. Branch flow: work → `master` → `test-website` (preview)
+  → `pub-website` (production); other branches are skipped. `cf-build.sh`
+  installs rustup and builds without debug info (Pages rejects files over
+  25 MiB). `rust-toolchain.toml` pins the nightly (TODO: move it forward
+  now and then; `+atomics` is being phased out, so a newer one may need
+  changes). `Cargo.lock` is committed: the wasm-bindgen CLI must match the
+  library exactly. `waker_interrupter` is a git dependency (public repo;
+  TODO: publish it, e.g. on crates.io).
 
 ## Perturbation math
 
