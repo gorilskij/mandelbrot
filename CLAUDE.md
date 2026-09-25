@@ -15,8 +15,9 @@ detection); the CPU one is older (per-group references, no BLA).
   resets). **Space** resets: drops every tile and the CPU reference lists (the
   GPU backend's cached reference survives, which is harmless). **↑/↓**
   doubles/halves the max iterations (default 2048; tiles are retargeted, not
-  recomputed, see below). **←/→** change the sampling ratio s by 0.5
-  (0.5…4, default 1; see the compositor). **Cmd-scroll** shifts
+  recomputed, see below). **←/→** change the requested sampling ratio s by 0.5
+  (0.5…4, default 1; see the compositor), lowered if the view would not
+  fit the memory ceiling (see the tile budget; title `s 4 (→3)`). **Cmd-scroll** shifts
   the phase of the palette's hue sine (1/128 turn per notch), **Ctrl-scroll**
   the lightness one (1/32; Alt is bound elsewhere on the user's machine)
   (`PalettePhase`; recolours only; both together shift both). **Cmd/Ctrl-C / V** copies/pastes `coords/iterations`
@@ -42,7 +43,14 @@ detection); the CPU one is older (per-group references, no BLA).
   `pixel_to_coord` (exact FBig coordinate of a global pixel).
   - **Tile budget** (LRU eviction at the start of each generation, never the
     current generation's tiles): max(1 GiB, 3× the current view's tiles),
-    no ceiling (`set_view_tiles`). A high s needs many tiles (s = 4: up to
+    capped by the **memory ceiling** (`memory_ceiling_bytes`: half the
+    physical RAM, 3 GiB on wasm; counting each tile's CPU pixels, GPU
+    iterations and colour levels, `TILE_TOTAL_BYTES`). The view's own tiles
+    can't be evicted, so the ceiling also bounds s: ←/→ set the requested
+    s, the store uses the largest 0.5 step at or below it whose worst-case
+    view fits (`effective_ratio`, on resize and s changes; shrinking the
+    window restores it). The 3× cache shrinks first. Never silent (user):
+    title `s 4 (→3)`, `cache 1.4×` when cut, a warning in the log. A high s needs many tiles (s = 4: up to
     ~24k for 3000×2000, ~4.5 GiB with the factor); with a fixed 1 GiB the
     view alone filled it, evicting parents and recent views (black previews
     while moving, no reuse). Lowering s shrinks it again.
@@ -389,17 +397,7 @@ coding):
    ~1–2 s wait still bothers the user): move on to later passes while
    deferred pixels are pending. Tricky: a tile finishes a pass only once all
    its pixels are stored, and later passes would defer more pixels too.
-7. **Memory ceiling for s** (agreed 2026-09-25, not built): a resize can
-   make a formerly fine s too big (the view's tiles are never evicted, so
-   the budget can't help). Keep the *requested* s (←/→) and derive an
-   *effective* s: shrink the 3× cache factor towards 1× first, then lower s
-   in 0.5 steps until the view's tiles (~w·h·r²/128², r ∈ [s, 2s); ~64 KiB
-   CPU + 64 KiB GPU iterations + colour each) fit a per-platform ceiling
-   (native: a fraction of physical RAM; wasm: ~3 GiB). Recompute on resize
-   and s change; shrinking the window restores the requested s. **Must be
-   visible in the debug info** (user): title like `s 4 (→3)`, plus a log
-   line when it clamps. Never clamp silently.
-8. **wasm port** (discussed 2026-09-25, not started): one codebase, not two.
+7. **wasm port** (discussed 2026-09-25, not started): one codebase, not two.
    Shared as is: all WGSL, the math (dashu, nucleus, BLA, store), the
    compositor. The one real refactor: make the compute driver async
    (`run_generation` → `render_pass_batch` → the chunk loop in gpu.rs
@@ -409,5 +407,5 @@ coding):
    (thread vs worker), `Instant` (`web-time`), clipboard, logging (no
    `gpu.log`), event-loop startup. rayon via `wasm-bindgen-rayon` needs
    COOP/COEP headers: fine, the user hosts on Cloudflare. wasm32's 4 GiB
-   address space is what item 7's wasm ceiling is for. First step: the
+   address space is what the wasm memory ceiling is for (see the tile budget). First step: the
    async chunk loop on native alone, checked with the existing GPU tests.
