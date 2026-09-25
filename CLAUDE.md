@@ -327,7 +327,10 @@ Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
   resets), `view_2026_09_23c_matches_exact` (2⁻³¹⁴, 262144 iterations),
   `dispatch_is_deterministic_even_when_killed`,
   `bla_with_escaping_reference_matches_plain`,
-  `zero_delta_escapes_with_reference`, plus `diag_*` measurements
+  `zero_delta_escapes_with_reference`, `recolour_matches_cpu` (compositor
+  colouring vs `val_to_color`), plus `diag_*` measurements
+  (`diag_recolour_speed`: a full-screen recolour, `DIAG_TILES`,
+  `DIAG_BASE`, `DIAG_SMOOTH`)
   (`diag_bla_ab`, `diag_switch_threshold`, `diag_interior_detection`,
   `diag_reference_precision`, `diag_far_reference`: accuracy with a reused
   far-away nucleus, `diag_deep_nucleus_search`: search timing
