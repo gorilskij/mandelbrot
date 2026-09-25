@@ -50,8 +50,10 @@ detection); the CPU one is older (per-group references, no BLA).
     s, the store uses the largest 0.5 step at or below it whose worst-case
     view fits (`effective_ratio`, on resize and s changes; shrinking the
     window restores it). The 3× cache shrinks first. Never silent (user):
-    title `s 4 (→3)`, `cache 1.4×` when cut, a warning in the log. A high s needs many tiles (s = 4: up to
-    ~24k for 3000×2000, ~4.5 GiB with the factor); with a fixed 1 GiB the
+    title `s 4 (→3)`, `cache 1.4×` when cut, a warning in the log. A high
+    s needs many tiles (s = 4: up to ~24k for 3000×2000, ~5 GiB in all
+    copies; on this 16 GiB machine the 8 GiB ceiling holds the view plus a
+    ~1.7× cache, and s is only lowered for much larger windows); with a fixed 1 GiB the
     view alone filled it, evicting parents and recent views (black previews
     while moving, no reuse). Lowering s shrinks it again.
   - **Passes** (`NUM_PASSES=7`): grid passes `GRID_STRIDES=[16,8,4,2]`, then
