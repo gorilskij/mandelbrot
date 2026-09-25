@@ -89,6 +89,8 @@ struct App {
     // Mandelbrot state.
     coords: CoordinatesBox,
     iterations: usize,
+    /// Palette phases, scrolled with Cmd (hue) / Alt (lightness).
+    palette: PalettePhase,
 
     // Input state.
     cursor_pos: Option<(f64, f64)>,   // physical pixels
@@ -116,6 +118,9 @@ const SAMPLING_STEP: f64 = 0.5;
 const SAMPLING_MIN:  f64 = 0.5;
 const SAMPLING_MAX:  f64 = 4.0;
 
+/// Palette phase shift per mouse-wheel notch, in turns (Cmd / Alt-scroll).
+const PALETTE_TURNS_PER_NOTCH: f64 = 1.0 / 32.0;
+
 impl App {
     fn new() -> Self {
         let precision = 100;
@@ -136,6 +141,7 @@ impl App {
                 view: View::new(1.0 / 600.0),
             },
             iterations: 2048,
+            palette: PalettePhase::default(),
             cursor_pos: None,
             mouse_left_down: false,
             dragging: None,
@@ -272,9 +278,10 @@ impl App {
             else { "f32" };
         let (cx, cy) = self.center_coord_f64();
         window.set_title(&format!(
-            "Mandelbrot | {} | view {:.4e} (2^{:.2}) | depth {} upp 2^{} | s {} | iters {} | centre {:.17}, {:.17} \
-             | mods [{}] | key {}",
-            pipe, view, view.log2(), depth, upp, ratio, self.iterations, cx, cy,
+            "Mandelbrot | {} | view {:.4e} (2^{:.2}) | depth {} upp 2^{} | s {} | iters {} \
+             | palette hue {:.3} light {:.3} | centre {:.17}, {:.17} | mods [{}] | key {}",
+            pipe, view, view.log2(), depth, upp, ratio, self.iterations,
+            self.palette.hue, self.palette.light, cx, cy,
             mod_symbols(self.modifiers), self.key_debug,
         ));
     }
@@ -451,13 +458,23 @@ impl ApplicationHandler for App {
             },
 
             WindowEvent::MouseWheel { delta, .. } => {
-                // Only zoom when not dragging (matches old behaviour).
-                if !self.mouse_left_down {
-                    let y = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y as f64 * 2.5,
-                        MouseScrollDelta::PixelDelta(pos) => pos.y / 4.0,
-                    };
-                    self.apply_scroll_zoom(y);
+                // In wheel notches (a trackpad's ~10 px each).
+                let notches = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y as f64,
+                    MouseScrollDelta::PixelDelta(pos) => pos.y / 10.0,
+                };
+                let hue = self.modifiers.super_key() || self.modifiers.control_key();
+                if hue || self.modifiers.alt_key() {
+                    // Recolour only: shift a palette phase, nothing is recomputed.
+                    let shift = notches * PALETTE_TURNS_PER_NOTCH;
+                    let phase = if hue { &mut self.palette.hue } else { &mut self.palette.light };
+                    *phase = (*phase + shift).rem_euclid(1.0);
+                    if let Some(rt) = &self.render_thread {
+                        rt.set_palette(self.palette);
+                    }
+                } else if !self.mouse_left_down {
+                    // Only zoom when not dragging (matches old behaviour).
+                    self.apply_scroll_zoom(notches * 2.5);
                     self.bump_precision();
                     // Show the zoomed view immediately (interpolated from
                     // existing tiles); schedule the compute refresh for the

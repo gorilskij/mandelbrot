@@ -1692,9 +1692,8 @@ mod tests {
 
     fn dump_rgb(name: &str, vals: &[u32]) {
         if let Ok(out) = std::env::var("DIAG_OUT") {
-            let mut palette = vec![];
             let rgb: Vec<u8> = vals.iter().flat_map(|&v| {
-                let c = crate::gpu_compositor::color_of_for_tests(v, &mut palette);
+                let c = crate::gpu_compositor::color_of_for_tests(v);
                 [(c >> 16) as u8, (c >> 8) as u8, c as u8]
             }).collect();
             std::fs::write(format!("{out}/{name}.rgb"), rgb).unwrap();

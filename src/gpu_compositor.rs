@@ -1,4 +1,4 @@
-use crate::rendering::{CoordinatesBox, val_to_color};
+use crate::rendering::{CoordinatesBox, PalettePhase, val_to_color};
 use std::num::NonZeroUsize;
 use crate::tiles::store::{
     GRID_STRIDES, NUM_GRID_PASSES, NUM_PASSES, TILE_LEN, TILE_SIZE, Tile, TileKey, TileStore,
@@ -8,7 +8,9 @@ use crate::tiles::store::{
 use bytemuck::{Pod, Zeroable};
 use dashu::integer::IBig;
 use itertools::iproduct;
-use std::collections::HashMap;
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -216,6 +218,21 @@ struct TileEntry {
     levels: u32,
     /// `Tile::version` this texture was built from
     version: u32,
+    /// `GpuCompositor::palette_gen` it was coloured with
+    palette_gen: u32,
+}
+
+/// A tile texture to (re)build: see `stale_texture`.
+struct Upload {
+    key: TileKey,
+    tile: Arc<Tile>,
+    stride: usize,
+    tex_size: u32,
+    base: u32,
+    levels: u32,
+    version: u32,
+    /// overwrite the existing texture in place
+    same_shape: bool,
 }
 
 /// The image the tiles are drawn into, 1:1 in texels of the mip level in use,
@@ -243,9 +260,9 @@ pub struct GpuCompositor {
     bgl: wgpu::BindGroupLayout,
     tiles: HashMap<TileKey, TileEntry>,
     bar: BarAnim,
-    /// Colour per escape iteration (`val_to_color`), grown on demand: tiles
-    /// store iterations and are coloured here, at upload.
-    palette: Vec<u32>,
+    palette: Palette,
+    /// Bumped on every palette change, so every texture is recoloured.
+    palette_gen: u32,
 }
 
 impl GpuCompositor {
@@ -503,7 +520,8 @@ impl GpuCompositor {
                 downsample_bgl,
                 offscreen: None,
                 bar: BarAnim::new(1.0),
-                palette: Vec::new(),
+                palette: Palette { phase: PalettePhase::default(), table: Vec::new() },
+                palette_gen: 0,
                 sampler,
                 bgl,
                 tiles: HashMap::new(),
@@ -620,6 +638,15 @@ impl GpuCompositor {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
+    /// Recolour with `phase`: every texture is rebuilt on the next frame,
+    /// from the tiles' stored iterations (no recomputation).
+    pub fn set_palette(&mut self, phase: PalettePhase) {
+        if phase != self.palette.phase {
+            self.palette = Palette { phase, table: Vec::new() };
+            self.palette_gen = self.palette_gen.wrapping_add(1);
+        }
+    }
+
     /// Draw one frame. Returns whether the progress bar is still moving, i.e.
     /// whether another frame is wanted even if nothing else changes.
     pub fn render(&mut self, store: &TileStore, coords: &CoordinatesBox, width: u32, height: u32) -> bool {
@@ -709,9 +736,13 @@ impl GpuCompositor {
         let (k_min, k_max) = drawn_levels(store.min_ratio());
         let k_min = k_min.min(k);
         let span = k_max.saturating_sub(k_min) + 1;
-        for p in &pending {
-            self.ensure_texture(&p.src, store, k_min.saturating_sub(p.climb), span);
-        }
+        let mut seen = HashSet::new();
+        let uploads: Vec<Upload> = pending
+            .iter()
+            .filter(|p| seen.insert(&p.src))
+            .filter_map(|p| self.stale_texture(&p.src, store, k_min.saturating_sub(p.climb), span))
+            .collect();
+        self.upload_textures(uploads);
         self.ensure_offscreen(width, height);
         let off = self.offscreen.as_ref().expect("offscreen image");
 
@@ -868,21 +899,18 @@ impl GpuCompositor {
         });
     }
 
-    /// Upload `key`'s tile if it changed, as the `span` (1 or 2) mip levels
-    /// drawn when full-resolution texels are sampled at `level` or up to one
-    /// coarser (at s = 1 level 0 only; at s = 3 levels 1 and 2; at s = 4
-    /// level 2, a sixteenth of the texels). Other levels are never drawn at
-    /// the current s, so they are neither kept on the GPU nor uploaded; a
-    /// change of s re-uploads.
-    fn ensure_texture(&mut self, key: &TileKey, store: &TileStore, level: u32, span: u32) {
-        let tile = match store.get(key) {
-            Some(t) => t,
-            None => return,
-        };
+    /// What `key`'s tile needs uploaded, if it changed (or the palette did),
+    /// as the `span` (1 or 2) mip levels drawn when full-resolution texels
+    /// are sampled at `level` or up to one coarser (at s = 1 level 0 only; at
+    /// s = 3 levels 1 and 2; at s = 4 level 2, a sixteenth of the texels).
+    /// Other levels are never drawn at the current s, so they are neither
+    /// kept on the GPU nor uploaded; a change of s re-uploads.
+    fn stale_texture(&self, key: &TileKey, store: &TileStore, level: u32, span: u32) -> Option<Upload> {
+        let tile = store.get(key)?;
         let passes_done = tile.display_passes();
         let version = tile.version();
         if passes_done == 0 {
-            return;
+            return None;
         }
 
         // Grid passes: upload the finest complete grid and let the sampler
@@ -898,40 +926,62 @@ impl GpuCompositor {
         let base = level.saturating_sub(stride.trailing_zeros()).min(max_level);
         let levels = (max_level - base + 1).min(span);
 
-        if let Some(entry) = self.tiles.get(key) {
-            let same_shape = entry.tex_size == tex_size && entry.base == base && entry.levels == levels;
-            if entry.version == version && same_shape {
-                return;
+        let same_shape = self.tiles.get(key).is_some_and(|entry| {
+            entry.tex_size == tex_size && entry.base == base && entry.levels == levels
+        });
+        let current = same_shape && self.tiles.get(key).is_some_and(|entry| {
+            entry.version == version && entry.palette_gen == self.palette_gen
+        });
+        (!current).then(|| Upload { key: key.clone(), tile, stride, tex_size, base, levels, version, same_shape })
+    }
+
+    /// Colour the stale tiles (in parallel: after a palette change that is
+    /// every tile on screen) and upload them.
+    fn upload_textures(&mut self, uploads: Vec<Upload>) {
+        if let Some(max) = uploads.iter().map(|u| u.tile.iterations.load(Ordering::Relaxed)).max() {
+            self.palette.grow(max);
+        }
+        let palette = &self.palette;
+        let data: Vec<Vec<Vec<u32>>> = uploads
+            .par_iter()
+            .map(|u| mip_chain(Self::texels(&u.tile, u.stride, u.tex_size, palette), u.tex_size, u.base + u.levels))
+            .collect();
+        for (u, data) in uploads.into_iter().zip(data) {
+            self.upload_texture(u, data);
+        }
+    }
+
+    /// Upload one tile's mip `data` (every level from full resolution).
+    fn upload_texture(&mut self, u: Upload, data: Vec<Vec<u32>>) {
+        let Upload { key, tex_size, base, levels, version, same_shape, .. } = u;
+        if same_shape {
+            // Same shape — overwrite pixels in-place, every level.
+            let entry = self.tiles.get_mut(&key).unwrap();
+            for (i, data) in data[base as usize..].iter().enumerate() {
+                let size = tex_size >> (base as usize + i);
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &entry.texture,
+                        mip_level: i as u32,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    bytemuck::cast_slice(data),
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(size * 4),
+                        rows_per_image: Some(size),
+                    },
+                    wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+                );
             }
-            if same_shape {
-                // Same shape — overwrite pixels in-place, every level.
-                let data = mip_chain(Self::texels(&tile, stride, tex_size, &mut self.palette), tex_size, base + levels);
-                for (i, data) in data[base as usize..].iter().enumerate() {
-                    let size = tex_size >> (base as usize + i);
-                    self.queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &entry.texture,
-                            mip_level: i as u32,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        bytemuck::cast_slice(data),
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(size * 4),
-                            rows_per_image: Some(size),
-                        },
-                        wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
-                    );
-                }
-                self.tiles.get_mut(key).unwrap().version = version;
-                return;
-            }
+            entry.version = version;
+            entry.palette_gen = self.palette_gen;
+            return;
         }
 
         // Create a new texture (first upload, size changed due to a new pass,
         // or other mip levels needed).
-        let data = mip_chain(Self::texels(&tile, stride, tex_size, &mut self.palette), tex_size, base + levels);
         let size = tex_size >> base;
         let texture = self.device.create_texture_with_data(
             &self.queue,
@@ -963,14 +1013,15 @@ impl GpuCompositor {
                 },
             ],
         });
-        self.tiles.insert(key.clone(), TileEntry { texture, bind_group, tex_size, base, levels, version });
+        let palette_gen = self.palette_gen;
+        self.tiles.insert(key, TileEntry { texture, bind_group, tex_size, base, levels, version, palette_gen });
     }
 
     /// Texels for a tile displayed at `stride`: the stride grid, or at
     /// stride 1 the reconstructed full-resolution tile.
     /// Texels for a tile displayed at `stride`: the stride grid, or at
     /// stride 1 the reconstructed full-resolution tile.
-    fn texels(tile: &Tile, stride: usize, tex_size: u32, palette: &mut Vec<u32>) -> Vec<u32> {
+    fn texels(tile: &Tile, stride: usize, tex_size: u32, palette: &Palette) -> Vec<u32> {
         if stride == 1 {
             Self::reconstruct(tile, palette)
         } else {
@@ -982,13 +1033,13 @@ impl GpuCompositor {
     /// A missing grid pixel is one being recomputed after the iteration
     /// count went up, i.e. formerly in the set: drawn black, as it was.
     /// Data races are intentional — see store.rs.
-    fn sample_pixels(tile: &Tile, stride: usize, tex_size: u32, palette: &mut Vec<u32>) -> Vec<u32> {
+    fn sample_pixels(tile: &Tile, stride: usize, tex_size: u32, palette: &Palette) -> Vec<u32> {
         let n = tex_size as usize;
         let mut data = vec![0u32; n * n];
         for row in 0..n {
             for col in 0..n {
                 let px = tile.load(row * stride * TILE_SIZE + col * stride).get();
-                data[row * n + col] = rgb_to_rgba8(px.map_or(0, |v| color_of(v, palette)));
+                data[row * n + col] = rgb_to_rgba8(px.map_or(0, |v| palette.color(v)));
             }
         }
         data
@@ -1000,11 +1051,11 @@ impl GpuCompositor {
     /// from the first sub-pass on, fewer at the tile edge). A missing pixel
     /// from an already-displayed pass is being recomputed after the
     /// iteration count went up — formerly in the set — and is drawn black.
-    fn reconstruct(tile: &Tile, palette: &mut Vec<u32>) -> Vec<u32> {
+    fn reconstruct(tile: &Tile, palette: &Palette) -> Vec<u32> {
         let n = TILE_SIZE;
         let shown = tile.display_passes();
-        let mut known = |r: usize, c: usize| match tile.load(r * n + c).get() {
-            Some(v) => Some(color_of(v, palette)),
+        let known = |r: usize, c: usize| match tile.load(r * n + c).get() {
+            Some(v) => Some(palette.color(v)),
             None if pass_of(r, c) < shown => Some(0),
             None => None,
         };
@@ -1031,19 +1082,36 @@ impl GpuCompositor {
 }
 
 #[cfg(test)]
-pub fn color_of_for_tests(iteration: u32, palette: &mut Vec<u32>) -> u32 {
-    color_of(iteration, palette)
+pub fn color_of_for_tests(iteration: u32) -> u32 {
+    val_to_color(NonZeroUsize::new(iteration as usize), PalettePhase::default())
 }
 
-/// Colour (0x00RRGGBB) of a stored pixel value: the escape iteration, 0 for
-/// in the set. Looked up in `palette`, which grows as needed.
-fn color_of(iteration: u32, palette: &mut Vec<u32>) -> u32 {
-    let i = iteration as usize;
-    if i >= palette.len() {
-        let len = (i + 1).next_power_of_two().max(256);
-        palette.extend((palette.len()..len).map(|j| val_to_color(NonZeroUsize::new(j))));
+/// Colour per escape iteration (`val_to_color`) at the current phase: tiles
+/// store iterations and are coloured here, at upload. The table is grown
+/// before the (parallel) colouring, which only reads it.
+struct Palette {
+    phase: PalettePhase,
+    table: Vec<u32>,
+}
+
+impl Palette {
+    /// Cover iterations up to `max`.
+    fn grow(&mut self, max: usize) {
+        if max >= self.table.len() {
+            let len = (max + 1).next_power_of_two().max(256);
+            let phase = self.phase;
+            self.table.extend((self.table.len()..len).map(|j| val_to_color(NonZeroUsize::new(j), phase)));
+        }
     }
-    palette[i]
+
+    /// Colour (0x00RRGGBB) of a stored pixel value: the escape iteration, 0
+    /// for in the set. Computed directly past the table's end.
+    fn color(&self, iteration: u32) -> u32 {
+        match self.table.get(iteration as usize) {
+            Some(&c) => c,
+            None => val_to_color(NonZeroUsize::new(iteration as usize), self.phase),
+        }
+    }
 }
 
 /// Mean of 0x00RRGGBB sRGB colours, taken in linear light like every other
@@ -1208,8 +1276,9 @@ struct Inner {
     coords: CoordinatesBox,
     width: u32,
     height: u32,
-    /// bumped whenever the view (coords/size) changes; lets the render thread
-    /// tell "nothing changed, park" from "new view, redraw".
+    palette: PalettePhase,
+    /// bumped whenever the view (coords/size) or palette changes; lets the
+    /// render thread tell "nothing changed, park" from "new view, redraw".
     generation: u64,
     /// pending surface reconfigure; only the render thread may touch the surface
     resize: Option<(u32, u32)>,
@@ -1241,6 +1310,7 @@ impl RenderThread {
                 coords,
                 width,
                 height,
+                palette: PalettePhase::default(),
                 generation: 0,
                 resize: None,
                 exit: false,
@@ -1258,10 +1328,10 @@ impl RenderThread {
                 loop {
                     // Snapshot the latest view under the lock, then release it
                     // before the (potentially vsync-blocking) render.
-                    let (coords, w, h, resize, exit, generation) = {
+                    let (coords, w, h, palette, resize, exit, generation) = {
                         let mut g = s.inner.lock().unwrap();
                         let resize = g.resize.take();
-                        (g.coords.clone(), g.width, g.height, resize, g.exit, g.generation)
+                        (g.coords.clone(), g.width, g.height, g.palette, resize, g.exit, g.generation)
                     };
                     if exit {
                         break;
@@ -1269,6 +1339,7 @@ impl RenderThread {
                     if let Some((rw, rh)) = resize {
                         compositor.resize(rw, rh);
                     }
+                    compositor.set_palette(palette);
 
                     // Progress is read *before* rendering: any tiles completed
                     // during the render show up as a change on the next pass and
@@ -1309,6 +1380,16 @@ impl RenderThread {
             g.coords = coords;
             g.width = width;
             g.height = height;
+            g.generation = g.generation.wrapping_add(1);
+        }
+        self.shared.cv.notify_one();
+    }
+
+    /// Recolour with the palette `phase` on the next frame.
+    pub fn set_palette(&self, phase: PalettePhase) {
+        {
+            let mut g = self.shared.inner.lock().unwrap();
+            g.palette = phase;
             g.generation = g.generation.wrapping_add(1);
         }
         self.shared.cv.notify_one();

@@ -155,7 +155,17 @@ fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-pub fn val_to_color(val: Option<NonZeroUsize>) -> u32 {
+/// Phase offsets of the palette's two sine waves, in turns (1 = a whole
+/// period): `hue` for the slow hue wave, `light` for the fast lightness one.
+/// Scrolled with Cmd / Alt; changing them recolours without recomputing.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct PalettePhase {
+    pub hue: f64,
+    pub light: f64,
+}
+
+pub fn val_to_color(val: Option<NonZeroUsize>, phase: PalettePhase) -> u32 {
+    use std::f64::consts::TAU;
     if let Some(val) = val {
         // really good color scheme
         // let hsl = HSL {
@@ -165,9 +175,9 @@ pub fn val_to_color(val: Option<NonZeroUsize>) -> u32 {
         // };
 
         let hsl = HSL {
-            h: (val.get() as f64 / 1200.0).sin() * 180.0,
+            h: (val.get() as f64 / 1200.0 + TAU * phase.hue).sin() * 180.0,
             s: 0.7,
-            l: ((val.get() as f64 / 40.0).sin() * 0.3 + 0.4),
+            l: ((val.get() as f64 / 40.0 + TAU * phase.light).sin() * 0.3 + 0.4),
         };
 
         let (r, g, b) = hsl.to_rgb();
