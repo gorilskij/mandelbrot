@@ -410,8 +410,8 @@ underflow, dropped-dispatch and floatexp-orbit fixes, deep nucleus search
 (precision, speed, caching, far reuse), BLA near an escaping reference, the
 momentum progress bar, CPU/GPU overlap, background nucleus search, GPU as
 the default backend, the sampling ratio s with area-averaging
-antialiasing (incl. a tile budget that follows the view), and palette
-scrolling. Decided: render order stays pass-major (each
+antialiasing (incl. a tile budget that follows the view), palette
+scrolling, GPU recolouring, and the web build (see Web build). Decided: render order stays pass-major (each
 pass completes, rippling out from the cursor, before the next starts); the
 user rejected ring-by-ring refinement. Still open (talk through before
 coding):
