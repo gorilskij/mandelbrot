@@ -12,8 +12,10 @@ detection); the CPU one is older (per-group references, no BLA).
   Logging defaults to `info` and is teed to `gpu.log` in the working directory
   (overwritten on each launch, gitignored); `RUST_LOG` overrides the level.
 - The app **starts on the GPU backend**; **Escape** switches CPU/GPU (and
-  resets). **Space** resets: drops every tile and the CPU reference lists (the
-  GPU backend's cached reference survives, which is harmless). **↑/↓**
+  resets). **Space** resets: drops every tile, the CPU reference lists and the
+  GPU backend's cached reference, failed-search memory and running search
+  (`Perturbator::reset`), so it searches for a nucleus afresh: the way out
+  of a bad nucleus (#8 in Open threads). **↑/↓**
   doubles/halves the max iterations (default 2048; tiles are retargeted, not
   recomputed, see below). **←/→** change the requested sampling ratio s by 0.5
   (0.5…4, default 1; see the compositor), lowered if the view would not
@@ -462,3 +464,14 @@ coding):
    possible, e.g. zooming during a render. Fix in waker_interrupter: a
    lock-free send (store the message in an atomic slot, wake the receiver
    without blocking) and an atomic-flag interrupter check.
+8. **TODO (user): bugged nucleus, the set takes weird shapes.** With a
+   nucleus whose period differs from a minibrot in view (e.g. a cached one
+   reused from further out, up to `MAX_REF_REUSE_DIST`), interior detection
+   gives false positives: minibrots' black areas take the wrong shape or
+   black discs appear (seen from the web build after zooming in; right when
+   the view is loaded directly). Repros: `diag_view_2026_09_25b_references`
+   (p=55 at 9 radii: 129 px falsely in the set vs 8 without interior
+   detection) and `view_2026_09_25_black_disc`. Proposed fix, not agreed
+   yet: also require z to have returned near its start at each window
+   boundary; maybe also limit reuse of a far nucleus when interior
+   detection is on. Workaround until then: Space, which searches afresh.
