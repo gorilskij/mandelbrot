@@ -16,9 +16,10 @@ detection); the CPU one is older (per-group references, no BLA).
   GPU backend's cached reference survives, which is harmless). **↑/↓**
   doubles/halves the max iterations (default 2048; tiles are retargeted, not
   recomputed, see below). **←/→** change the sampling ratio s by 0.5
-  (0.5…4, default 1; see the compositor). **Cmd/Ctrl-scroll** shifts
-  the phase of the palette's hue sine, **Alt-scroll** the lightness one
-  (`PalettePhase`, 1/32 turn per notch; recolours only). **Cmd/Ctrl-C / V** copies/pastes `coords/iterations`
+  (0.5…4, default 1; see the compositor). **Cmd-scroll** shifts
+  the phase of the palette's hue sine (1/128 turn per notch), **Ctrl-scroll**
+  the lightness one (1/32; Alt is bound elsewhere on the user's machine)
+  (`PalettePhase`; recolours only). **Cmd/Ctrl-C / V** copies/pastes `coords/iterations`
   (`x,y|units_per_pixel/iterations`, `x,y` = top-left corner). Letter shortcuts
   match the layout's character (`logical_key`), not the key position (the user
   types Dvorak).

@@ -89,7 +89,7 @@ struct App {
     // Mandelbrot state.
     coords: CoordinatesBox,
     iterations: usize,
-    /// Palette phases, scrolled with Cmd (hue) / Alt (lightness).
+    /// Palette phases, scrolled with Cmd (hue) / Ctrl (lightness).
     palette: PalettePhase,
 
     // Input state.
@@ -118,8 +118,10 @@ const SAMPLING_STEP: f64 = 0.5;
 const SAMPLING_MIN:  f64 = 0.5;
 const SAMPLING_MAX:  f64 = 4.0;
 
-/// Palette phase shift per mouse-wheel notch, in turns (Cmd / Alt-scroll).
-const PALETTE_TURNS_PER_NOTCH: f64 = 1.0 / 32.0;
+/// Palette phase shift per mouse-wheel notch, in turns: hue (Cmd-scroll)
+/// and lightness (Ctrl-scroll).
+const HUE_TURNS_PER_NOTCH:   f64 = 1.0 / 128.0;
+const LIGHT_TURNS_PER_NOTCH: f64 = 1.0 / 32.0;
 
 impl App {
     fn new() -> Self {
@@ -463,12 +465,15 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(pos) => pos.y / 10.0,
                 };
-                let hue = self.modifiers.super_key() || self.modifiers.control_key();
-                if hue || self.modifiers.alt_key() {
+                let hue = self.modifiers.super_key();
+                if hue || self.modifiers.control_key() {
                     // Recolour only: shift a palette phase, nothing is recomputed.
-                    let shift = notches * PALETTE_TURNS_PER_NOTCH;
-                    let phase = if hue { &mut self.palette.hue } else { &mut self.palette.light };
-                    *phase = (*phase + shift).rem_euclid(1.0);
+                    let (phase, step) = if hue {
+                        (&mut self.palette.hue, HUE_TURNS_PER_NOTCH)
+                    } else {
+                        (&mut self.palette.light, LIGHT_TURNS_PER_NOTCH)
+                    };
+                    *phase = (*phase + notches * step).rem_euclid(1.0);
                     if let Some(rt) = &self.render_thread {
                         rt.set_palette(self.palette);
                     }
