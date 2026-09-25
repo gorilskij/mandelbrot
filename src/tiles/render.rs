@@ -106,7 +106,7 @@ pub async fn run_generation(
     iterations:  usize,
     cursor:      Option<Point<usize, Pixels>>,
     int:         MultiInterrupter<'_>,
-    backend:     &(dyn Perturbator + Send),
+    backend:     &dyn Perturbator,
 ) {
     if store.take_reset() {
         store.clear();

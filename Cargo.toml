@@ -20,6 +20,7 @@ rand = "0.10.3"
 rayon = "1.12.0"
 #waker_interrupter = { git = "https://github.com/gorilskij/waker_interrupter" }
 waker_interrupter = { path = "../waker_interrupter" }
+web-time = "1"
 wgpu = "30.0.1"
 winit = "0.30"
 

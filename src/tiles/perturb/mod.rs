@@ -82,7 +82,7 @@ pub type BatchFuture<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
 ///
 /// The tile store is updated in place; `finish_pass` is called on each tile
 /// upon completion (backends may skip it if interrupted mid-batch).
-pub trait Perturbator: Sync {
+pub trait Perturbator {
     fn render_pass_batch<'a>(
         &'a self,
         ctx:   &'a PassBatchCtx,
@@ -104,10 +104,8 @@ pub struct Toggle {
 }
 
 impl Toggle {
-    pub fn new(gpu: Gpu) -> (Self, Arc<AtomicBool>) {
-        let use_gpu = Arc::new(AtomicBool::new(true)); // start on the GPU backend
-        let toggle = Toggle { cpu: Cpu, gpu, use_gpu: use_gpu.clone() };
-        (toggle, use_gpu)
+    pub fn new(gpu: Gpu, use_gpu: Arc<AtomicBool>) -> Self {
+        Toggle { cpu: Cpu, gpu, use_gpu }
     }
 }
 

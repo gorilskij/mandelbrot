@@ -54,3 +54,28 @@ impl Future for Fired {
         }
     }
 }
+
+/// Run the future made by `f` on its own thread: natively a thread driving
+/// it with a blocking executor; on the web a Web Worker running it on its
+/// event loop (which GPU readbacks need).
+pub fn spawn_async<F, Fut>(name: &str, f: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || pollster::block_on(f()))
+        .expect("spawn thread");
+    #[cfg(target_arch = "wasm32")]
+    web::spawn_async(name, f);
+}
+
+/// Set up what threads need before first use on this thread: natively
+/// nothing (rayon starts its pool itself); on the web rayon's pool, whose
+/// threads must be spawned as Web Workers.
+pub fn init_worker_threads() {
+    #[cfg(target_arch = "wasm32")]
+    web::init_rayon();
+}

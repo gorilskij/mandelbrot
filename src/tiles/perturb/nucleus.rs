@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn deep_view_gives_full_orbit() {
         let center = c(-0.743_643_887_037_151, 0.131_825_904_205_330);
-        let t = std::time::Instant::now();
+        let t = web_time::Instant::now();
         let n = find(center, 1e-12, -50);
         eprintln!("period {} found in {:?}", n.period, t.elapsed());
         let (orbit, _) = calculate_orbit(n.c, 20_000);
@@ -317,7 +317,7 @@ mod tests {
             re: &exact.re + &fp(3e-41),
             im: &exact.im - &fp(2e-41),
         };
-        let t = std::time::Instant::now();
+        let t = web_time::Instant::now();
         let n = find_nucleus(&center, &fp(1e-40), -140, 20_000, p, &|| false)
             .unwrap()
             .expect("nucleus");

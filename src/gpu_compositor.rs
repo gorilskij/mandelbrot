@@ -106,7 +106,7 @@ const BAR_BRAKE_SECS: f32 = 0.3;
 struct BarAnim {
     shown: f32,
     vel:   f32,
-    last:  Option<std::time::Instant>,
+    last:  Option<web_time::Instant>,
     /// Seconds of animation time (sum of `step`'s dt).
     t:     f32,
     /// Target at the last change, and when it changed (None: not yet seen,
@@ -130,7 +130,7 @@ impl BarAnim {
     /// Advance towards `target` (0..=1) and return the fill to draw, or
     /// `None` once complete and settled (bar hidden).
     fn advance(&mut self, target: f32) -> Option<f32> {
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         let dt  = self.last.map_or(0.0, |t| (now - t).as_secs_f32()).min(0.1);
         self.last = Some(now);
         self.step(target, dt)
@@ -1694,7 +1694,7 @@ mod tests {
         queue.submit([]);
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         for round in 0..3 {
-            let t = std::time::Instant::now();
+            let t = web_time::Instant::now();
             let mut enc = device.create_command_encoder(&Default::default());
             for (groups, layers) in &chunks {
                 record_recolour(&mut enc, &r, &inputs, groups, shape, *layers);

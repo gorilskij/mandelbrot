@@ -1,11 +1,11 @@
 use crate::rendering::{CoordinatesBox, Pixels};
 use crate::support::Point;
-use crate::tiles::perturb::Perturbator;
+use crate::tiles::perturb::{Toggle, gpu::{Gpu, GpuState}};
 use crate::tiles::render::{GroupCache, run_generation};
 use crate::tiles::store::TileStore;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::thread;
+use std::sync::atomic::AtomicBool;
 use waker_interrupter as wi;
 
 pub type Message = (
@@ -45,33 +45,22 @@ impl Handle {
     }
 }
 
-pub fn spawn(
-    store:   Arc<TileStore>,
-    backend: Arc<dyn Perturbator + Send + Sync>,
-) -> Handle {
+/// Start the compute thread (a Web Worker on the web; see
+/// `platform::spawn_async`). It makes its own backends, since on the web
+/// GPU objects stay on the thread that created them.
+pub fn spawn(store: Arc<TileStore>, use_gpu: Arc<AtomicBool>) -> Handle {
     let (sender, receiver) = wi::channel();
-
-    thread::spawn(move || {
-        let group_cache = Mutex::new(GroupCache::new());
-
-        receiver.run_multithreaded(
-            None,
-            None,
-            |(coords, iterations, cursor, width, height): Message, int| {
-                pollster::block_on(run_generation(
-                    &store,
-                    &group_cache,
-                    width,
-                    height,
-                    &coords,
-                    iterations,
-                    cursor,
-                    int,
-                    backend.as_ref(),
-                ));
-            },
-        );
-    });
-
+    crate::platform::spawn_async("compute", move || compute_loop(store, receiver, use_gpu));
     Handle { sender }
+}
+
+/// Render each requested view until told to stop; a newer request
+/// interrupts the current generation.
+async fn compute_loop(store: Arc<TileStore>, receiver: wi::Receiver<Message>, use_gpu: Arc<AtomicBool>) {
+    crate::platform::init_worker_threads();
+    let backend = Toggle::new(Gpu(Arc::new(GpuState::new().await)), use_gpu);
+    let group_cache = Mutex::new(GroupCache::new());
+    while let Some(((coords, iterations, cursor, width, height), int)) = receiver.recv_multithreaded() {
+        run_generation(&store, &group_cache, width, height, &coords, iterations, cursor, int, &backend).await;
+    }
 }

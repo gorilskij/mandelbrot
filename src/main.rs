@@ -13,7 +13,8 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use arboard::Clipboard;
 use dashu::float::FBig;
@@ -29,7 +30,6 @@ use crate::drawing::Drawer;
 use crate::gpu_compositor::{GpuCompositor, RenderThread};
 use crate::rendering::*;
 use crate::support::{Length, Point};
-use crate::tiles::perturb::{Perturbator, Toggle, gpu::{Gpu, GpuState}};
 
 /// DIAG: ⌃⌥⇧⌘ for the held modifiers.
 fn mod_symbols(m: ModifiersState) -> String {
@@ -80,7 +80,7 @@ struct App {
     window: Option<Arc<Window>>,
     render_thread: Option<RenderThread>,
     drawer: Option<Drawer>,
-    backend: Arc<dyn Perturbator + Send + Sync>,
+    /// which backend the compute thread uses (Escape toggles it)
     use_gpu: Arc<std::sync::atomic::AtomicBool>,
 
     // Physical pixel dimensions of the window.
@@ -121,14 +121,12 @@ const LIGHT_TURNS_PER_NOTCH: f64 = 1.0 / 32.0;
 impl App {
     fn new() -> Self {
         let precision = 100;
-        let (toggle, use_gpu) = Toggle::new(Gpu(Arc::new(GpuState::new_blocking())));
         let exact = |f: f64| FBig::try_from(f).unwrap().with_precision(precision).value();
         Self {
             window: None,
             render_thread: None,
             drawer: None,
-            backend: Arc::new(toggle),
-            use_gpu,
+            use_gpu: Arc::new(std::sync::atomic::AtomicBool::new(true)), // start on the GPU backend
             phys_width: 0,
             phys_height: 0,
             coords: CoordinatesBox {
@@ -374,7 +372,7 @@ impl ApplicationHandler for App {
             height as usize,
             self.coords.clone(),
             self.iterations,
-            self.backend.clone(),
+            self.use_gpu.clone(),
         );
 
         // Hand the compositor and a store handle to the render thread; it owns

@@ -5,9 +5,10 @@ use crate::{
     drawing::renderer::multithreaded,
     rendering::{CoordinatesBox, Pixels},
     support::Point,
-    tiles::{perturb::Perturbator, store::MEMORY_BUDGET_BYTES, store::TileStore},
+    tiles::{store::MEMORY_BUDGET_BYTES, store::TileStore},
 };
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// Owns the tile store and the compute render thread. Display assembly lives
 /// in the GPU compositor, which reads tiles from the store directly; the
@@ -27,10 +28,10 @@ impl Drawer {
         height: usize,
         coords: CoordinatesBox,
         iterations: usize,
-        backend: Arc<dyn Perturbator + Send + Sync>,
+        use_gpu: Arc<AtomicBool>,
     ) -> Self {
         let store = Arc::new(TileStore::new(MEMORY_BUDGET_BYTES));
-        let renderer = multithreaded::spawn(store.clone(), backend);
+        let renderer = multithreaded::spawn(store.clone(), use_gpu);
 
         let mut this = Self {
             width,
