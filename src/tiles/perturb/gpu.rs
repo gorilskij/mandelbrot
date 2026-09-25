@@ -2268,4 +2268,53 @@ mod tests {
             dump_rgb(&format!("disc_{name}"), &got);
         }
     }
+
+    /// View reported on 2026-09-25 from the web build (2^-25.9): the
+    /// minibrot's black area had the wrong shape after zooming in, right
+    /// when loaded directly. The real shader with the view's own nucleus
+    /// vs nuclei of other periods nearby (as a cached reference from
+    /// further out could be), with and without interior detection; counts
+    /// pixels in the set where the own nucleus says they escape.
+    /// DIAG_PERIODS=5,11,... (default: a spread). DIAG_OUT dumps renders.
+    #[test]
+    #[ignore]
+    fn diag_view_2026_09_25b_references() {
+        let clip = "0.3981021933073662783090241220056593879351,-0.3206659358048569381892253779465824255592|1.559326974158611e-8";
+        let iters = 32768;
+        let (w, h) = (3000usize, 3700usize);
+        let v = sample_view_geometry(clip, iters, (w, h), (150, 185));
+        let g = &v.geom;
+        let gpu = GpuState::new_blocking();
+        let run = |c: Complex<FBig>, period: Option<usize>| -> (Reference, Vec<u32>) {
+            let r = Reference::new(c, iters, period);
+            let (rx, ry) = ref_px(&r.c, &v.ctx);
+            let offs: Vec<(f64, f64)> = v.pix.iter().map(|&(c, rw)| (c as f64 - rx, rw as f64 - ry)).collect();
+            let gr = gpu.prepare(&r, log2_dc(&offs, g.upp), g.upp);
+            let out = offs.chunks(4096).flat_map(|c| gpu.dispatch_offsets_now(c, g.upp, &gr)).collect();
+            (r, out)
+        };
+        let own = find_nucleus(&g.center, &g.radius, g.upp, iters, g.prec, &|| false).unwrap().expect("nucleus");
+        let (_, base) = run(own.c.clone(), Some(own.period));
+        eprintln!("own nucleus p={}: {} of {} in the set", own.period, base.iter().filter(|&&x| x == 0).count(), base.len());
+        dump_rgb("b25_own", &base);
+        let periods: Vec<usize> = std::env::var("DIAG_PERIODS").ok()
+            .map(|s| s.split(',').map(|x| x.parse().unwrap()).collect())
+            .unwrap_or(vec![5, 11, 22, 44, 55, 110]);
+        let tol2 = FBig::ONE >> (2 * (40 - g.upp)) as isize;
+        let far = FBig::try_from(0.05).unwrap();
+        for p in periods {
+            let Some(c) = newton_nucleus(&g.center, p, g.prec, &tol2, &(&far * &far), &|| false).unwrap() else {
+                eprintln!("p={p}: no nucleus"); continue
+            };
+            for (label, period) in [("interior", Some(p)), ("no interior", None)] {
+                let (r, got) = run(c.clone(), period);
+                let (rx, ry) = ref_px(&r.c, &v.ctx);
+                let radii = rx.hypot(ry) / (w as f64).hypot(h as f64) * 2.0;
+                let false_in = got.iter().zip(&base).filter(|&(&a, &b)| a == 0 && b != 0).count();
+                let lost = got.iter().zip(&base).filter(|&(&a, &b)| a != 0 && b == 0).count();
+                eprintln!("p={p} ({radii:.0} radii, full {}), {label}: {false_in} falsely in the set, {lost} falsely escaping", r.is_full);
+                dump_rgb(&format!("b25_p{p}_{}", if period.is_some() { "int" } else { "noint" }), &got);
+            }
+        }
+    }
 }
