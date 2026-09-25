@@ -106,18 +106,40 @@ fn jump_limit(n : u32) -> u32 {
 // Interior detection (see INTERIOR_* in gpu.rs)
 // ---------------------------------------------------------------------------
 
-// Called after iteration n with ld = log2|dz/dz₀|². At the end of each
-// interior window, update the contraction streak; true once enough
-// consecutive windows contracted (pixel is in the set).
-fn interior_check(n : u32, ld_prev : ptr<function, f32>, have_prev : ptr<function, bool>,
-                  streak : ptr<function, u32>, ld : f32) -> bool {
-    if ((n + 1u) % uniforms.interior_window != 0u) { return false; }
-    if (*have_prev && ld - *ld_prev < uniforms.interior_contraction) {
-        *streak = *streak + 1u;
+struct Interior {
+    ld_prev   : f32,        // ld at the previous window boundary
+    z_prev    : vec2<f32>,  // z there
+    have_prev : bool,
+    streak    : u32,        // consecutive windows that passed
+}
+
+fn interior_new() -> Interior {
+    return Interior(0.0, vec2<f32>(0.0, 0.0), false, 0u);
+}
+
+// Whether iteration n starts a new interior window (not the first one).
+fn interior_boundary(n : u32) -> bool {
+    return uniforms.interior_window != 0u && n != 0u && n % uniforms.interior_window == 0u;
+}
+
+// At a window boundary (`interior_boundary(n)`), with z = z_n and ld =
+// log2|dz_n/dz₀|²: a window passes if the derivative shrank by the
+// contraction threshold and z came back to where it was a window earlier
+// (within `interior_return`, relative). True once enough consecutive windows
+// passed (the pixel is in the set). Without the return test, a pixel near a
+// minibrot whose period does not divide the window (a nucleus reference of
+// another period) could look contracting while it escapes: black discs and
+// misshapen minibrots.
+fn interior_check(z : vec2<f32>, ld : f32, s : ptr<function, Interior>) -> bool {
+    let d = z - (*s).z_prev;
+    let back = dot(d, d) <= uniforms.interior_return * max(dot(z, z), dot((*s).z_prev, (*s).z_prev));
+    if ((*s).have_prev && back && ld - (*s).ld_prev < uniforms.interior_contraction) {
+        (*s).streak = (*s).streak + 1u;
     } else {
-        *streak = 0u;
+        (*s).streak = 0u;
     }
-    *ld_prev = ld;
-    *have_prev = true;
-    return *streak >= uniforms.interior_windows;
+    (*s).ld_prev = ld;
+    (*s).z_prev = z;
+    (*s).have_prev = true;
+    return (*s).streak >= uniforms.interior_windows;
 }

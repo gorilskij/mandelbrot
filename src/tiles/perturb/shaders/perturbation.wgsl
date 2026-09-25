@@ -10,7 +10,7 @@ struct Uniforms {
     // BLA table (see perturb_common.wgsl); bla_levels 0 disables it.
     bla_levels           : u32,
     bla_log2_size        : u32,
-    _pad0                : u32,
+    interior_return      : f32,
     _pad1                : u32,
     _pad2                : u32,
 }
@@ -38,7 +38,8 @@ const GLITCH_BIT : u32 = 0x80000000u;
 // Interior detection: track ld = log2|dz/dz_0|² (|dz_{n+1}|² = 4|z_n|²|dz_n|²,
 // additive in log space so it cannot over/underflow). Every `interior_window`
 // iterations (a whole number of the nucleus period) compare it with the
-// previous window: inside a component the cycle multiplier |λ| < 1, so it
+// previous window (and require z to have come back, see interior_check):
+// inside a component the cycle multiplier |λ| < 1, so it
 // shrinks; `interior_windows` consecutive shrinks by `interior_contraction`
 // declare the pixel in the set, instead of running to the iteration limit.
 //
@@ -53,14 +54,17 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     var delta = d0;
     var m     = 0u;  // index into the reference orbit (resets on rebase)
     var ld     = 0.0; // log2 |dz/dz_0|²
-    var ld_prev = 0.0;
-    var have_prev = false;
-    var streak = 0u;
+    var interior = interior_new();
     var n = 0u;
     var backoff = BlaBackoff(0u, 1u);
 
     loop {
         if n >= uniforms.orbit_len { break; }
+        // Every n is reached here once (BLA jumps stop at window boundaries).
+        if interior_boundary(n) && interior_check(orbit_data[m] + delta, ld, &interior) {
+            output[idx] = 0u;
+            return;
+        }
 
         var hit = BlaHit(0u, 0u);
         if bla_should_search(&backoff, m) {
@@ -70,13 +74,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         if hit.len != 0u {
             let e = bla_table[hit.idx];
             delta = fe_to_c(bla_apply(e, fe_from_c(delta), fe_from_c(d0)));
-            if uniforms.interior_window != 0u {
-                ld += bla_log2_a2(e);
-                if interior_check(n + hit.len - 1u, &ld_prev, &have_prev, &streak, ld) {
-                    output[idx] = 0u;
-                    return;
-                }
-            }
+            if uniforms.interior_window != 0u { ld += bla_log2_a2(e); }
             n += hit.len;
             m += hit.len;
             continue;
@@ -91,13 +89,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
             return;
         }
 
-        if uniforms.interior_window != 0u {
-            ld += 2.0 + log2(x2);
-            if interior_check(n, &ld_prev, &have_prev, &streak, ld) {
-                output[idx] = 0u;
-                return;
-            }
-        }
+        if uniforms.interior_window != 0u { ld += 2.0 + log2(x2); }
 
         if x2 < dot(delta, delta) {
             // Rebase: δ ← z² + δ_0, back to the start of the reference.

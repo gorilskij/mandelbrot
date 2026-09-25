@@ -40,7 +40,7 @@ struct Uniforms {
     // BLA table (see perturb_common.wgsl); bla_levels 0 disables it.
     bla_levels           : u32,
     bla_log2_size        : u32,
-    _pad0                : u32,
+    interior_return      : f32,
     _pad1                : u32,
     _pad2                : u32,
 }
@@ -79,14 +79,18 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     var m = 0u;  // index into the reference orbit (resets on rebase)
     var backoff = BlaBackoff(0u, 1u);
     var ld = 0.0;  // log2 |dz/dz_0|²
-    var ld_prev = 0.0;
-    var have_prev = false;
-    var streak = 0u;
+    var interior = interior_new();
 
     loop {
     // Phase 1: floatexp while delta is too small for f32.
     loop {
         if (n >= uniforms.orbit_len) { break; }
+        // Every n is reached once at the top of one of the two phases' loops
+        // (BLA jumps stop at window boundaries).
+        if (interior_boundary(n) && interior_check(fe_to_c(fe_add(fe_norm(orbit_raw(m)), delta)), ld, &interior)) {
+            output[idx] = 0u;
+            return;
+        }
         var hit = BlaHit(0u, 0u);
         if (bla_should_search(&backoff, m)) {
             hit = bla_find(m, 0.5 * log2(dot(delta.m, delta.m)) + f32(delta.e), jump_limit(n));
@@ -95,13 +99,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         if (hit.len != 0u) {
             let e = bla_table[hit.idx];
             delta = bla_apply(e, delta, d0);
-            if (uniforms.interior_window != 0u) {
-                ld += bla_log2_a2(e);
-                if (interior_check(n + hit.len - 1u, &ld_prev, &have_prev, &streak, ld)) {
-                    output[idx] = 0u;
-                    return;
-                }
-            }
+            if (uniforms.interior_window != 0u) { ld += bla_log2_a2(e); }
             n = n + hit.len;
             m = m + hit.len;
             if (delta.e > F32_SWITCH_EXP) { break; }
@@ -116,13 +114,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         // z in floatexp: X can be ~0 (a nucleus orbit hits 0), where the f32
         // value above has underflowed.
         let z = fe_add(cf, delta);
-        if (uniforms.interior_window != 0u) {
-            ld += 2.0 + log2(dot(z.m, z.m)) + 2.0 * f32(z.e);
-            if (interior_check(n, &ld_prev, &have_prev, &streak, ld)) {
-                output[idx] = 0u;
-                return;
-            }
-        }
+        if (uniforms.interior_window != 0u) { ld += 2.0 + log2(dot(z.m, z.m)) + 2.0 * f32(z.e); }
         if (fe_abs_lt(z, delta)) {
             // Rebase: δ ← z² + δ_0, back to the start of the reference.
             delta = fe_add(fe_mul(z, z), d0);
@@ -146,6 +138,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let d0f = fe_to_c(d0);
     loop {
         if (n >= uniforms.orbit_len) { break; }
+        if (interior_boundary(n) && interior_check(fe_to_c(orbit_raw(m)) + df, ld, &interior)) {
+            output[idx] = 0u;
+            return;
+        }
         var hit = BlaHit(0u, 0u);
         if (bla_should_search(&backoff, m)) {
             hit = bla_find(m, 0.5 * log2(dot(df, df)), jump_limit(n));
@@ -154,13 +150,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         if (hit.len != 0u) {
             let e = bla_table[hit.idx];
             let dn = bla_apply(e, fe_from_c(df), d0);
-            if (uniforms.interior_window != 0u) {
-                ld += bla_log2_a2(e);
-                if (interior_check(n + hit.len - 1u, &ld_prev, &have_prev, &streak, ld)) {
-                    output[idx] = 0u;
-                    return;
-                }
-            }
+            if (uniforms.interior_window != 0u) { ld += bla_log2_a2(e); }
             n = n + hit.len;
             m = m + hit.len;
             if (dn.e <= F32_SWITCH_EXP) {
@@ -177,13 +167,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
             output[idx] = n + 1u;
             return;
         }
-        if (uniforms.interior_window != 0u) {
-            ld += 2.0 + log2(x2);
-            if (interior_check(n, &ld_prev, &have_prev, &streak, ld)) {
-                output[idx] = 0u;
-                return;
-            }
-        }
+        if (uniforms.interior_window != 0u) { ld += 2.0 + log2(x2); }
         let rebase = x2 < dot(df, df);
         var next : vec2<f32>;
         if (rebase) {

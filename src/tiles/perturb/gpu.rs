@@ -121,6 +121,13 @@ const MIN_RETRY_PX: usize = 256;
 const INTERIOR_MIN_WINDOW: usize = 128;
 const INTERIOR_WINDOWS:    u32   = 2;
 const INTERIOR_Q:          f64   = 0.9;
+/// A window also needs z back where it was a window earlier: |Δz|² ≤
+/// INTERIOR_RETURN·|z|². Otherwise a pixel near a minibrot whose period does
+/// not divide the window (with a nucleus of another period as the reference,
+/// e.g. a cached one from further out) could pass while it escapes: black
+/// discs and misshapen minibrots (`view_2026_09_25_black_disc`,
+/// `diag_view_2026_09_25b_references`).
+const INTERIOR_RETURN:     f64   = 1.0 / (1u64 << 20) as f64;
 
 /// How far (in view half-diagonals) a cached full reference (a nucleus) may
 /// be from the view and still be reused, so zooming does not search again
@@ -172,7 +179,10 @@ struct Uniforms {
     /// BLA table: number of levels (0 disables BLA) and log2 of level 0's size.
     bla_levels:           u32,
     bla_log2_size:        u32,
-    _pad:                 [u32; 3],
+    /// Squared distance, relative to |z|², within which z must return
+    /// across a window (`INTERIOR_RETURN`).
+    interior_return:      f32,
+    _pad:                 [u32; 2],
 }
 
 // ---------------------------------------------------------------------------
@@ -758,7 +768,8 @@ impl GpuState {
                 interior_windows: INTERIOR_WINDOWS,
                 bla_levels:    r.bla_levels,
                 bla_log2_size: r.bla_log2_size,
-                _pad: [0; 3],
+                interior_return: INTERIOR_RETURN as f32,
+                _pad: [0; 2],
             }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -1535,20 +1546,25 @@ mod tests {
         let d0 = Complex { re: F::from(d0.0).unwrap(), im: F::from(d0.1).unwrap() };
         let two = F::from(2.0).unwrap();
         let (mut d, mut m) = (d0, 0usize);
-        let (mut ld, mut prev, mut streak) = (F::zero(), None::<F>, 0u32);
+        let (mut ld, mut prev, mut streak) = (F::zero(), None::<(F, Complex<F>)>, 0u32);
         let lq = F::from(log2_q2).unwrap();
+        let ret = F::from(INTERIOR_RETURN).unwrap();
         let n_max = orbit.len() - 1;
         for n in 0..orbit.len() {
             let z = x[m] + d;
+            // at a window boundary, as the shader: ld = log2|dz_n|², z = z_n
+            if period > 0 && n > 0 && n % period == 0 {
+                streak = match prev {
+                    Some((p, zp)) if ld - p < lq && (z - zp).norm_sqr() <= ret * z.norm_sqr().max(zp.norm_sqr()) => streak + 1,
+                    _ => 0,
+                };
+                prev = Some((ld, z));
+                if streak >= k { return (Ok(None), n); }
+            }
             let z2 = z.norm_sqr();
             if z2 > F::from(4.0).unwrap() { return (Ok(Some(n + 1)), n + 1); }
             if n == n_max { break; }
             ld = ld + two + z2.log2(); // |dz_{n+1}|² = 4|z_n|²|dz_n|²
-            if period > 0 && (n + 1) % period == 0 {
-                streak = match prev { Some(p) if ld - p < lq => streak + 1, _ => 0 };
-                prev = Some(ld);
-                if streak >= k { return (Ok(None), n + 1); }
-            }
             if z2 < d.norm_sqr() {
                 d = z * z + d0;
                 m = 0;
