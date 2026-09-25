@@ -95,8 +95,9 @@ fn group_list(cache: &Mutex<GroupCache>, gkey: &GroupKey, iterations: usize) -> 
 
 /// Render all tiles visible in `coords`, coarse-to-fine, returning early when
 /// interrupted. For each progressive pass the entire set of tiles needing that
-/// pass is handed to the backend as a single batch.
-pub fn run_generation(
+/// pass is handed to the backend as a single batch. Async like the backends
+/// (see `BatchFuture`).
+pub async fn run_generation(
     store:       &TileStore,
     group_cache: &Mutex<GroupCache>,
     width:       usize,
@@ -104,7 +105,7 @@ pub fn run_generation(
     coords:      &CoordinatesBox,
     iterations:  usize,
     cursor:      Option<Point<usize, Pixels>>,
-    int:         MultiInterrupter,
+    int:         MultiInterrupter<'_>,
     backend:     &(dyn Perturbator + Send),
 ) {
     if store.take_reset() {
@@ -187,7 +188,7 @@ pub fn run_generation(
 
         if batch.is_empty() { continue; }
 
-        backend.render_pass_batch(&ctx, &batch, pass, &int);
+        backend.render_pass_batch(&ctx, &batch, pass, &int).await;
         store.bump_progress();
         log_tile_colors(generation, pass, &tiles);
     }

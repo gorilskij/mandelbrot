@@ -58,7 +58,7 @@ pub fn spawn(
             None,
             None,
             |(coords, iterations, cursor, width, height): Message, int| {
-                run_generation(
+                pollster::block_on(run_generation(
                     &store,
                     &group_cache,
                     width,
@@ -68,7 +68,7 @@ pub fn spawn(
                     cursor,
                     int,
                     backend.as_ref(),
-                );
+                ));
             },
         );
     });

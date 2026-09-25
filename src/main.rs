@@ -4,6 +4,7 @@
 
 mod drawing;
 mod gpu_compositor;
+mod platform;
 mod rendering;
 mod support;
 mod tiles;
@@ -120,7 +121,7 @@ const LIGHT_TURNS_PER_NOTCH: f64 = 1.0 / 32.0;
 impl App {
     fn new() -> Self {
         let precision = 100;
-        let (toggle, use_gpu) = Toggle::new(Gpu(Arc::new(GpuState::new())));
+        let (toggle, use_gpu) = Toggle::new(Gpu(Arc::new(GpuState::new_blocking())));
         let exact = |f: f64| FBig::try_from(f).unwrap().with_precision(precision).value();
         Self {
             window: None,

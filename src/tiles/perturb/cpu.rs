@@ -3,7 +3,7 @@
 //! its own high-precision orbit, projects it, and pushes it into the shared
 //! group list so later pixels reuse it.
 
-use super::{PassBatchCtx, Perturbator, RefList, RefOrbit, TileItem};
+use super::{BatchFuture, PassBatchCtx, Perturbator, RefList, RefOrbit, TileItem};
 use crate::rendering::{Pf, calculate_orbit, check_divergence_delta, check_orbit};
 use crate::tiles::store::{
     GROUP_POW, GROUP_TILES, NUM_PASSES, TILE_SIZE, Tile, floor_div_pow2, pass_pixels,
@@ -23,13 +23,19 @@ const DETERMINISTIC: bool = false;
 pub struct Cpu;
 
 impl Perturbator for Cpu {
-    fn render_pass_batch(
-        &self,
-        _ctx:  &PassBatchCtx,
-        tiles: &[TileItem],
+    fn render_pass_batch<'a>(
+        &'a self,
+        ctx:   &'a PassBatchCtx,
+        tiles: &'a [TileItem],
         pass:  u8,
-        int:   &MultiInterrupter,
-    ) {
+        int:   &'a MultiInterrupter,
+    ) -> BatchFuture<'a> {
+        Box::pin(async move { self.render_pass(ctx, tiles, pass, int) })
+    }
+}
+
+impl Cpu {
+    fn render_pass(&self, _ctx: &PassBatchCtx, tiles: &[TileItem], pass: u8, int: &MultiInterrupter) {
         if DETERMINISTIC {
             for item in tiles {
                 if int.interrupted() { return; }

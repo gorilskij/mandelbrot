@@ -21,6 +21,8 @@ use cpu::Cpu;
 use dashu::integer::IBig;
 use gpu::Gpu;
 use num::Complex;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -70,18 +72,24 @@ pub struct TileItem {
 // Trait
 // ---------------------------------------------------------------------------
 
+/// A backend's work on one batch. Async because on the web a worker can't
+/// block on GPU readbacks; natively it is driven with a blocking executor
+/// (`pollster`) and behaves as before. Not `Send`: on the web GPU objects
+/// stay on the thread that made them.
+pub type BatchFuture<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
+
 /// Renders a batch of tiles for one progressive pass.
 ///
 /// The tile store is updated in place; `finish_pass` is called on each tile
 /// upon completion (backends may skip it if interrupted mid-batch).
 pub trait Perturbator: Sync {
-    fn render_pass_batch(
-        &self,
-        ctx:   &PassBatchCtx,
-        tiles: &[TileItem],
+    fn render_pass_batch<'a>(
+        &'a self,
+        ctx:   &'a PassBatchCtx,
+        tiles: &'a [TileItem],
         pass:  u8,
-        int:   &MultiInterrupter,
-    );
+        int:   &'a MultiInterrupter,
+    ) -> BatchFuture<'a>;
 }
 
 // ---------------------------------------------------------------------------
@@ -104,13 +112,13 @@ impl Toggle {
 }
 
 impl Perturbator for Toggle {
-    fn render_pass_batch(
-        &self,
-        ctx:   &PassBatchCtx,
-        tiles: &[TileItem],
+    fn render_pass_batch<'a>(
+        &'a self,
+        ctx:   &'a PassBatchCtx,
+        tiles: &'a [TileItem],
         pass:  u8,
-        int:   &MultiInterrupter,
-    ) {
+        int:   &'a MultiInterrupter,
+    ) -> BatchFuture<'a> {
         if self.use_gpu.load(Ordering::Relaxed) {
             self.gpu.render_pass_batch(ctx, tiles, pass, int)
         } else {

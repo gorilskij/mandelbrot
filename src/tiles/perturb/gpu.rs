@@ -34,7 +34,7 @@
 
 use super::bla::BlaTable;
 use super::nucleus::{MAX_REF_DIST, find_nucleus};
-use super::{PassBatchCtx, Perturbator, TileItem};
+use super::{BatchFuture, PassBatchCtx, Perturbator, TileItem};
 use crate::rendering::{calculate_orbit, check_orbit};
 use crate::tiles::store::{TILE_SIZE, pass_pixels, pixel_to_coord, upp_log2, working_precision};
 use bytemuck::{Pod, Zeroable};
@@ -358,8 +358,14 @@ pub struct GpuState {
 }
 
 impl GpuState {
-    pub fn new() -> Self {
-        pollster::block_on(async {
+    /// Blocking `new`, for the native app and tests.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new_blocking() -> Self {
+        pollster::block_on(Self::new())
+    }
+
+    pub async fn new() -> Self {
+        {
             let instance = wgpu::Instance::default();
             let adapter = instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
@@ -419,7 +425,7 @@ impl GpuState {
                 search: Mutex::new(None),
                 ms_per_px: Mutex::new(1e-4),
             }
-        })
+        }
     }
 
     /// Reference for a pass, without waiting for a nucleus search: a cached
@@ -601,9 +607,9 @@ impl GpuState {
     }
 
     /// Dispatch pixels given as offsets from `r` in pixel units.
-    fn dispatch_offsets(&self, offs: &[(f64, f64)], upp: i64, r: &GpuRef) -> Vec<u32> {
+    async fn dispatch_offsets(&self, offs: &[(f64, f64)], upp: i64, r: &GpuRef) -> Vec<u32> {
         let d = Deltas::pack(offs, upp);
-        self.dispatch(self.pipeline_for(&d), &d.bytes, d.n, d.elem(), r)
+        self.dispatch(self.pipeline_for(&d), &d.bytes, d.n, d.elem(), r).await
     }
 
     fn pipeline_for(&self, d: &Deltas) -> &wgpu::ComputePipeline {
@@ -623,15 +629,15 @@ impl GpuState {
 
     /// Wait for a submitted chunk and read it back, retrying pixels the GPU
     /// did not run (see `dispatch_chunk`).
-    fn finish(&self, p: PendingChunk) -> Vec<u32> {
+    async fn finish(&self, p: PendingChunk) -> Vec<u32> {
         let (d, elem) = (&p.deltas, p.deltas.elem());
         let mut out = Vec::with_capacity(d.n);
         let mut at = 0;
         for part in p.parts {
             let n = part.n;
             let bytes = &d.bytes[at * elem..(at + n) * elem];
-            let got = self.wait(part);
-            out.extend(self.retry_not_run(self.pipeline_for(d), bytes, n, &p.gref, got));
+            let got = self.wait(part).await;
+            out.extend(self.retry_not_run(self.pipeline_for(d), bytes, n, &p.gref, got).await);
             at += n;
         }
         out
@@ -644,7 +650,7 @@ impl GpuState {
     /// `delta_bytes` holds `n` deltas of `elem` bytes each.  Large batches are
     /// split into chunks so no storage buffer exceeds the device's
     /// `max_storage_buffer_binding_size`.
-    fn dispatch(
+    async fn dispatch(
         &self,
         pipeline:    &wgpu::ComputePipeline,
         delta_bytes: &[u8],
@@ -655,11 +661,11 @@ impl GpuState {
         if n == 0 { return Vec::new(); }
         let max_pixels = ((self.max_binding / elem) * 9 / 10).max(1);
         if n <= max_pixels {
-            return self.dispatch_chunk(pipeline, delta_bytes, n, r);
+            return self.dispatch_chunk(pipeline, delta_bytes, n, r).await;
         }
         let mut out = Vec::with_capacity(n);
         for chunk in delta_bytes.chunks(max_pixels * elem) {
-            out.extend(self.dispatch_chunk(pipeline, chunk, chunk.len() / elem, r));
+            out.extend(self.dispatch_chunk(pipeline, chunk, chunk.len() / elem, r).await);
         }
         out
     }
@@ -667,19 +673,22 @@ impl GpuState {
     /// One dispatch over a chunk small enough to fit the binding-size limit,
     /// retrying pixels the GPU did not run (NOT_RUN) in halves down to
     /// MIN_RETRY_PX.  Pixels still not run are returned as NOT_RUN.
-    fn dispatch_chunk(
-        &self,
-        pipeline:    &wgpu::ComputePipeline,
-        delta_bytes: &[u8],
+    /// (Boxed: it recurses through `retry_not_run`.)
+    fn dispatch_chunk<'a>(
+        &'a self,
+        pipeline:    &'a wgpu::ComputePipeline,
+        delta_bytes: &'a [u8],
         n_pixels:    usize,
-        r:           &GpuRef,
-    ) -> Vec<u32> {
-        let out = self.dispatch_once(pipeline, delta_bytes, n_pixels, r);
-        self.retry_not_run(pipeline, delta_bytes, n_pixels, r, out)
+        r:           &'a GpuRef,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u32>> + 'a>> {
+        Box::pin(async move {
+            let out = self.dispatch_once(pipeline, delta_bytes, n_pixels, r).await;
+            self.retry_not_run(pipeline, delta_bytes, n_pixels, r, out).await
+        })
     }
 
     /// Given the results `out` of a dispatch, redo the pixels it did not run.
-    fn retry_not_run(
+    async fn retry_not_run(
         &self,
         pipeline:    &wgpu::ComputePipeline,
         delta_bytes: &[u8],
@@ -693,25 +702,28 @@ impl GpuState {
         }
         log::warn!("GPU did not run {missing}/{n_pixels} px of a dispatch; retrying in halves");
         if n_pixels <= MIN_RETRY_PX {
-            let retry = self.dispatch_once(pipeline, delta_bytes, n_pixels, r);
+            let retry = self.dispatch_once(pipeline, delta_bytes, n_pixels, r).await;
             return out.into_iter().zip(retry).map(|(a, b)| if a == NOT_RUN { b } else { a }).collect();
         }
         let elem = delta_bytes.len() / n_pixels;
         let half = n_pixels / 2;
-        let mut merged = self.dispatch_chunk(pipeline, &delta_bytes[..half * elem], half, r);
-        merged.extend(self.dispatch_chunk(pipeline, &delta_bytes[half * elem..], n_pixels - half, r));
+        let mut merged = self.dispatch_chunk(pipeline, &delta_bytes[..half * elem], half, r).await;
+        merged.extend(self.dispatch_chunk(pipeline, &delta_bytes[half * elem..], n_pixels - half, r).await);
         out.into_iter().zip(merged).map(|(a, b)| if a == NOT_RUN { b } else { a }).collect()
     }
 
     /// A single dispatch; pixels the GPU did not run come back as NOT_RUN.
-    fn dispatch_once(
+    async fn dispatch_once(
         &self,
         pipeline:    &wgpu::ComputePipeline,
         delta_bytes: &[u8],
         n_pixels:    usize,
         r:           &GpuRef,
     ) -> Vec<u32> {
-        self.submit_once(pipeline, delta_bytes, n_pixels, r).map_or_else(Vec::new, |f| self.wait(f))
+        match self.submit_once(pipeline, delta_bytes, n_pixels, r) {
+            Some(f) => self.wait(f).await,
+            None => Vec::new(),
+        }
     }
 
     /// Submit a single dispatch (`None` for no pixels); `wait` reads it back.
@@ -792,14 +804,19 @@ impl GpuState {
         enc.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
         let t_submit = std::time::Instant::now(); // DIAG
         let index = queue.submit([enc.finish()]);
-        staging_buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        Some(InFlight { staging: staging_buf, index, n: n_pixels, t_submit })
+        let (signal, mapped) = crate::platform::signal();
+        staging_buf.slice(..).map_async(wgpu::MapMode::Read, move |_| signal.fire());
+        Some(InFlight { staging: staging_buf, index, mapped, n: n_pixels, t_submit })
     }
 
     /// Wait for one submitted dispatch (only that one: later submissions
-    /// keep the GPU busy meanwhile) and read back its results.
-    fn wait(&self, f: InFlight) -> Vec<u32> {
+    /// keep the GPU busy meanwhile) and read back its results. Natively
+    /// this blocks on the device (the mapping callback fires inside the
+    /// poll); on the web it yields until the browser has mapped the buffer.
+    async fn wait(&self, f: InFlight) -> Vec<u32> {
+        #[cfg(not(target_arch = "wasm32"))]
         self.device.poll(wgpu::PollType::Wait { submission_index: Some(f.index), timeout: None }).unwrap();
+        f.mapped.await;
         log::info!( // DIAG
             "[diag gpu] dispatch {} px done {:.1} ms after submit", f.n, f.t_submit.elapsed().as_secs_f64() * 1e3,
         );
@@ -858,7 +875,10 @@ struct SearchJob {
 /// One submitted dispatch, not yet read back.
 struct InFlight {
     staging:  wgpu::Buffer,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     index:    wgpu::SubmissionIndex,
+    /// fires once the staging buffer is mapped
+    mapped:   crate::platform::Fired,
     n:        usize,
     t_submit: std::time::Instant, // DIAG
 }
@@ -921,12 +941,24 @@ struct PixelRef {
 }
 
 impl Perturbator for Gpu {
-    fn render_pass_batch(
+    fn render_pass_batch<'a>(
+        &'a self,
+        ctx:   &'a PassBatchCtx,
+        tiles: &'a [TileItem],
+        pass:  u8,
+        int:   &'a MultiInterrupter,
+    ) -> BatchFuture<'a> {
+        Box::pin(self.render_pass(ctx, tiles, pass, int))
+    }
+}
+
+impl Gpu {
+    async fn render_pass(
         &self,
         ctx:   &PassBatchCtx,
         tiles: &[TileItem],
         pass:  u8,
-        int:   &MultiInterrupter,
+        int:   &MultiInterrupter<'_>,
     ) {
         if tiles.is_empty() || int.interrupted() { return; }
 
@@ -1037,12 +1069,12 @@ impl Perturbator for Gpu {
         // Dispatch pixels `ids` against `r`, in chunks of ~TARGET_CHUNK_MS
         // (glitched or deferred pixels can be many: keep dispatches short).
         // Pixels left when interrupted come back as NOT_RUN.
-        let dispatch_ids = |ids: &[usize], r: &Reference, gr: &GpuRef| -> Vec<u32> {
+        let dispatch_ids = async |ids: &[usize], r: &Reference, gr: &GpuRef| -> Vec<u32> {
             let mut out = Vec::with_capacity(ids.len());
             for part in ids.chunks(state.chunk_len()) {
                 if int.interrupted() { out.resize(ids.len(), NOT_RUN); break; }
                 let t = std::time::Instant::now();
-                out.extend(state.dispatch_offsets(&offsets(&mut part.iter().copied(), r), upp, gr));
+                out.extend(state.dispatch_offsets(&offsets(&mut part.iter().copied(), r), upp, gr).await);
                 state.record_chunk(part.len(), ms(t));
             }
             out
@@ -1050,8 +1082,8 @@ impl Perturbator for Gpu {
 
         // Glitch rounds, residual CPU resolve and storing for pixels `ids`
         // (indices into `pixel_refs`) with GPU results `raw`.
-        let resolve_and_store = |ids: &[usize], raw: &mut [u32], reference: &mut Arc<Reference>,
-                                 gref: &mut Arc<GpuRef>, remaining: &mut [usize], label: &str| {
+        let resolve_and_store = async |ids: &[usize], raw: &mut [u32], reference: &mut Arc<Reference>,
+                                       gref: &mut Arc<GpuRef>, remaining: &mut [usize], label: &str| {
             // Glitch rounds: a pixel is glitched only when it outlived the
             // reference's (escaping) orbit.  Re-dispatch those against a
             // longer-lived reference chosen among them.
@@ -1075,7 +1107,7 @@ impl Perturbator for Gpu {
                 let g_ids: Vec<usize> = glitched.iter().map(|&j| ids[j]).collect();
                 let offs = offsets(&mut g_ids.iter().copied(), &new_ref);
                 let new_gref = state.prepare(&new_ref, log2_dc(&offs, upp), upp);
-                let new_raw = dispatch_ids(&g_ids, &new_ref, &new_gref);
+                let new_raw = dispatch_ids(&g_ids, &new_ref, &new_gref).await;
                 for (k, &j) in glitched.iter().enumerate() {
                     raw[j] = new_raw[k];
                 }
@@ -1179,7 +1211,7 @@ impl Perturbator for Gpu {
             let packed = (more && chunks > 0 && !int.interrupted()).then(|| pack(at + len, false, &reference));
             let t_wait = std::time::Instant::now();
             let t_submit = pending.t_submit;
-            let mut raw = state.finish(pending);
+            let mut raw = state.finish(pending).await;
             let done = std::time::Instant::now();
             // Only a wait that blocked tells when the GPU finished.
             if (done - t_wait).as_secs_f64() > 1e-4 {
@@ -1205,7 +1237,7 @@ impl Perturbator for Gpu {
                     if *r != NOT_RUN && *r & GLITCH_BIT != 0 { deferred.push(ids[j]); *r = NOT_RUN; }
                 }
             }
-            resolve_and_store(&ids, &mut raw, &mut reference, &mut gref, &mut remaining, &format!("chunk {chunks}"));
+            resolve_and_store(&ids, &mut raw, &mut reference, &mut gref, &mut remaining, &format!("chunk {chunks}")).await;
 
             pos    += len;
             chunks += 1;
@@ -1217,11 +1249,11 @@ impl Perturbator for Gpu {
             let t_wait = std::time::Instant::now(); // DIAG
             while searching && !int.interrupted() {
                 poll_search(&mut searching, &mut reference, &mut gref);
-                if searching { std::thread::sleep(std::time::Duration::from_millis(5)); }
+                if searching { crate::platform::sleep(std::time::Duration::from_millis(5)).await; }
             }
             if int.interrupted() { return; }
             let mut raw = if reference.is_full {
-                dispatch_ids(&deferred, &reference, &gref)
+                dispatch_ids(&deferred, &reference, &gref).await
             } else {
                 vec![GLITCH_BIT; deferred.len()] // no nucleus: glitch rounds
             };
@@ -1229,7 +1261,7 @@ impl Perturbator for Gpu {
                 "[diag gpu] pass {pass}: {} deferred px, waited {:.1} ms for the search, ref {} -> {}",
                 deferred.len(), ms(t_wait), reference.describe(), raw_stats(&raw),
             );
-            resolve_and_store(&deferred, &mut raw, &mut reference, &mut gref, &mut remaining, "deferred");
+            resolve_and_store(&deferred, &mut raw, &mut reference, &mut gref, &mut remaining, "deferred").await;
         }
 
         log::info!(
@@ -1242,6 +1274,17 @@ impl Perturbator for Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Blocking versions of the async dispatch calls, for the tests.
+    impl GpuState {
+        fn dispatch_offsets_now(&self, offs: &[(f64, f64)], upp: i64, r: &GpuRef) -> Vec<u32> {
+            pollster::block_on(self.dispatch_offsets(offs, upp, r))
+        }
+
+        fn dispatch_now(&self, pipeline: &wgpu::ComputePipeline, delta_bytes: &[u8], n: usize, elem: usize, r: &GpuRef) -> Vec<u32> {
+            pollster::block_on(self.dispatch(pipeline, delta_bytes, n, elem, r))
+        }
+    }
 
     /// WGSL is only compiled at runtime (when the GPU backend starts), so
     /// check here that both perturbation shaders parse and validate.
@@ -1677,7 +1720,7 @@ mod tests {
         let (rx, ry) = ref_px(&r.c, &v.ctx);
         let offs: Vec<(f64, f64)> = v.pix.iter().map(|&(col, row)| (col as f64 - rx, row as f64 - ry)).collect();
         let gr = gpu.prepare_with(&r, log2_dc(&offs, g.upp), g.upp, bla);
-        let out = gpu.dispatch_offsets(&offs, g.upp, &gr);
+        let out = gpu.dispatch_offsets_now(&offs, g.upp, &gr);
         (r, out)
     }
 
@@ -1713,7 +1756,7 @@ mod tests {
     fn artifact_view_2026_09_23_matches_exact() {
         let clip = "0.36268061816918528044899172250760567988128488705999553580413024078293361870845608332075349484941,-0.64268799384608729642124986015130477562370908052480481690338843577039749867381572196329048271251|6.226537747227718e-67";
         let v = sample_view(clip, 32768, (3000, 2000), (150, 100));
-        let (_, got) = gpu_on_sample(&v, &GpuState::new());
+        let (_, got) = gpu_on_sample(&v, &GpuState::new_blocking());
         let (wrong, off50, black) = score(&got, &v.exact);
         eprintln!("GPU vs exact over {} px: wrong {wrong}, off by >50 {off50}, black {black}", got.len());
         dump_rgb("a1_exact", &v.exact);
@@ -1757,8 +1800,8 @@ mod tests {
             tx.send(());
             let mut tx = Some(tx);
             rx.run_multithreaded(None, None, |(), int| {
-                run_generation(store, &group_cache, v.ctx.width, v.ctx.height, &v.ctx.coords,
-                    v.ctx.iterations, None, int, backend);
+                pollster::block_on(run_generation(store, &group_cache, v.ctx.width, v.ctx.height, &v.ctx.coords,
+                    v.ctx.iterations, None, int, backend));
                 if let Some(tx) = tx.take() { tx.terminate(); }
             });
             let ts = TILE_SIZE as i64;
@@ -1792,7 +1835,7 @@ mod tests {
         let clip = "0.362680618169185280448991722507605679881284887059995535804130241675861432076423165340038916307547696001473666663642181909,-0.642687993846087296421249860151304775623709080524804816903388435265396126015520705061576074177687940915500836211594418175|1.7963169535192306e-92";
         let _ = env_logger::builder().is_test(true).try_init();
         let v = sample_view_cached("b", clip, 32768, (3000, 2000), (150, 100));
-        let backend = Gpu(Arc::new(GpuState::new()));
+        let backend = Gpu(Arc::new(GpuState::new_blocking()));
         let store = crate::tiles::store::TileStore::new(crate::tiles::store::MEMORY_BUDGET_BYTES);
         let t = std::time::Instant::now();
         let n_gens = std::env::var("DIAG_GENS").ok().and_then(|g| g.parse().ok()).unwrap_or(2);
@@ -1837,13 +1880,13 @@ mod tests {
         let offs: Vec<(f64, f64)> = (0..256).flat_map(|j| (0..256).map(move |i| (i as f64 - 128.0 + 0.3, j as f64 - 128.0 + 0.7)))
             .map(|(dx, dy)| (dx * 3.0, dy * 3.0)).collect();
         let _ = (rx, ry);
-        let gpu = GpuState::new();
+        let gpu = GpuState::new_blocking();
         // BLA off: with it this block takes ~20 ms, too short to be killed.
         let r = gpu.prepare_with(&r, log2_dc(&offs, g.upp), g.upp, false);
         let mut first: Option<Vec<u32>> = None;
         for run in 0..6 {
             let t = std::time::Instant::now();
-            let out = gpu.dispatch_offsets(&offs, g.upp, &r);
+            let out = gpu.dispatch_offsets_now(&offs, g.upp, &r);
             let zeros = out.iter().filter(|&&x| x == 0).count();
             let diff = first.as_ref().map_or(0, |f| f.iter().zip(&out).filter(|(a, b)| a != b).count());
             eprintln!("run {run}: {:?}, zeros {zeros}, differs from run 0 in {diff} px", t.elapsed());
@@ -1858,7 +1901,7 @@ mod tests {
                 let mut worst = std::time::Duration::ZERO;
                 for chunk in offs.chunks(size) {
                     let tc = std::time::Instant::now();
-                    out.extend(gpu.dispatch_offsets(chunk, g.upp, &r));
+                    out.extend(gpu.dispatch_offsets_now(chunk, g.upp, &r));
                     worst = worst.max(tc.elapsed());
                 }
                 let zeros = out.iter().filter(|&&x| x == 0).count();
@@ -1890,7 +1933,7 @@ mod tests {
         let sample: Vec<[f32; 4]> = v.pix.iter().map(|&(c, w)| pack_fe(c as f64 - rx, w as f64 - ry, g.upp)).collect();
         let block: Vec<[f32; 4]> = (0..256).flat_map(|j| (0..256).map(move |i| (i, j)))
             .map(|(i, j)| pack_fe((i as f64 - 128.3) * 3.0, (j as f64 - 127.6) * 3.0, g.upp)).collect();
-        let gpu = GpuState::new();
+        let gpu = GpuState::new_blocking();
         let r = gpu.prepare_with(&r, v.geom.upp as f64 + 12.0, v.geom.upp, false); // as measured, before BLA
         let layout = gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None, bind_group_layouts: &[Some(&gpu.bgl)], immediate_size: 0,
@@ -1909,7 +1952,7 @@ mod tests {
                 compilation_options: Default::default(), cache: None,
             });
             let run = |d: &[[f32; 4]]| -> Vec<u32> {
-                d.chunks(4096).flat_map(|c| gpu.dispatch(&pipeline, bytemuck::cast_slice(c), c.len(), 16, &r)).collect()
+                d.chunks(4096).flat_map(|c| gpu.dispatch_now(&pipeline, bytemuck::cast_slice(c), c.len(), 16, &r)).collect()
             };
             let got = run(&sample);
             let (wrong, off50, black) = score(&got, &v.exact);
@@ -1939,7 +1982,7 @@ mod tests {
             ("a", "0.36268061816918528044899172250760567988128488705999553580413024078293361870845608332075349484941,-0.64268799384608729642124986015130477562370908052480481690338843577039749867381572196329048271251|6.226537747227718e-67", 32768),
             ("b", "0.362680618169185280448991722507605679881284887059995535804130241675861432076423165340038916307547696001473666663642181909,-0.642687993846087296421249860151304775623709080524804816903388435265396126015520705061576074177687940915500836211594418175|1.7963169535192306e-92", 32768),
         ];
-        let gpu = GpuState::new();
+        let gpu = GpuState::new_blocking();
         for (name, clip, iters) in views {
             let v = sample_view_cached(name, clip, iters, (3000, 2000), (150, 100));
             let exact_black = v.exact.iter().filter(|&&x| x == 0).count();
@@ -1951,7 +1994,7 @@ mod tests {
                 let (_, got) = gpu_on_sample_with(&v, &gpu, bla);
                 let (wrong, off50, black) = score(&got, &v.exact);
                 let gr = gpu.prepare_with(&r, log2_dc(&block, g.upp), g.upp, bla);
-                let run = || -> Vec<u32> { block.chunks(4096).flat_map(|c| gpu.dispatch_offsets(c, g.upp, &gr)).collect() };
+                let run = || -> Vec<u32> { block.chunks(4096).flat_map(|c| gpu.dispatch_offsets_now(c, g.upp, &gr)).collect() };
                 let _ = run();
                 let t = std::time::Instant::now();
                 let _ = run();
@@ -1987,10 +2030,10 @@ mod tests {
         eprintln!("reference {}", r.describe());
         let (rx, ry) = ref_px(&r.c, &v.ctx);
         let offs: Vec<(f64, f64)> = v.pix.iter().map(|&(c, w)| (c as f64 - rx, w as f64 - ry)).collect();
-        let gpu = GpuState::new();
+        let gpu = GpuState::new_blocking();
         let run = |bla: bool| {
             let gr = gpu.prepare_with(&r, log2_dc(&offs, g.upp), g.upp, bla);
-            offs.chunks(1024).flat_map(|c| gpu.dispatch_offsets(c, g.upp, &gr)).collect::<Vec<u32>>()
+            offs.chunks(1024).flat_map(|c| gpu.dispatch_offsets_now(c, g.upp, &gr)).collect::<Vec<u32>>()
         };
         let (plain, bla) = (run(false), run(true));
         let glitch = |v: &[u32]| v.iter().filter(|&&x| x & GLITCH_BIT != 0).count();
@@ -2023,7 +2066,7 @@ mod tests {
     fn view_2026_09_23c_matches_exact() {
         let clip = "0.3626806181691852804489917225076056798812848870599955358041302416758614320764231653400389334599052087605123550187040027890282,-0.6426879938460872964212498601513047756237090805248048169033884352653961260155207050615760571472782180516346029887216862939575|3.290623677226253e-95";
         let v = sample_view_cached("c30", clip, 262144, (3000, 2000), (30, 20));
-        let (r, got) = gpu_on_sample(&v, &GpuState::new());
+        let (r, got) = gpu_on_sample(&v, &GpuState::new_blocking());
         let (wrong, off50, black) = score(&got, &v.exact);
         let exact_black = v.exact.iter().filter(|&&x| x == 0).count();
         eprintln!("reference {}: wrong {wrong}, off by >50 {off50}, black {black} (exact {exact_black}) of {}", r.describe(), got.len());
@@ -2059,7 +2102,7 @@ mod tests {
             let g = &v.geom;
             if std::env::var("DIAG_PIPE").is_ok() {
                 let _ = env_logger::builder().is_test(true).try_init();
-                let backend = Gpu(Arc::new(GpuState::new()));
+                let backend = Gpu(Arc::new(GpuState::new_blocking()));
                 let store = crate::tiles::store::TileStore::new(crate::tiles::store::MEMORY_BUDGET_BYTES);
                 let t = std::time::Instant::now();
                 run_pipeline(&v, &backend, &store, 1);
@@ -2110,12 +2153,12 @@ mod tests {
         let r = Reference::new(g.center.clone(), 262144, None);
         let exact = check_orbit(&calculate_orbit(g.center.clone(), 262144).1).unwrap().map_or(0, |n| n.get() as u32);
         let (rx, ry) = ref_px(&r.c, &v.ctx);
-        let gpu = GpuState::new();
+        let gpu = GpuState::new_blocking();
         let offs = [(0.0, 0.0), (1e-3, 0.0)];
         let gr = gpu.prepare_with(&r, log2_dc(&offs, g.upp), g.upp, false);
-        eprintln!("BLA off: {:x?}", gpu.dispatch_offsets(&offs, g.upp, &gr));
+        eprintln!("BLA off: {:x?}", gpu.dispatch_offsets_now(&offs, g.upp, &gr));
         let gr = gpu.prepare(&r, log2_dc(&offs, g.upp), g.upp);
-        let got = gpu.dispatch_offsets(&offs, g.upp, &gr);
+        let got = gpu.dispatch_offsets_now(&offs, g.upp, &gr);
         eprintln!("reference {} at ({rx:.3}, {ry:.3}): exact {exact}, got {:x?}", r.describe(), got);
         assert_eq!(got[0], exact);
     }
@@ -2135,7 +2178,7 @@ mod tests {
         let g0 = &b.geom;
         let n0 = find_nucleus(&g0.center, &g0.radius, g0.upp, iters, g0.prec, &|| false).unwrap().expect("nucleus");
         let far = Reference::new(n0.c.clone(), iters, Some(n0.period));
-        let gpu = GpuState::new();
+        let gpu = GpuState::new_blocking();
         let levels: Vec<f64> = std::env::var("DIAG_LEVELS").ok()
             .map(|s| s.split(',').map(|x| x.parse().unwrap()).collect())
             .unwrap_or(vec![-314.0, -318.0, -322.0, -326.0, -330.0]);
@@ -2143,7 +2186,7 @@ mod tests {
         // backend (a zoom), timing each and scoring the stored pixels.
         let pipe = std::env::var("DIAG_PIPE").is_ok().then(|| {
             let _ = env_logger::builder().is_test(true).try_init();
-            (Gpu(Arc::new(GpuState::new())), crate::tiles::store::TileStore::new(crate::tiles::store::MEMORY_BUDGET_BYTES))
+            (Gpu(Arc::new(GpuState::new_blocking())), crate::tiles::store::TileStore::new(crate::tiles::store::MEMORY_BUDGET_BYTES))
         });
         for l in levels {
             let view = l.exp2();
@@ -2159,7 +2202,7 @@ mod tests {
             if let Some((backend, store)) = &pipe {
                 // DIAG_FRESH: a new backend per level, like pasting the view.
                 let fresh = std::env::var("DIAG_FRESH").is_ok().then(|| {
-                    (Gpu(Arc::new(GpuState::new())), crate::tiles::store::TileStore::new(crate::tiles::store::MEMORY_BUDGET_BYTES))
+                    (Gpu(Arc::new(GpuState::new_blocking())), crate::tiles::store::TileStore::new(crate::tiles::store::MEMORY_BUDGET_BYTES))
                 });
                 let (backend, store) = fresh.as_ref().map_or((backend, store), |(b, s)| (b, s));
                 let t = std::time::Instant::now();
@@ -2179,7 +2222,7 @@ mod tests {
                 let radii = rx.hypot(ry) / (w as f64).hypot(h as f64) * 2.0;
                 let gr = gpu.prepare(r, log2_dc(&offs, g.upp), g.upp);
                 let t = std::time::Instant::now();
-                let got: Vec<u32> = offs.chunks(256).flat_map(|c| gpu.dispatch_offsets(c, g.upp, &gr)).collect();
+                let got: Vec<u32> = offs.chunks(256).flat_map(|c| gpu.dispatch_offsets_now(c, g.upp, &gr)).collect();
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 let (wrong, off50, black) = score(&got, &v.exact);
                 let exact_black = v.exact.iter().filter(|&&x| x == 0).count();
@@ -2206,7 +2249,7 @@ mod tests {
         let clip = format!("{},{}|{view}", cx - w as f64 / 2.0 * view, cy - h as f64 / 2.0 * view);
         let v = sample_view_cached(&format!("disc{k}"), &clip, iters, (w, h), (150, 100));
         let g = &v.geom;
-        let gpu = GpuState::new();
+        let gpu = GpuState::new_blocking();
         let own = find_nucleus(&g.center, &g.radius, g.upp, iters, g.prec, &|| false).unwrap().expect("nucleus");
         let tol2 = FBig::ONE >> (2 * (40 - g.upp)) as isize;
         let far = FBig::try_from(1e-3).unwrap();
@@ -2219,7 +2262,7 @@ mod tests {
             let offs: Vec<(f64, f64)> = v.pix.iter().map(|&(c, rw)| (c as f64 - rx, rw as f64 - ry)).collect();
             let radii = rx.hypot(ry) / (w as f64).hypot(h as f64) * 2.0;
             let gr = gpu.prepare(&r, log2_dc(&offs, g.upp), g.upp);
-            let got = gpu.dispatch_offsets(&offs, g.upp, &gr);
+            let got = gpu.dispatch_offsets_now(&offs, g.upp, &gr);
             let (wrong, off50, black) = score(&got, &v.exact);
             eprintln!("{name} ({}, {radii:.0} radii): wrong {wrong} off>50 {off50} black {black} (exact {exact_black})", r.describe());
             dump_rgb(&format!("disc_{name}"), &got);
