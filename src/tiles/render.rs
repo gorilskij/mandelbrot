@@ -111,7 +111,8 @@ pub async fn run_generation(
     if store.take_reset() {
         store.clear();
         group_cache.lock().clear();
-        info!("reset: dumped all tiles and reference lists");
+        backend.reset();
+        info!("reset: dumped all tiles, reference lists and the GPU's cached reference");
     }
 
     let generation = store.begin_generation();

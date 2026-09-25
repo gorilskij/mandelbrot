@@ -950,6 +950,17 @@ impl Perturbator for Gpu {
     ) -> BatchFuture<'a> {
         Box::pin(self.render_pass(ctx, tiles, pass, int))
     }
+
+    /// Drop the cached reference, the failed-search memory and any running
+    /// search, so the next pass searches for a nucleus afresh (Space: the
+    /// way out of a bad nucleus).
+    fn reset(&self) {
+        let s = &self.0;
+        *s.reference.lock() = None;
+        *s.failed_search.lock() = None;
+        *s.failed_glitch_search.lock() = None;
+        if let Some(job) = s.search.lock().take() { job.cancel.store(true, Ordering::Relaxed); }
+    }
 }
 
 impl Gpu {

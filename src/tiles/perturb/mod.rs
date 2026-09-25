@@ -90,6 +90,9 @@ pub trait Perturbator {
         pass:  u8,
         int:   &'a MultiInterrupter,
     ) -> BatchFuture<'a>;
+
+    /// Forget any state kept across generations (Space).
+    fn reset(&self) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -122,5 +125,10 @@ impl Perturbator for Toggle {
         } else {
             self.cpu.render_pass_batch(ctx, tiles, pass, int)
         }
+    }
+
+    fn reset(&self) {
+        self.cpu.reset();
+        self.gpu.reset();
     }
 }
