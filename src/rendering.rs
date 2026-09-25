@@ -1,5 +1,6 @@
 use crate::support::{Point, Scale};
 use dashu::float::{DBig, FBig};
+#[cfg(test)]
 use hsl::HSL;
 use itertools::Itertools;
 use num::Complex;
@@ -151,19 +152,24 @@ pub fn check_divergence_delta(
     }
 }
 
+#[cfg(test)]
 fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
 /// Phase offsets of the palette's two sine waves, in turns (1 = a whole
 /// period): `hue` for the slow hue wave, `light` for the fast lightness one.
-/// Scrolled with Cmd / Alt; changing them recolours without recomputing.
+/// Scrolled with Cmd / Ctrl; changing them recolours without recomputing.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct PalettePhase {
     pub hue: f64,
     pub light: f64,
 }
 
+/// The palette (0x00RRGGBB), as the reference for the one the compositor
+/// computes on the GPU (`colour` in gpu_compositor_recolour.wgsl, checked
+/// by `recolour_matches_cpu`) and for tests' image dumps. Change both.
+#[cfg(test)]
 pub fn val_to_color(val: Option<NonZeroUsize>, phase: PalettePhase) -> u32 {
     use std::f64::consts::TAU;
     if let Some(val) = val {

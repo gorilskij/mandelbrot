@@ -12,7 +12,14 @@
 // texels it covers (k = the level); the texture is written as sRGB-encoded
 // bytes (storage textures can't be sRGB) and sampled through an sRGB view.
 
-@group(0) @binding(0) var palette: texture_2d<f32>;             // sRGB, entry i at (i % width, i / width)
+struct Palette {
+    hue:   f32,   // phase offsets in turns (`PalettePhase`)
+    light: f32,
+    _pad0: f32,
+    _pad1: f32,
+}
+
+@group(0) @binding(0) var<uniform> pal: Palette;
 @group(0) @binding(1) var<storage, read> jobs: array<u32>;      // layers (dynamic offset per dispatch)
 @group(1) @binding(0) var iters: texture_2d_array<u32>;
 @group(1) @binding(1) var out: texture_storage_2d_array<rgba8unorm, write>;
@@ -23,12 +30,41 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     return select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055, c * 12.92, c <= vec3<f32>(0.0031308));
 }
 
-/// Linear colour of an escape iteration (past the table's end: its last
-/// entry); the texture is sRGB, so loads come back linear.
+const TAU: f32 = 6.283185307179586;
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    return select(pow((c + 0.055) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));
+}
+
+/// The `hsl` crate's hue_to_rgb.
+fn hue_to_rgb(p: f32, q: f32, t0: f32) -> f32 {
+    var t = t0;
+    if (t < 0.0) { t += 1.0; } else if (t > 1.0) { t -= 1.0; }
+    if (t < 1.0 / 6.0) { return p + (q - p) * 6.0 * t; }
+    if (t < 0.5) { return q; }
+    if (t < 2.0 / 3.0) { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+    return p;
+}
+
+/// Linear colour of an escape iteration (0 = in the set: black). This is
+/// `val_to_color` (rendering.rs) with the `hsl` crate's HSL → RGB, rounded
+/// to bytes like it; the two must be kept in sync (`recolour_matches_cpu`).
+/// Computed rather than looked up in a table: the lookup is a gather by the
+/// pixels' iterations, which on noisy tiles was the pass's main cost
+/// (`diag_recolour_speed`, s = 4 screen: 155 ms from a storage buffer,
+/// 214 ms from a texture, 25 ms computed; smooth tiles ~20 ms either way).
+/// f32 argument precision: exact to ~2^-24 relative, so at 10^7 iterations
+/// the lightness wave's phase is off by ~0.002 turns (invisible).
 fn colour(v: u32) -> vec3<f32> {
-    let dims = textureDimensions(palette);
-    let i = min(v, dims.x * dims.y - 1u);
-    return textureLoad(palette, vec2<u32>(i % dims.x, i / dims.x), 0).rgb;
+    if (v == 0u) { return vec3<f32>(0.0); }
+    let n = f32(v);
+    let h = sin(n / 1200.0 + TAU * pal.hue) * 0.5;   // turns: sin·180° / 360°
+    let s = 0.7;
+    let l = sin(n / 40.0 + TAU * pal.light) * 0.3 + 0.4;
+    let q = select(l + s - l * s, l * (1.0 + s), l < 0.5);
+    let p = 2.0 * l - q;
+    let rgb = vec3<f32>(hue_to_rgb(p, q, h + 1.0 / 3.0), hue_to_rgb(p, q, h), hue_to_rgb(p, q, h - 1.0 / 3.0));
+    return srgb_to_linear(round(rgb * 255.0) / 255.0);
 }
 
 /// Add the colour at `p` to `sum` if it is inside the tile and computed.
