@@ -415,6 +415,16 @@ impl ApplicationHandler for App {
         self.drawer = Some(drawer);
 
         self.resize(width, height);
+
+        // On the web, a view in the URL (`#` + a Cmd-C string) opens there.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(hash) = web_sys::window().and_then(|w| w.location().hash().ok()) {
+            let hash = hash.trim_start_matches('#');
+            if !hash.is_empty() {
+                let decoded = js_sys::decode_uri_component(hash).ok().and_then(|s| s.as_string());
+                self.apply_paste(&decoded.unwrap_or_else(|| hash.to_string()));
+            }
+        }
     }
 
     fn window_event(

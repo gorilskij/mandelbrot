@@ -359,7 +359,15 @@ impl GpuCompositor {
                 alpha_mode: caps.alpha_modes[0],
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
-                color_space: wgpu::SurfaceColorSpace::Auto,
+                // Natively `Auto` leaves the Metal layer without a colour
+                // space, so macOS shows the values unconverted: on a P3
+                // display, as P3. A browser canvas is sRGB by default, which
+                // would look duller; Display P3 matches the native look.
+                color_space: if cfg!(target_arch = "wasm32") {
+                    wgpu::SurfaceColorSpace::DisplayP3
+                } else {
+                    wgpu::SurfaceColorSpace::Auto
+                },
             };
             surface.configure(&device, &surface_config);
 
