@@ -1110,11 +1110,7 @@ impl GpuCompositor {
         let held: u32 = chunks.iter().flatten().map(|c| c.capacity).sum();
         let capacity = held.clamp(CHUNK_MIN_LAYERS, CHUNK_MAX_LAYERS);
         let (iters, colour) = chunk_textures(&self.device, shape, capacity);
-        let view = colour.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(TEXTURE_FORMAT),
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
+        let view = draw_view(&colour);
         let draw = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.bgl,
@@ -1221,6 +1217,18 @@ fn chunk_textures(device: &wgpu::Device, shape: Shape, capacity: u32) -> (wgpu::
         view_formats: &[TEXTURE_FORMAT],
     });
     (iters, colour)
+}
+
+/// The view tiles are drawn from: every layer of a chunk's colour array, as
+/// sRGB. Sampling only: the texture also has STORAGE usage (for the
+/// colouring pass), which an sRGB view would otherwise inherit and fail.
+fn draw_view(colour: &wgpu::Texture) -> wgpu::TextureView {
+    colour.create_view(&wgpu::TextureViewDescriptor {
+        format: Some(TEXTURE_FORMAT),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
+        ..Default::default()
+    })
 }
 
 /// The colouring pass (`gpu_compositor_recolour.wgsl`): iteration data →
@@ -1724,6 +1732,7 @@ mod tests {
             let n = 8u32;
             let shape = Shape { tex_size: n, base, levels };
             let (iters, colour) = chunk_textures(&device, shape, LAYER + 1);
+            let _draw = draw_view(&colour); // as the compositor makes it
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo { texture: &iters, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: LAYER }, aspect: wgpu::TextureAspect::All },
                 bytemuck::cast_slice(data),
