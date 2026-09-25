@@ -105,18 +105,10 @@ pub const SAMPLING_MIN:  f64 = 0.5;
 pub const SAMPLING_MAX:  f64 = 4.0;
 
 /// Memory ceiling for the tile cache (all copies, see TILE_TOTAL_BYTES):
-/// half the physical RAM; on wasm 3 GiB (a 4 GiB address space); 8 GiB
-/// where the RAM can't be read.
-pub fn memory_ceiling_bytes() -> usize {
-    #[cfg(unix)]
-    {
-        // SAFETY: sysconf only reads system configuration.
-        let (pages, page) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
-        if pages > 0 && page > 0 {
-            return (pages as usize).saturating_mul(page as usize) / 2;
-        }
-    }
-    if cfg!(target_arch = "wasm32") { 3 << 30 } else { 8 << 30 }
+/// 3 GiB on wasm (a 4 GiB address space). None natively: the user wants
+/// s = 4 at any window size, whatever it takes.
+pub fn memory_ceiling_bytes() -> Option<usize> {
+    cfg!(target_arch = "wasm32").then_some(3 << 30)
 }
 
 /// Worst-case number of tiles covering a `w`×`h` px window at sampling
@@ -404,7 +396,8 @@ pub struct TileStore {
     reset: AtomicBool,
     /// Floor of the tile budget (`MEMORY_BUDGET_BYTES` in tiles).
     min_tiles: usize,
-    /// Ceiling of the tile budget (`memory_ceiling_bytes` in tiles).
+    /// Ceiling of the tile budget (`memory_ceiling_bytes` in tiles;
+    /// usize::MAX: none).
     ceiling_tiles: usize,
     /// Current tile budget: VIEW_BUDGET_FACTOR × view tiles, within
     /// [min_tiles, ceiling_tiles].
@@ -423,6 +416,11 @@ pub struct TileStore {
 
 impl TileStore {
     pub fn new(memory_budget_bytes: usize) -> Self {
+        Self::with_ceiling(memory_budget_bytes, memory_ceiling_bytes())
+    }
+
+    /// A store with the memory ceiling `ceiling_bytes` (None: none).
+    pub fn with_ceiling(memory_budget_bytes: usize, ceiling_bytes: Option<usize>) -> Self {
         Self {
             map: FlurryMap::new(),
             frame: AtomicU64::new(0),
@@ -430,7 +428,7 @@ impl TileStore {
             generation: AtomicU64::new(0),
             reset: AtomicBool::new(false),
             min_tiles: (memory_budget_bytes / TILE_BYTES).max(64),
-            ceiling_tiles: (memory_ceiling_bytes() / TILE_TOTAL_BYTES).max(64),
+            ceiling_tiles: ceiling_bytes.map_or(usize::MAX, |b| (b / TILE_TOTAL_BYTES).max(64)),
             max_tiles: AtomicUsize::new((memory_budget_bytes / TILE_BYTES).max(64)),
             view_tiles: AtomicUsize::new(0),
             requested_ratio: AtomicU32::new(1.0f32.to_bits()),
@@ -723,10 +721,18 @@ mod tests {
         assert_eq!(effective_ratio(1.0, w, h, fits_3), 1.0);
     }
 
-    /// The store applies it on window and s changes, and caps the budget.
+    /// The store applies it on window and s changes, and caps the budget
+    /// (a wasm-like 3 GiB ceiling); natively there is none.
     #[test]
     fn store_clamps_s_to_the_ceiling() {
-        let store = TileStore::new(1 << 20);
+        let native = TileStore::new(1 << 20);
+        native.set_window(100_000, 100_000);
+        native.set_requested_ratio(4.0);
+        assert_eq!(native.min_ratio(), 4.0);
+        native.set_view_tiles(1 << 20);
+        assert_eq!(native.cache_factor(), Some(VIEW_BUDGET_FACTOR as f64));
+
+        let store = TileStore::with_ceiling(1 << 20, Some(3 << 30));
         let ceiling = store.ceiling_tiles;
         // a window so large that s = 4 can't fit (but s = 0.5 can)
         let side = ((ceiling as f64).sqrt() * TILE_SIZE as f64 / 4.0) as usize;

@@ -33,10 +33,6 @@ debug = true
 [profile.dev.package."*"]
 opt-level = 3
 
-[target.'cfg(unix)'.dependencies]
-# physical RAM, for the tile memory ceiling (tiles::store::memory_ceiling_bytes)
-libc = "0.2"
-
 [dev-dependencies]
 hsl = "0.1.1"
 naga = { version = "30.0.1", features = ["wgsl-in"] }

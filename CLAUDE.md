@@ -17,7 +17,7 @@ detection); the CPU one is older (per-group references, no BLA).
   doubles/halves the max iterations (default 2048; tiles are retargeted, not
   recomputed, see below). **←/→** change the requested sampling ratio s by 0.5
   (0.5…4, default 1; see the compositor), lowered if the view would not
-  fit the memory ceiling (see the tile budget; title `s 4 (→3)`). **Cmd-scroll** shifts
+  fit the memory ceiling (wasm only; see the tile budget; title `s 4 (→3)`). **Cmd-scroll** shifts
   the phase of the palette's hue sine (1/128 turn per notch), **Ctrl-scroll**
   the lightness one (1/32; Alt is bound elsewhere on the user's machine)
   (`PalettePhase`; recolours only; both together shift both). **Cmd/Ctrl-C / V** copies/pastes `coords/iterations`
@@ -43,17 +43,18 @@ detection); the CPU one is older (per-group references, no BLA).
   `pixel_to_coord` (exact FBig coordinate of a global pixel).
   - **Tile budget** (LRU eviction at the start of each generation, never the
     current generation's tiles): max(1 GiB, 3× the current view's tiles),
-    capped by the **memory ceiling** (`memory_ceiling_bytes`: half the
-    physical RAM, 3 GiB on wasm; counting each tile's CPU pixels, GPU
-    iterations and colour levels, `TILE_TOTAL_BYTES`). The view's own tiles
+    capped by the **memory ceiling** on wasm only (`memory_ceiling_bytes`:
+    3 GiB, counting each tile's CPU pixels, GPU iterations and colour
+    levels, `TILE_TOTAL_BYTES`). **Natively there is no ceiling** (user:
+    "the full ungodly glory of s = 4"). The view's own tiles
     can't be evicted, so the ceiling also bounds s: ←/→ set the requested
     s, the store uses the largest 0.5 step at or below it whose worst-case
     view fits (`effective_ratio`, on resize and s changes; shrinking the
     window restores it). The 3× cache shrinks first. Never silent (user):
     title `s 4 (→3)`, `cache 1.4×` when cut, a warning in the log. A high
-    s needs many tiles (s = 4: up to ~24k for 3000×2000, ~5 GiB in all
-    copies; on this 16 GiB machine the 8 GiB ceiling holds the view plus a
-    ~1.7× cache, and s is only lowered for much larger windows); with a fixed 1 GiB the
+    s needs many tiles (s = 4: up to ~24k for 3000×2000, ~15 GiB in all
+    copies with the 3× cache, since the GPU keeps each tile's iterations
+    too); with a fixed 1 GiB the
     view alone filled it, evicting parents and recent views (black previews
     while moving, no reuse). Lowering s shrinks it again.
   - **Passes** (`NUM_PASSES=7`): grid passes `GRID_STRIDES=[16,8,4,2]`, then
