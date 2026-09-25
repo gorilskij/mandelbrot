@@ -16,7 +16,9 @@ detection); the CPU one is older (per-group references, no BLA).
   GPU backend's cached reference survives, which is harmless). **↑/↓**
   doubles/halves the max iterations (default 2048; tiles are retargeted, not
   recomputed, see below). **←/→** change the sampling ratio s by 0.5
-  (0.5…4, default 1; see the compositor). **Cmd/Ctrl-C / V** copies/pastes `coords/iterations`
+  (0.5…4, default 1; see the compositor). **Cmd/Ctrl-scroll** shifts
+  the phase of the palette's hue sine, **Alt-scroll** the lightness one
+  (`PalettePhase`, 1/32 turn per notch; recolours only). **Cmd/Ctrl-C / V** copies/pastes `coords/iterations`
   (`x,y|units_per_pixel/iterations`, `x,y` = top-left corner). Letter shortcuts
   match the layout's character (`logical_key`), not the key position (the user
   types Dvorak).
@@ -77,9 +79,14 @@ detection); the CPU one is older (per-group references, no BLA).
 - `src/drawing/renderer/multithreaded.rs` — the compute thread, which calls `run_generation`.
 - `src/gpu_compositor.rs` — draws the tiles to screen (its own wgpu device,
   separate from the compute backend) on the render thread. Colours tiles at
-  upload through a palette table (`color_of`, grown on demand), re-uploads a
-  tile when its `version` changes, reconstructs sub-pass gaps from neighbours
-  (`reconstruct`).
+  upload through a palette table (`Palette`, grown before colouring),
+  re-uploads a tile when its `version` or the palette (`palette_gen`)
+  changes, reconstructs sub-pass gaps from neighbours (`reconstruct`).
+  Colouring runs in parallel (rayon) over the frame's stale tiles
+  (`stale_texture` → `upload_textures`): 23 Mpx (s = 1, 3000×2000) take
+  ~4 ms (30 ms sequential), so a palette scroll is near-instant up to about
+  s = 2; at s = 4 expect ~0.1 s (estimated). If that is too slow: colour on
+  the GPU from uploaded iterations.
   - **Sampling and antialiasing**: tiles are rendered at the depth where a
     screen pixel spans r ∈ [s, 2s) tile pixels per axis (`TileStore::
     min_ratio` / `depth_for_view`; s shared with the compute thread through
@@ -336,8 +343,9 @@ quadtree seeding, iteration retargeting, interior detection, BLA, the floatexp
 underflow, dropped-dispatch and floatexp-orbit fixes, deep nucleus search
 (precision, speed, caching, far reuse), BLA near an escaping reference, the
 momentum progress bar, CPU/GPU overlap, background nucleus search, GPU as
-the default backend, and the sampling ratio s with area-averaging
-antialiasing (incl. a tile budget that follows the view). Decided: render order stays pass-major (each
+the default backend, the sampling ratio s with area-averaging
+antialiasing (incl. a tile budget that follows the view), and palette
+scrolling. Decided: render order stays pass-major (each
 pass completes, rippling out from the cursor, before the next starts); the
 user rejected ring-by-ring refinement. Still open (talk through before
 coding):
@@ -350,21 +358,18 @@ coding):
    axis, but is fully used only just before a depth switch; sizing it to
    the ratio in use would save ~1 ms of GPU bandwidth per frame. It is
    scratch space, so this is no extra computation.
-3. **Palette scrolling**: Cmd-scroll shifts the phase of the hue sine wave,
-   Alt-scroll the lightness one (in `val_to_color`). Cheap: rebuild the
-   compositor's palette table and re-upload, no recompute.
-4. **Mantissa precision**: double-single delta arithmetic, or accept f32
+3. **Mantissa precision**: double-single delta arithmetic, or accept f32
    (much better with BLA). Undecided.
-5. **CPU backend** lacks the GPU's nucleus references, rebasing, BLA and
+4. **CPU backend** lacks the GPU's nucleus references, rebasing, BLA and
    interior detection; the GPU lacks the CPU's black-fill. Not solid
    guessing (fill a cell whose corners match): the user said not yet.
-6. **Compositor draw calls at high s** (user: don't forget): one draw call
+5. **Compositor draw calls at high s** (user: don't forget): one draw call
    and bind group per tile, ~16k per frame at s = 4 (and thousands of
    re-uploads per frame in the early passes). s = 4 is "slow af" mostly from
    the 16–64× work, but this may add to it; measure first (do compute
    chunks still shrink to the minimum at s = 4?). Fix would be a texture
    atlas / array to batch tiles.
-7. **Don't wait for the search at the end of pass 0** (optional, only if the
+6. **Don't wait for the search at the end of pass 0** (optional, only if the
    ~1–2 s wait still bothers the user): move on to later passes while
    deferred pixels are pending. Tricky: a tile finishes a pass only once all
    its pixels are stored, and later passes would defer more pixels too.
