@@ -505,11 +505,15 @@ impl ApplicationHandler for App {
             },
 
             WindowEvent::MouseWheel { delta, .. } => {
-                // In wheel notches (a trackpad's ~10 px each).
-                let notches = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y as f64,
-                    MouseScrollDelta::PixelDelta(pos) => pos.y / 10.0,
+                // In wheel notches (a trackpad's ~10 px each). With Shift
+                // held, macOS turns a mouse wheel's vertical scroll into
+                // horizontal (y = 0): take x then.
+                let (x, y) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64),
+                    MouseScrollDelta::PixelDelta(pos) => (pos.x / 10.0, pos.y / 10.0),
                 };
+                let shift = self.modifiers.shift_key();
+                let notches = if shift && y == 0.0 { x } else { y };
                 let (hue, light) = (self.modifiers.super_key(), self.modifiers.control_key());
                 if hue || light {
                     // Recolour only: shift the palette phases (both with Cmd
@@ -518,7 +522,9 @@ impl ApplicationHandler for App {
                         self.palette.hue = (self.palette.hue + notches * HUE_TURNS_PER_NOTCH).rem_euclid(1.0);
                     }
                     if light {
-                        self.palette.light = (self.palette.light + notches * LIGHT_TURNS_PER_NOTCH).rem_euclid(1.0);
+                        // Shift inverts the lightness direction.
+                        let dir = if shift { -1.0 } else { 1.0 };
+                        self.palette.light = (self.palette.light + dir * notches * LIGHT_TURNS_PER_NOTCH).rem_euclid(1.0);
                     }
                     if let Some(rt) = &self.render_thread {
                         rt.set_palette(self.palette);

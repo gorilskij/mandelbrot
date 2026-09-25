@@ -20,7 +20,8 @@ detection); the CPU one is older (per-group references, no BLA).
   fit the memory ceiling (wasm only; see the tile budget; title `s 4 (→3)`). **Cmd-scroll** shifts
   the phase of the palette's hue sine (1/128 turn per notch), **Ctrl-scroll**
   the lightness one (1/32; Alt is bound elsewhere on the user's machine)
-  (`PalettePhase`; recolours only; both together shift both). **Cmd/Ctrl-C / V** copies/pastes `coords/iterations`
+  (`PalettePhase`; recolours only; both together shift both; Shift inverts
+  the lightness direction). **Cmd/Ctrl-C / V** copies/pastes `coords/iterations`
   (`x,y|units_per_pixel/iterations`, `x,y` = top-left corner). Letter shortcuts
   match the layout's character (`logical_key`), not the key position (the user
   types Dvorak).
