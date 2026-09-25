@@ -14,8 +14,7 @@ detection); the CPU one is older (per-group references, no BLA).
 - The app **starts on the GPU backend**; **Escape** switches CPU/GPU (and
   resets). **Space** resets: drops every tile, the CPU reference lists and the
   GPU backend's cached reference, failed-search memory and running search
-  (`Perturbator::reset`), so it searches for a nucleus afresh: the way out
-  of a bad nucleus (#8 in Open threads). **↑/↓**
+  (`Perturbator::reset`), so it searches for a nucleus afresh. **↑/↓**
   doubles/halves the max iterations (default 2048; tiles are retargeted, not
   recomputed, see below). **←/→** change the requested sampling ratio s by 0.5
   (0.5…4, default 1; see the compositor), lowered if the view would not
@@ -240,6 +239,16 @@ nucleus period p), compare it with the previous window; 2 consecutive windows
 contracting by ≥0.9× per period → in the set. Inside a component the cycle
 multiplier |λ| < 1; just outside |λ| ≥ 1. Short windows (< ~64) produce false
 positives (escaping pixels contracting briefly near 0), so don't shorten them.
+A window also needs z back within 2⁻¹⁰ (relative) of where it was at the
+previous boundary (`INTERIOR_RETURN`): with a nucleus of another period than a
+minibrot in view (e.g. a cached one from further out), windows are out of
+phase with the pixel's cycle, and escaping pixels looked contracting (black
+discs, misshapen minibrots: `view_2026_09_25_black_disc`, 519 black vs 378
+exact, now 359 as without detection; `diag_view_2026_09_25b_references`,
+p=55: 129 falsely in the set, now 8 as without). The check runs at the top of
+the loop at each boundary (z_n = X_m + δ, the same phase after a step or a
+BLA jump). Cost: shallow cardioid work 16.9 → 19.4% of full iterations,
+other `diag_interior_detection` views unchanged, no false positives.
 Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
 
 ## GPU backend (`gpu.rs`)
@@ -464,14 +473,8 @@ coding):
    possible, e.g. zooming during a render. Fix in waker_interrupter: a
    lock-free send (store the message in an atomic slot, wake the receiver
    without blocking) and an atomic-flag interrupter check.
-8. **TODO (user): bugged nucleus, the set takes weird shapes.** With a
-   nucleus whose period differs from a minibrot in view (e.g. a cached one
-   reused from further out, up to `MAX_REF_REUSE_DIST`), interior detection
-   gives false positives: minibrots' black areas take the wrong shape or
-   black discs appear (seen from the web build after zooming in; right when
-   the view is loaded directly). Repros: `diag_view_2026_09_25b_references`
-   (p=55 at 9 radii: 129 px falsely in the set vs 8 without interior
-   detection) and `view_2026_09_25_black_disc`. Proposed fix, not agreed
-   yet: also require z to have returned near its start at each window
-   boundary; maybe also limit reuse of a far nucleus when interior
-   detection is on. Workaround until then: Space, which searches afresh.
+8. **Bugged nucleus, the set takes weird shapes**: fixed on branch
+   `interior-fix` (interior detection's return test, see Perturbation math).
+   Not yet merged. Pixels near a minibrot of another period than the
+   reference now run to the iteration limit instead of being detected
+   (correct, slower); a view's own nucleus avoids that.
