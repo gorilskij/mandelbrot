@@ -569,7 +569,7 @@ impl GpuCompositor {
             });
 
             let recolour = Recolour::new(&device);
-            let palette_gpu = PaletteGpu::new(&device, 256);
+            let palette_gpu = PaletteGpu::new(&device, PALETTE_WIDTH);
             let jobs = jobs_buffer(&device, 64);
 
             GpuCompositor {
@@ -1047,7 +1047,7 @@ impl GpuCompositor {
             self.jobs = jobs_buffer(&self.device, jobs.len().next_power_of_two());
         }
         self.queue.write_buffer(&self.jobs, 0, bytemuck::cast_slice(&lists));
-        let inputs = self.recolour.inputs(&self.device, &self.palette_gpu.buffer, &self.jobs);
+        let inputs = self.recolour.inputs(&self.device, &self.palette_gpu.view, &self.jobs);
 
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
@@ -1150,7 +1150,7 @@ impl GpuCompositor {
     /// Make the GPU palette cover iterations up to `max` (plus one: escapes
     /// are reported up to max + 1) at the current phase.
     fn sync_palette(&mut self, max: usize) {
-        let len = (max + 2).next_power_of_two().max(256);
+        let len = (max + 2).next_multiple_of(PALETTE_WIDTH);
         let grow = len > self.palette_gpu.len;
         if !grow && self.palette_gpu.phase == Some(self.palette_phase) {
             return;
@@ -1164,7 +1164,7 @@ impl GpuCompositor {
         if grow {
             self.palette_gpu = PaletteGpu::new(&self.device, len);
         }
-        self.queue.write_buffer(&self.palette_gpu.buffer, 0, bytemuck::cast_slice(&table));
+        self.palette_gpu.write(&self.queue, &table);
         self.palette_gpu.phase = Some(phase);
     }
 }
@@ -1258,7 +1258,7 @@ impl Recolour {
             label: Some("recolour"),
             source: wgpu::ShaderSource::Wgsl(RECOLOUR_SHADER.into()),
         });
-        let storage = |binding, dynamic| wgpu::BindGroupLayoutEntry {
+        let storage = |binding, dynamic: bool| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
@@ -1270,7 +1270,19 @@ impl Recolour {
         };
         let inputs_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("recolour inputs"),
-            entries: &[storage(0, false), storage(1, true)],
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                storage(1, true),
+            ],
         });
         let tile_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("recolour tiles"),
@@ -1314,12 +1326,12 @@ impl Recolour {
     }
 
     /// Group 0: the palette, and a JOB_SLOT window of `jobs`.
-    fn inputs(&self, device: &wgpu::Device, palette: &wgpu::Buffer, jobs: &wgpu::Buffer) -> wgpu::BindGroup {
+    fn inputs(&self, device: &wgpu::Device, palette: &wgpu::TextureView, jobs: &wgpu::Buffer) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.inputs_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: palette.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(palette) },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -1353,11 +1365,18 @@ impl Recolour {
     }
 }
 
-/// The palette on the GPU: colour (0x00RRGGBB) per escape iteration
-/// (`val_to_color`), read by the colouring pass.
+/// Palette texture width: entry i is texel (i % PALETTE_WIDTH, i / PALETTE_WIDTH).
+const PALETTE_WIDTH: usize = 4096;
+
+/// The palette on the GPU: colour per escape iteration (`val_to_color`),
+/// read by the colouring pass. A texture rather than a buffer: the lookup
+/// is a gather (by the pixels' iterations), which a storage buffer served
+/// ~7x slower (`diag_recolour_speed`); and being sRGB, the hardware decodes
+/// it to linear light.
 struct PaletteGpu {
-    buffer: wgpu::Buffer,
-    /// entries
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// entries (a multiple of PALETTE_WIDTH)
     len: usize,
     /// phase the contents were built with (None: not yet)
     phase: Option<PalettePhase>,
@@ -1365,13 +1384,41 @@ struct PaletteGpu {
 
 impl PaletteGpu {
     fn new(device: &wgpu::Device, len: usize) -> Self {
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let len = len.next_multiple_of(PALETTE_WIDTH);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("palette"),
-            size: (len * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+            size: wgpu::Extent3d {
+                width: PALETTE_WIDTH as u32,
+                height: (len / PALETTE_WIDTH) as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
         });
-        Self { buffer, len, phase: None }
+        let view = texture.create_view(&Default::default());
+        Self { texture, view, len, phase: None }
+    }
+
+    /// Upload `table` (0x00RRGGBB per entry, `len` of them).
+    fn write(&self, queue: &wgpu::Queue, table: &[u32]) {
+        let rgba: Vec<u32> = table.iter().map(|&c| {
+            let (r, g, b) = ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+            r | (g << 8) | (b << 16) | (0xFF << 24)
+        }).collect();
+        queue.write_texture(
+            self.texture.as_image_copy(),
+            bytemuck::cast_slice(&rgba),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(PALETTE_WIDTH as u32 * 4),
+                rows_per_image: None,
+            },
+            self.texture.size(),
+        );
     }
 }
 
@@ -1671,14 +1718,20 @@ mod tests {
         let (device, queue) = test_device();
         let r = Recolour::new(&device);
         let palette = PaletteGpu::new(&device, 4096);
-        let table: Vec<u32> = (0..4096).map(|j| val_to_color(NonZeroUsize::new(j), PalettePhase::default())).collect();
-        queue.write_buffer(&palette.buffer, 0, bytemuck::cast_slice(&table));
+        let table: Vec<u32> = (0..palette.len).map(|j| val_to_color(NonZeroUsize::new(j), PalettePhase::default())).collect();
+        palette.write(&queue, &table);
         let jobs = jobs_buffer(&device, 1);
         queue.write_buffer(&jobs, 0, bytemuck::cast_slice(&(0..CHUNK_MAX_LAYERS).collect::<Vec<u32>>()));
-        let inputs = r.inputs(&device, &palette.buffer, &jobs);
+        let inputs = r.inputs(&device, &palette.view, &jobs);
         let n = TILE_SIZE as u32;
         let shape = Shape { tex_size: n, base, levels: 1 };
-        let data: Vec<u32> = (0..n * n * CHUNK_MAX_LAYERS).map(|i| (i * 7919) % 2000).collect();
+        // DIAG_SMOOTH: iterations varying smoothly across the tile, like a
+        // real image away from the boundary (default: a different value per
+        // texel, the worst case for the palette lookup)
+        let smooth = std::env::var("DIAG_SMOOTH").is_ok();
+        let data: Vec<u32> = (0..n * n * CHUNK_MAX_LAYERS).map(|i| {
+            if smooth { (i % n / 8 + i / n % n / 8 + i / (n * n)) % 2000 } else { (i * 7919) % 2000 }
+        }).collect();
         let chunks: Vec<(Vec<wgpu::BindGroup>, u32)> = (0..n_tiles.div_ceil(CHUNK_MAX_LAYERS)).map(|c| {
             let layers = (n_tiles - c * CHUNK_MAX_LAYERS).min(CHUNK_MAX_LAYERS);
             let (iters, colour) = chunk_textures(&device, shape, CHUNK_MAX_LAYERS);
@@ -1719,13 +1772,13 @@ mod tests {
         let r = Recolour::new(&device);
         // palette: 0 black, 1 white, 2 grey 77
         let palette = PaletteGpu::new(&device, 256);
-        let mut table = vec![0u32; 256];
+        let mut table = vec![0u32; palette.len];
         table[1] = 0xFFFFFF;
         table[2] = 0x4D4D4D;
-        queue.write_buffer(&palette.buffer, 0, bytemuck::cast_slice(&table));
+        palette.write(&queue, &table);
         let jobs = jobs_buffer(&device, 1);
         queue.write_buffer(&jobs, 0, bytemuck::cast_slice(&[2u32]));
-        let inputs = r.inputs(&device, &palette.buffer, &jobs);
+        let inputs = r.inputs(&device, &palette.view, &jobs);
         const LAYER: u32 = 2;
 
         // One 8×8 data tile, drawn at `levels` from `base`: every output byte.

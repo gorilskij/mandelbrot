@@ -12,26 +12,23 @@
 // texels it covers (k = the level); the texture is written as sRGB-encoded
 // bytes (storage textures can't be sRGB) and sampled through an sRGB view.
 
-@group(0) @binding(0) var<storage, read> palette: array<u32>;   // 0x00RRGGBB per iteration
+@group(0) @binding(0) var palette: texture_2d<f32>;             // sRGB, entry i at (i % width, i / width)
 @group(0) @binding(1) var<storage, read> jobs: array<u32>;      // layers (dynamic offset per dispatch)
 @group(1) @binding(0) var iters: texture_2d_array<u32>;
 @group(1) @binding(1) var out: texture_storage_2d_array<rgba8unorm, write>;
 
 const GAP: u32 = 0x80000000u;
 
-fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
-    return select(pow((c + 0.055) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));
-}
-
 fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     return select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055, c * 12.92, c <= vec3<f32>(0.0031308));
 }
 
-/// Linear colour of an escape iteration (past the table's end: its last entry).
+/// Linear colour of an escape iteration (past the table's end: its last
+/// entry); the texture is sRGB, so loads come back linear.
 fn colour(v: u32) -> vec3<f32> {
-    let c = palette[min(v, arrayLength(&palette) - 1u)];
-    let rgb = vec3<f32>(f32((c >> 16u) & 255u), f32((c >> 8u) & 255u), f32(c & 255u)) / 255.0;
-    return srgb_to_linear(rgb);
+    let dims = textureDimensions(palette);
+    let i = min(v, dims.x * dims.y - 1u);
+    return textureLoad(palette, vec2<u32>(i % dims.x, i / dims.x), 0).rgb;
 }
 
 /// Add the colour at `p` to `sum` if it is inside the tile and computed.
