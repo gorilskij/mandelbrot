@@ -91,7 +91,7 @@ struct App {
     // Mandelbrot state.
     coords: CoordinatesBox,
     iterations: usize,
-    /// Palette phases, scrolled with Cmd (hue) / Ctrl (lightness).
+    /// Palette phases, scrolled with Alt (hue) / Ctrl (lightness).
     palette: PalettePhase,
 
     // Input state.
@@ -118,7 +118,7 @@ struct App {
     pasted: std::rc::Rc<std::cell::RefCell<Option<String>>>,
 }
 
-/// Palette phase shift per mouse-wheel notch, in turns: hue (Cmd-scroll)
+/// Palette phase shift per mouse-wheel notch, in turns: hue (Alt-scroll)
 /// and lightness (Ctrl-scroll).
 const HUE_TURNS_PER_NOTCH:   f64 = 1.0 / 128.0;
 const LIGHT_TURNS_PER_NOTCH: f64 = 1.0 / 32.0;
@@ -514,9 +514,12 @@ impl ApplicationHandler for App {
                 };
                 let shift = self.modifiers.shift_key();
                 let notches = if shift && y == 0.0 { x } else { y };
-                let (hue, light) = (self.modifiers.super_key(), self.modifiers.control_key());
+                // Alt (Option) and Ctrl work alike on every platform, natively
+                // and in browsers (Cmd's counterpart on Windows, the Windows
+                // key, opens the Start menu when released).
+                let (hue, light) = (self.modifiers.alt_key(), self.modifiers.control_key());
                 if hue || light {
-                    // Recolour only: shift the palette phases (both with Cmd
+                    // Recolour only: shift the palette phases (both with Alt
                     // and Ctrl held), nothing is recomputed.
                     if hue {
                         self.palette.hue = (self.palette.hue + notches * HUE_TURNS_PER_NOTCH).rem_euclid(1.0);

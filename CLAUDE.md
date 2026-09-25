@@ -17,11 +17,12 @@ detection); the CPU one is older (per-group references, no BLA).
   doubles/halves the max iterations (default 2048; tiles are retargeted, not
   recomputed, see below). **←/→** change the requested sampling ratio s by 0.5
   (0.5…4, default 1; see the compositor), lowered if the view would not
-  fit the memory ceiling (wasm only; see the tile budget; title `s 4 (→3)`). **Cmd-scroll** shifts
+  fit the memory ceiling (wasm only; see the tile budget; title `s 4 (→3)`). **Alt-scroll** shifts
   the phase of the palette's hue sine (1/128 turn per notch), **Ctrl-scroll**
-  the lightness one (1/32; Alt is bound elsewhere on the user's machine)
-  (`PalettePhase`; recolours only; both together shift both; Shift inverts
-  the lightness direction). **Cmd/Ctrl-C / V** copies/pastes `coords/iterations`
+  the lightness one (1/32) (`PalettePhase`; recolours only; both together
+  shift both; Shift inverts the lightness direction). Alt rather than Cmd so
+  it works on every platform (the Windows key opens the Start menu); the
+  user unbound their own Alt binding for it. **Cmd/Ctrl-C / V** copies/pastes `coords/iterations`
   (`x,y|units_per_pixel/iterations`, `x,y` = top-left corner). Letter shortcuts
   match the layout's character (`logical_key`), not the key position (the user
   types Dvorak).

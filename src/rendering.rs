@@ -159,7 +159,7 @@ fn rgb_to_u32(r: u8, g: u8, b: u8) -> u32 {
 
 /// Phase offsets of the palette's two sine waves, in turns (1 = a whole
 /// period): `hue` for the slow hue wave, `light` for the fast lightness one.
-/// Scrolled with Cmd / Ctrl; changing them recolours without recomputing.
+/// Scrolled with Alt / Ctrl; changing them recolours without recomputing.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct PalettePhase {
     pub hue: f64,
