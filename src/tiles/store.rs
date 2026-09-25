@@ -452,32 +452,35 @@ impl TileStore {
     }
 
     pub fn set_requested_ratio(&self, s: f64) {
+        let before = self.requested_ratio();
         self.requested_ratio.store((s as f32).to_bits(), Ordering::Relaxed);
-        self.update_ratio(true);
+        self.update_ratio(Some(before));
     }
 
     /// The window size changed: an s that fitted may no longer (or again).
     pub fn set_window(&self, w: usize, h: usize) {
         self.window.store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
-        self.update_ratio(false);
+        self.update_ratio(None);
     }
 
-    /// Recompute the effective s. Logged when it changes, or (after an s
-    /// change, `requested`) whenever it is clamped: never clamped silently.
-    fn update_ratio(&self, requested: bool) {
+    /// Recompute the effective s. A clamp is logged whenever it changes
+    /// the effective s or follows an s change (the requested s before it
+    /// is `requested_before`), and its end is logged too: never silent.
+    fn update_ratio(&self, requested_before: Option<f64>) {
         let window = self.window.load(Ordering::Relaxed);
         let (w, h) = ((window >> 32) as usize, (window & 0xFFFF_FFFF) as usize);
         let want = self.requested_ratio();
         let s = effective_ratio(want, w, h, self.ceiling_tiles);
         let old = f32::from_bits(self.min_ratio.swap((s as f32).to_bits(), Ordering::Relaxed)) as f64;
-        if s < want && (s != old || requested) {
+        let was_clamped = old < requested_before.unwrap_or(want);
+        if s < want && (s != old || requested_before.is_some()) {
             log::warn!(
                 "sampling: s = {want} needs up to {} tiles for a {w}x{h} window, over the memory \
                  ceiling of {} tiles ({:.1} GiB); using s = {s}",
                 view_tiles_worst(want, w, h), self.ceiling_tiles,
                 (self.ceiling_tiles * TILE_TOTAL_BYTES) as f64 / (1u64 << 30) as f64,
             );
-        } else if s != old {
+        } else if was_clamped {
             log::info!("sampling: s = {s} fits a {w}x{h} window again");
         }
     }

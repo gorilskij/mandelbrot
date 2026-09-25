@@ -8,10 +8,13 @@ use crate::tiles::store::{
 use bytemuck::{Pod, Zeroable};
 use dashu::integer::IBig;
 use itertools::iproduct;
-use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Condvar, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
 use std::thread::{self, JoinHandle};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -319,8 +322,10 @@ pub struct GpuCompositor {
 }
 
 impl GpuCompositor {
-    pub fn new(window: Arc<Window>) -> Self {
-        pollster::block_on(async {
+    /// Async: on the web the adapter and device only arrive from the
+    /// browser's event loop (natively `RenderThread::start` blocks on it).
+    pub async fn new(window: Arc<Window>) -> Self {
+        {
             let instance = wgpu::Instance::default();
             let surface = instance.create_surface(window.clone()).unwrap();
             let adapter = instance
@@ -592,7 +597,7 @@ impl GpuCompositor {
                 pools: HashMap::new(),
                 jobs,
             }
-        })
+        }
     }
 
     /// Force Metal/Vulkan to compile both render pipelines now so the first
@@ -690,7 +695,14 @@ impl GpuCompositor {
                 })],
                 ..Default::default()
             });
+            // WebGPU rejects a draw without its vertex buffer, even of 0 vertices.
+            let dummy = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[BarVertex { pos: [0.0; 2], color: [0.0; 4] }]),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
             pass.set_pipeline(&self.bar_pipeline);
+            pass.set_vertex_buffer(0, dummy.slice(..));
             pass.draw(0..0, 0..1);
         }
         self.queue.submit([enc.finish()]);
@@ -1025,10 +1037,9 @@ impl GpuCompositor {
             return None;
         }
         self.queue.write_buffer(&self.palette_buf, 0, bytemuck::cast_slice(&palette_uniform(self.palette_phase)));
-        let data: Vec<Option<Vec<u32>>> = uploads
-            .par_iter()
-            .map(|u| u.contents.then(|| iteration_texels(&u.tile, u.stride, u.shape.tex_size)))
-            .collect();
+        let data: Vec<Option<Vec<u32>>> = crate::platform::ui_map(&uploads, |u| {
+            u.contents.then(|| iteration_texels(&u.tile, u.stride, u.shape.tex_size))
+        });
         // layers to colour, per chunk
         let mut jobs: HashMap<(Shape, usize), Vec<u32>> = HashMap::new();
         for (u, data) in uploads.into_iter().zip(data) {
@@ -1446,6 +1457,14 @@ fn quad([x0, y0, x1, y1]: [f32; 4], color: [f32; 4]) -> [BarVertex; 6] {
 // our control and independent of platform support.
 // ---------------------------------------------------------------------------
 
+/// The render driver: a thread natively; on the web the browser's main
+/// thread, drawing on requestAnimationFrame (`WebRenderer`).
+#[cfg(not(target_arch = "wasm32"))]
+pub type Renderer = RenderThread;
+#[cfg(target_arch = "wasm32")]
+pub type Renderer = WebRenderer;
+
+#[cfg(not(target_arch = "wasm32"))]
 struct Inner {
     coords: CoordinatesBox,
     width: u32,
@@ -1459,6 +1478,7 @@ struct Inner {
     exit: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Shared {
     inner: Mutex<Inner>,
     cv: Condvar,
@@ -1466,13 +1486,23 @@ struct Shared {
 
 /// Handle to the render thread. The main thread keeps this; the compositor and
 /// the actual draw loop live on the spawned thread.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct RenderThread {
     shared: Arc<Shared>,
     handle: Option<JoinHandle<()>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl RenderThread {
-    pub fn spawn(
+    /// Make the compositor for `window` and start drawing on a new thread.
+    pub fn start(window: Arc<Window>, store: Arc<TileStore>, coords: CoordinatesBox, width: u32, height: u32) -> Self {
+        Self::spawn(pollster::block_on(GpuCompositor::new(window)), store, coords, width, height)
+    }
+
+    /// Nothing to do: the thread draws by itself (see `WebRenderer::redraw`).
+    pub fn redraw(&self) {}
+
+    fn spawn(
         mut compositor: GpuCompositor,
         store: Arc<TileStore>,
         coords: CoordinatesBox,
@@ -1594,6 +1624,96 @@ impl RenderThread {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+}
+
+/// The render driver on the web: the compositor lives on the browser's main
+/// thread (where the canvas is) and draws in `redraw`, on each
+/// requestAnimationFrame, when anything changed. Same interface as
+/// `RenderThread`.
+#[cfg(target_arch = "wasm32")]
+pub struct WebRenderer {
+    state:  std::rc::Rc<std::cell::RefCell<WebState>>,
+    window: Arc<Window>,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct WebState {
+    /// None until the browser has provided the GPU device (async)
+    compositor: Option<GpuCompositor>,
+    store:      Arc<TileStore>,
+    coords:     CoordinatesBox,
+    width:      u32,
+    height:     u32,
+    palette:    PalettePhase,
+    resize:     Option<(u32, u32)>,
+    /// bumped by every view, palette or size change
+    generation: u64,
+    /// (generation, compute progress) last drawn
+    drawn:      Option<(u64, u64)>,
+    /// the progress bar was still moving after the last frame
+    animating:  bool,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WebRenderer {
+    pub fn start(window: Arc<Window>, store: Arc<TileStore>, coords: CoordinatesBox, width: u32, height: u32) -> Self {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(WebState {
+            compositor: None, store, coords, width, height,
+            palette: PalettePhase::default(), resize: None,
+            generation: 0, drawn: None, animating: false,
+        }));
+        let (s, w) = (state.clone(), window.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut compositor = GpuCompositor::new(w.clone()).await;
+            compositor.warmup();
+            s.borrow_mut().compositor = Some(compositor);
+            w.request_redraw();
+        });
+        WebRenderer { state, window }
+    }
+
+    fn changed(&self, f: impl FnOnce(&mut WebState)) {
+        let mut s = self.state.borrow_mut();
+        f(&mut s);
+        s.generation += 1;
+        drop(s);
+        self.window.request_redraw();
+    }
+
+    pub fn set_view(&self, coords: CoordinatesBox, width: u32, height: u32) {
+        self.changed(|s| { s.coords = coords; s.width = width; s.height = height; });
+    }
+
+    pub fn set_palette(&self, phase: PalettePhase) {
+        self.changed(|s| s.palette = phase);
+    }
+
+    pub fn resize(&self, width: u32, height: u32) {
+        if width == 0 || height == 0 { return; }
+        self.changed(|s| { s.width = width; s.height = height; s.resize = Some((width, height)); });
+    }
+
+    pub fn stop(&mut self) {}
+
+    /// On each RedrawRequested: draw if the view, palette, size or compute
+    /// progress changed, or the progress bar is moving; then ask for the
+    /// next animation frame (a check per frame while idle).
+    pub fn redraw(&self) {
+        {
+            let mut guard = self.state.borrow_mut();
+            let s = &mut *guard;
+            if let Some(c) = s.compositor.as_mut() {
+                let progress = s.store.progress();
+                if s.animating || s.drawn != Some((s.generation, progress)) {
+                    if let Some((w, h)) = s.resize.take() { c.resize(w, h); }
+                    c.set_palette(s.palette);
+                    s.animating = c.render(&s.store, &s.coords, s.width, s.height);
+                    s.drawn = Some((s.generation, progress));
+                }
+            }
+        }
+        self.window.request_redraw();
     }
 }
 

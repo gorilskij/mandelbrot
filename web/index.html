@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mandelbrot</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  /* winit sizes the drawing surface from the canvas's CSS size */
+  canvas { display: block; width: 100vw; height: 100vh; outline: none; touch-action: none; }
+  /* DIAG: the debug line (the native window title) */
+  #debug {
+    position: fixed; top: 0; left: 0; right: 0; padding: 2px 6px;
+    font: 12px ui-monospace, Menlo, monospace; color: #fff; background: rgba(0, 0, 0, 0.55);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="0"></canvas>
+<div id="debug">loading…</div>
+<script type="module">
+  import init from "./mandelbrot.js";
+  const debug = document.getElementById("debug");
+  const canvas = document.getElementById("canvas");
+  if (!self.crossOriginIsolated) {
+    debug.textContent = "Not cross-origin isolated: the server must send COOP/COEP headers (see web/README.md)";
+  } else if (!navigator.gpu) {
+    debug.textContent = "WebGPU is not available in this browser";
+  } else {
+    await init();
+    canvas.focus();
+    canvas.addEventListener("pointerdown", () => canvas.focus());
+  }
+</script>
+</body>
+</html>

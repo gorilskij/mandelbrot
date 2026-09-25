@@ -1,0 +1,5 @@
+# Cloudflare Pages: cross-origin isolation, needed for SharedArrayBuffer
+# (the wasm memory shared between the page and its Web Workers).
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp

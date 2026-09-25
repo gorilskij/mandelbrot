@@ -1,0 +1,18 @@
+# The web build (web/build.sh): Web Workers sharing one wasm memory need
+# atomics and bulk memory, and std rebuilt with them (-Z build-std, passed by
+# the script: set here it would apply to native builds too). Memory may grow
+# to the full 4 GiB of wasm32 (the tile store's ceiling is 3 GiB).
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+    "-C", "link-arg=--max-memory=4294967296",
+    # shared, imported memory and the TLS exports wasm-bindgen's thread
+    # support needs (current nightlies no longer add them for +atomics)
+    "-C", "link-arg=--shared-memory",
+    "-C", "link-arg=--import-memory",
+    "-C", "link-arg=--export=__wasm_init_tls",
+    "-C", "link-arg=--export=__tls_size",
+    "-C", "link-arg=--export=__tls_align",
+    "-C", "link-arg=--export=__tls_base",
+    "--cfg", 'getrandom_backend="wasm_js"',
+]

@@ -16,18 +16,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use web_time::Instant;
 
-use arboard::Clipboard;
 use dashu::float::FBig;
 use log::{info, trace, warn};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize};
+#[cfg(not(target_arch = "wasm32"))]
+use winit::dpi::LogicalSize;
+use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::drawing::Drawer;
-use crate::gpu_compositor::{GpuCompositor, RenderThread};
+use crate::gpu_compositor::Renderer;
 use crate::rendering::*;
 use crate::support::{Length, Point};
 
@@ -78,7 +79,7 @@ enum UpdateKind {
 
 struct App {
     window: Option<Arc<Window>>,
-    render_thread: Option<RenderThread>,
+    render_thread: Option<Renderer>,
     drawer: Option<Drawer>,
     /// which backend the compute thread uses (Escape toggles it)
     use_gpu: Arc<std::sync::atomic::AtomicBool>,
@@ -111,6 +112,10 @@ struct App {
     // (left, top, right, bottom) in Mandelbrot units — the initial view rectangle.
     // Nothing outside this rect is ever allowed to be visible.
     bounds: Option<(f64, f64, f64, f64)>,
+
+    /// Clipboard text from Cmd/Ctrl-V, applied in `about_to_wait` (on the
+    /// web it arrives asynchronously).
+    pasted: std::rc::Rc<std::cell::RefCell<Option<String>>>,
 }
 
 /// Palette phase shift per mouse-wheel notch, in turns: hue (Cmd-scroll)
@@ -146,6 +151,21 @@ impl App {
             pending_update: UpdateKind::No,
             key_debug: String::new(),
             bounds: None,
+            pasted: Default::default(),
+        }
+    }
+
+    /// Go to the view in a Cmd-C string (`coords/iterations`).
+    fn apply_paste(&mut self, contents: &str) {
+        if let Ok(new_data) = contents.parse::<ClipBoardData>() {
+            self.coords = new_data.coords.into_owned();
+            self.iterations = new_data.iterations;
+            info!("PASTED: {}", contents.trim());
+            self.pending_update = self.pending_update.max(UpdateKind::AroundCenter);
+            self.note_action("pasted");
+        } else {
+            warn!("PASTE FAILED: invalid clipboard contents: {contents:?}");
+            self.note_action("paste FAILED (not coordinates)");
         }
     }
 
@@ -284,7 +304,7 @@ impl App {
             else if upp < crate::tiles::perturb::gpu::FE_THRESHOLD { "fe" }
             else { "f32" };
         let (cx, cy) = self.center_coord_f64();
-        window.set_title(&format!(
+        platform::show_debug(window, &format!(
             "Mandelbrot | {} | view {:.4e} (2^{:.2}) | depth {} upp 2^{} | s {} | iters {} \
              | palette hue {:.3} light {:.3} | centre {:.17}, {:.17} | mods [{}] | key {}",
             pipe, view, view.log2(), depth, upp, ratio, self.iterations,
@@ -339,18 +359,24 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window = Arc::new(
-            event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("Mandelbrot")
-                        .with_inner_size(LogicalSize::new(1500u32, 1000u32))
-                        .with_resizable(true),
-                )
-                .unwrap(),
-        );
+        let attributes = Window::default_attributes().with_title("Mandelbrot");
+        #[cfg(not(target_arch = "wasm32"))]
+        let attributes = attributes.with_inner_size(LogicalSize::new(1500u32, 1000u32)).with_resizable(true);
+        // On the web: the page's canvas, sized by its CSS (web/index.html).
+        #[cfg(target_arch = "wasm32")]
+        let attributes = {
+            use wasm_bindgen::JsCast;
+            use winit::platform::web::WindowAttributesExtWebSys;
+            let canvas = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.get_element_by_id("canvas"))
+                .and_then(|c| c.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+                .expect("a <canvas id=\"canvas\"> on the page");
+            attributes.with_canvas(Some(canvas))
+        };
+        let window = Arc::new(event_loop.create_window(attributes).unwrap());
 
-        let PhysicalSize { width, height } = window.inner_size();
+        let PhysicalSize { width, height } = initial_size(&window);
 
         // Center the view on (-0.5, 0) using the actual physical size.
         let view = self.coords.view.inner;
@@ -366,7 +392,6 @@ impl ApplicationHandler for App {
         let oy = self.coords.origin.y.to_f64().value();
         self.bounds = Some((ox, oy, ox + width as f64 * view, oy + height as f64 * view));
 
-        let compositor = GpuCompositor::new(window.clone());
         let drawer = Drawer::new(
             width as usize,
             height as usize,
@@ -375,10 +400,10 @@ impl ApplicationHandler for App {
             self.use_gpu.clone(),
         );
 
-        // Hand the compositor and a store handle to the render thread; it owns
+        // The compositor and a store handle go to the render driver; it owns
         // the surface and draws independently of the main event loop from here.
-        let render_thread = RenderThread::spawn(
-            compositor,
+        let render_thread = Renderer::start(
+            window.clone(),
             drawer.store().clone(),
             self.coords.clone(),
             width,
@@ -420,8 +445,13 @@ impl ApplicationHandler for App {
                 self.publish_view();
             }
 
-            // Rendering is driven by the render thread, not RedrawRequested.
-            WindowEvent::RedrawRequested => {}
+            // Natively the render thread draws by itself; on the web the
+            // compositor draws here, on each animation frame.
+            WindowEvent::RedrawRequested => {
+                if let Some(rt) = &self.render_thread {
+                    rt.redraw();
+                }
+            }
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = Some((position.x, position.y));
@@ -573,7 +603,7 @@ impl ApplicationHandler for App {
                         };
                         let s = data.to_string();
                         info!("COPIED: {s}");
-                        match Clipboard::new().and_then(|mut cb| cb.set_text(s)) {
+                        match platform::copy_text(s) {
                             Ok(()) => self.note_action("copied"),
                             Err(e) => {
                                 warn!("clipboard copy failed: {e}");
@@ -582,22 +612,10 @@ impl ApplicationHandler for App {
                         }
                     }
                     _ if ctrl && letter == "v" => {
-                        let contents = Clipboard::new()
-                            .and_then(|mut cb| cb.get_text())
-                            .unwrap_or_default();
-                        if let Ok(new_data) = contents.parse::<ClipBoardData>() {
-                            self.coords = new_data.coords.into_owned();
-                            self.iterations = new_data.iterations;
-                            info!("PASTED: {}", contents.trim());
-                            self.pending_update =
-                                self.pending_update.max(UpdateKind::AroundCenter);
-                            self.note_action("pasted");
-                        } else {
-                            warn!(
-                                "PASTE FAILED: invalid clipboard contents: {contents:?}"
-                            );
-                            self.note_action("paste FAILED (not coordinates)");
-                        }
+                        // Applied in `about_to_wait` (on the web the text
+                        // arrives asynchronously).
+                        let pasted = self.pasted.clone();
+                        platform::paste_text(move |text| *pasted.borrow_mut() = Some(text));
                     }
                     _ => self.note_action("no action"),
                 }
@@ -608,6 +626,11 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let pasted = self.pasted.borrow_mut().take();
+        if let Some(contents) = pasted {
+            self.apply_paste(&contents);
+        }
+
         // Detect scroll-end: got_scroll is set by each MouseWheel event.
         // When it's false for a whole about_to_wait cycle, the gesture ended.
         if std::mem::take(&mut self.got_scroll) {
@@ -663,30 +686,33 @@ impl ApplicationHandler for App {
     }
 }
 
-/// DIAG: writes every log line to both stderr and `gpu.log` (flushed per
-/// line, so the file is complete even if the app hangs and gets killed).
-struct Tee(std::fs::File);
-
-impl std::io::Write for Tee {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let _ = std::io::stderr().write_all(buf);
-        self.0.write_all(buf)?;
-        self.0.flush()?;
-        Ok(buf.len())
+/// The window's size in physical pixels. On the web, winit only learns the
+/// canvas's size from a resize observer after startup, so until then it is
+/// read from the canvas's layout (CSS size × device pixel ratio).
+fn initial_size(window: &Window) -> PhysicalSize<u32> {
+    let size = window.inner_size();
+    #[cfg(target_arch = "wasm32")]
+    if size.width == 0 || size.height == 0 {
+        use winit::platform::web::WindowExtWebSys;
+        if let (Some(canvas), Some(w)) = (window.canvas(), web_sys::window()) {
+            let dpr = w.device_pixel_ratio();
+            return PhysicalSize::new(
+                (canvas.client_width() as f64 * dpr).round() as u32,
+                (canvas.client_height() as f64 * dpr).round() as u32,
+            );
+        }
     }
-    fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+    size
 }
 
 fn main() {
-    // DIAG: default to `info` (RUST_LOG still overrides) and tee into gpu.log.
-    let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
-    match std::fs::File::create("gpu.log") {
-        Ok(file) => { logger.target(env_logger::Target::Pipe(Box::new(Tee(file)))); }
-        Err(e)   => eprintln!("could not create gpu.log: {e}"),
-    }
-    logger.init();
-    info!("logging to {}", std::env::current_dir().map(|d| d.join("gpu.log").display().to_string()).unwrap_or_default());
+    platform::init_logging();
     let event_loop = EventLoop::new().unwrap();
-    let mut app = App::new();
-    event_loop.run_app(&mut app).unwrap();
+    #[cfg(not(target_arch = "wasm32"))]
+    event_loop.run_app(&mut App::new()).unwrap();
+    #[cfg(target_arch = "wasm32")]
+    {
+        use winit::platform::web::EventLoopExtWebSys;
+        event_loop.spawn_app(App::new());
+    }
 }

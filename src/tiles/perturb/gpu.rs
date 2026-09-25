@@ -501,7 +501,7 @@ impl GpuState {
         let result = Arc::new(Mutex::new(None));
         let (center, radius, upp, prec) = (g.center.clone(), g.radius.clone(), g.upp, g.prec);
         let (c2, r2) = (cancel.clone(), result.clone());
-        std::thread::spawn(move || {
+        crate::platform::spawn("nucleus search", move || {
             let t = web_time::Instant::now(); // DIAG
             let cancelled = || c2.load(Ordering::Relaxed);
             let found = match find_nucleus(&center, &radius, upp, iters, prec, &cancelled) {

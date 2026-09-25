@@ -4,10 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-arboard = { version = "3.6.1", default-features = false }
 bytemuck = { version = "1.25.2", features = ["derive"] }
 dashu = { version = "0.6.0", features = ["num-traits"] }
-env_logger = "0.11.11"
 flurry = "0.5.2"
 itertools = "0.15.0"
 log = "0.4.34"
@@ -15,7 +13,6 @@ num = "0.4.3"
 num-traits = "0.2.19"
 ordered-float = "5.5.0"
 parking_lot = "0.12.5"
-pollster = "1.0.1"
 rand = "0.10.3"
 rayon = "1.12.0"
 #waker_interrupter = { git = "https://github.com/gorilskij/waker_interrupter" }
@@ -23,6 +20,26 @@ waker_interrupter = { path = "../waker_interrupter" }
 web-time = "1"
 wgpu = "30.0.1"
 winit = "0.30"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+arboard = { version = "3.6.1", default-features = false }
+env_logger = "0.11.11"
+pollster = "1.0.1"
+
+# The web build (see web/README.md): threads are Web Workers sharing the
+# wasm memory (wasm_thread), the GPU is WebGPU.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1.7"
+# its wasm thread parker (atomics) is behind "nightly"; without it, parking panics
+parking_lot = { version = "0.12.5", features = ["nightly"] }
+console_log = "1.1.0"
+getrandom = { version = "0.4", features = ["wasm_js"] }
+gloo-timers = { version = "0.4", features = ["futures"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4"
+wasm_thread = "0.3.3"
+web-sys = { version = "0.3", features = ["Blob", "BlobPropertyBag", "Clipboard", "Document", "Element", "HtmlCanvasElement", "HtmlElement", "Navigator", "Url", "Window"] }
 
 [profile.release]
 debug = true

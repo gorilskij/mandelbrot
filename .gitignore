@@ -6,3 +6,5 @@ flamegraph.svg
 *.png
 .DS_Store
 gpu.log
+/web/.tools
+/web/dist
