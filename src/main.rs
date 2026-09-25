@@ -465,15 +465,16 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(pos) => pos.y / 10.0,
                 };
-                let hue = self.modifiers.super_key();
-                if hue || self.modifiers.control_key() {
-                    // Recolour only: shift a palette phase, nothing is recomputed.
-                    let (phase, step) = if hue {
-                        (&mut self.palette.hue, HUE_TURNS_PER_NOTCH)
-                    } else {
-                        (&mut self.palette.light, LIGHT_TURNS_PER_NOTCH)
-                    };
-                    *phase = (*phase + notches * step).rem_euclid(1.0);
+                let (hue, light) = (self.modifiers.super_key(), self.modifiers.control_key());
+                if hue || light {
+                    // Recolour only: shift the palette phases (both with Cmd
+                    // and Ctrl held), nothing is recomputed.
+                    if hue {
+                        self.palette.hue = (self.palette.hue + notches * HUE_TURNS_PER_NOTCH).rem_euclid(1.0);
+                    }
+                    if light {
+                        self.palette.light = (self.palette.light + notches * LIGHT_TURNS_PER_NOTCH).rem_euclid(1.0);
+                    }
                     if let Some(rt) = &self.render_thread {
                         rt.set_palette(self.palette);
                     }
