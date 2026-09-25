@@ -438,3 +438,13 @@ coding):
    ~1–2 s wait still bothers the user): move on to later passes while
    deferred pixels are pending. Tricky: a tile finishes a pass only once all
    its pixels are stored, and later passes would defer more pixels too.
+7. **TODO (user): main-thread lock in the view channel (web).**
+   `waker_interrupter::Sender::send` (called on the browser's main thread on
+   every view change) takes the channel's parking_lot mutex, which the
+   compute worker also holds briefly (every `interrupted()` check between
+   chunks, and while waiting in `recv_multithreaded`). If contended, parking
+   calls `Atomics.wait`, which throws on the main thread; `notify_one` can
+   too (parking_lot's internal bucket lock). Rare (ns-long holds) but
+   possible, e.g. zooming during a render. Fix in waker_interrupter: a
+   lock-free send (store the message in an atomic slot, wake the receiver
+   without blocking) and an atomic-flag interrupter check.
