@@ -2189,4 +2189,40 @@ mod tests {
             }
         }
     }
+
+    /// View reported on 2026-09-25 (2^-32, 2048 iterations): a black disc
+    /// over a p=190 minibrot, gone after Space. Reached by zooming with a
+    /// cached p=80 nucleus. Runs the real shader with the view's own nucleus
+    /// and with a nearby p=80 one (with and without interior detection).
+    #[test]
+    #[ignore]
+    fn view_2026_09_25_black_disc() {
+        let iters = 2048;
+        // DIAG_ZOOM_OUT=k: the same centre, k times wider, on a 150x100 window
+        // sampled 1:1 (the minibrot is then only a few pixels across).
+        let k: f64 = std::env::var("DIAG_ZOOM_OUT").ok().map_or(1.0, |k| k.parse().unwrap());
+        let (w, h) = if k == 1.0 { (3000usize, 2000usize) } else { (150, 100) };
+        let (cx, cy, view) = (0.41552841904539495f64, -0.34225879141255033f64, 1.9331e-10 * k);
+        let clip = format!("{},{}|{view}", cx - w as f64 / 2.0 * view, cy - h as f64 / 2.0 * view);
+        let v = sample_view_cached(&format!("disc{k}"), &clip, iters, (w, h), (150, 100));
+        let g = &v.geom;
+        let gpu = GpuState::new();
+        let own = find_nucleus(&g.center, &g.radius, g.upp, iters, g.prec, &|| false).unwrap().expect("nucleus");
+        let tol2 = FBig::ONE >> (2 * (40 - g.upp)) as isize;
+        let far = FBig::try_from(1e-3).unwrap();
+        let p80 = newton_nucleus(&g.center, 80, g.prec, &tol2, &(&far * &far), &|| false).unwrap().expect("p=80 nucleus");
+        let exact_black = v.exact.iter().filter(|&&x| x == 0).count();
+        dump_rgb("disc_exact", &v.exact);
+        for (name, c, period) in [("own", own.c.clone(), Some(own.period)), ("p80", p80.clone(), Some(80)), ("p80-nointerior", p80, None)] {
+            let r = Reference::new(c, iters, period);
+            let (rx, ry) = ref_px(&r.c, &v.ctx);
+            let offs: Vec<(f64, f64)> = v.pix.iter().map(|&(c, rw)| (c as f64 - rx, rw as f64 - ry)).collect();
+            let radii = rx.hypot(ry) / (w as f64).hypot(h as f64) * 2.0;
+            let gr = gpu.prepare(&r, log2_dc(&offs, g.upp), g.upp);
+            let got = gpu.dispatch_offsets(&offs, g.upp, &gr);
+            let (wrong, off50, black) = score(&got, &v.exact);
+            eprintln!("{name} ({}, {radii:.0} radii): wrong {wrong} off>50 {off50} black {black} (exact {exact_black})", r.describe());
+            dump_rgb(&format!("disc_{name}"), &got);
+        }
+    }
 }
