@@ -18,25 +18,28 @@ use std::time::Duration;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-/// Draws tiles 1:1 into the offscreen image, from the mip level `level`.
+/// Draws tiles 1:1 into the offscreen image, from the mip level `level` of
+/// their layer of a chunk (see `Chunk`).
 const SHADER: &str = r#"
 struct VOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) level: f32,
+    @location(2) @interpolate(flat) layer: u32,
 }
 
 @vertex
-fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>, @location(2) level: f32) -> VOut {
-    return VOut(vec4<f32>(pos, 0.0, 1.0), uv, level);
+fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>, @location(2) level: f32,
+      @location(3) layer: u32) -> VOut {
+    return VOut(vec4<f32>(pos, 0.0, 1.0), uv, level, layer);
 }
 
-@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(0) var t: texture_2d_array<f32>;
 @group(0) @binding(1) var s: sampler;
 
 @fragment
 fn fs(v: VOut) -> @location(0) vec4<f32> {
-    return textureSampleLevel(t, s, v.uv, v.level);
+    return textureSampleLevel(t, s, v.uv, v.layer, v.level);
 }
 "#;
 
@@ -207,6 +210,8 @@ struct Vertex {
     uv: [f32; 2],
     /// mip level to sample
     level: f32,
+    /// the tile's layer in its chunk
+    layer: u32,
 }
 
 #[repr(C)]
@@ -216,19 +221,27 @@ struct BarVertex {
     color: [f32; 4],
 }
 
-struct TileEntry {
-    /// the tile's data texels (see `iteration_texels`)
-    iters: wgpu::Texture,
-    /// draws the colour texture (sampled as sRGB)
-    bind_group: wgpu::BindGroup,
-    /// colouring pass, per mip level held
-    recolour: Vec<wgpu::BindGroup>,
+/// A tile texture's shape: `tex_size`² data texels (the pass-stride grid,
+/// or the whole tile), of which the colour mip levels `base..base + levels`
+/// are held; finer levels are never drawn at the current s.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct Shape {
     tex_size: u32,
-    /// Mip levels of the tile's data held by the texture: `base` (the
-    /// texture's level 0) and up to one coarser one; finer levels are never
-    /// drawn at the current s and are not uploaded.
     base: u32,
     levels: u32,
+}
+
+/// Where a tile's textures live: layer `layer` of chunk `chunk` of the
+/// pool for its shape.
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    shape: Shape,
+    chunk: usize,
+    layer: u32,
+}
+
+struct TileEntry {
+    slot: Slot,
     /// `Tile::version` this texture was built from
     version: u32,
     /// `GpuCompositor::palette_gen` it was coloured with
@@ -240,14 +253,34 @@ struct Upload {
     key: TileKey,
     tile: Arc<Tile>,
     stride: usize,
-    tex_size: u32,
-    base: u32,
-    levels: u32,
+    shape: Shape,
     version: u32,
-    /// keep the existing textures
+    /// keep the existing slot
     same_shape: bool,
     /// upload the iteration data (else only recolour)
     contents: bool,
+}
+
+/// Layers per chunk: the first chunk of a shape is small (most shapes only
+/// hold a few tiles for a while), each next one twice the last, up to
+/// wgpu's default `max_texture_array_layers`.
+const CHUNK_MIN_LAYERS: u32 = 16;
+const CHUNK_MAX_LAYERS: u32 = 256;
+
+/// Tiles of one shape, one per layer of 2D array textures: the colouring
+/// pass and drawing then take one dispatch / draw call per chunk rather
+/// than per tile (Metal serialises dispatches, ~10-15 µs each: a
+/// recolour of 24000 tiles took 365 ms as one dispatch per tile, 13-28 ms
+/// as one; `diag_recolour_speed`).
+struct Chunk {
+    /// iteration data (see `iteration_texels`)
+    iters: wgpu::Texture,
+    /// draws the colour array (sampled as sRGB)
+    draw: wgpu::BindGroup,
+    /// colouring pass, per colour mip level
+    recolour: Vec<wgpu::BindGroup>,
+    free: Vec<u32>,
+    capacity: u32,
 }
 
 /// The image the tiles are drawn into, 1:1 in texels of the mip level in use,
@@ -274,6 +307,10 @@ pub struct GpuCompositor {
     sampler: wgpu::Sampler,
     bgl: wgpu::BindGroupLayout,
     tiles: HashMap<TileKey, TileEntry>,
+    /// chunks per shape (None: dropped once empty)
+    pools: HashMap<Shape, Vec<Option<Chunk>>>,
+    /// the colouring pass's job lists (layers), `JOB_SLOT` bytes per dispatch
+    jobs: wgpu::Buffer,
     bar: BarAnim,
     recolour: Recolour,
     palette_phase: PalettePhase,
@@ -335,7 +372,7 @@ impl GpuCompositor {
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
+                            view_dimension: wgpu::TextureViewDimension::D2Array,
                             multisampled: false,
                         },
                         count: None,
@@ -380,6 +417,11 @@ impl GpuCompositor {
                                 format: wgpu::VertexFormat::Float32,
                                 offset: 16,
                                 shader_location: 2,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Uint32,
+                                offset: 20,
+                                shader_location: 3,
                             },
                         ],
                     })],
@@ -527,7 +569,8 @@ impl GpuCompositor {
             });
 
             let recolour = Recolour::new(&device);
-            let palette_gpu = PaletteGpu::new(&device, &recolour.palette_bgl, 256);
+            let palette_gpu = PaletteGpu::new(&device, 256);
+            let jobs = jobs_buffer(&device, 64);
 
             GpuCompositor {
                 device,
@@ -547,6 +590,8 @@ impl GpuCompositor {
                 sampler,
                 bgl,
                 tiles: HashMap::new(),
+                pools: HashMap::new(),
+                jobs,
             }
         })
     }
@@ -571,7 +616,10 @@ impl GpuCompositor {
             let scratch = tex(self.surface_config.format, wgpu::TextureUsages::RENDER_ATTACHMENT);
             let scratch_view = scratch.create_view(&Default::default());
             let dummy_tile = tex(TEXTURE_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING);
-            let dummy_tile_view = dummy_tile.create_view(&Default::default());
+            let dummy_tile_view = dummy_tile.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
             let tile_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &self.bgl,
@@ -596,7 +644,7 @@ impl GpuCompositor {
             });
             let dummy_verts = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
-                contents: bytemuck::cast_slice(&[Vertex { pos: [0.0; 2], uv: [0.0; 2], level: 0.0 }]),
+                contents: bytemuck::cast_slice(&[Vertex { pos: [0.0; 2], uv: [0.0; 2], level: 0.0, layer: 0 }]),
                 usage: wgpu::BufferUsages::VERTEX,
             });
             let mut enc = self.device.create_command_encoder(&Default::default());
@@ -775,30 +823,38 @@ impl GpuCompositor {
             [px / ow * 2.0 - 1.0, 1.0 - py / oh * 2.0]
         };
 
-        let mut verts: Vec<Vertex> = Vec::with_capacity(pending.len() * 6);
-        let mut draw_keys: Vec<(&TileKey, u32)> = Vec::with_capacity(pending.len());
-
+        // Quads grouped by chunk: one draw call per chunk.
+        let mut quads: Vec<((Shape, usize), [Vertex; 6])> = Vec::with_capacity(pending.len());
         for p in &pending {
             let Some(entry) = self.tiles.get(&p.src) else { continue };
+            let Slot { shape, chunk, layer } = entry.slot;
             // Source texel size in target-depth pixels: the pass stride, times
             // 2 per ancestor level; the level whose texels are 2^k of those
             // is drawn 1:1 (coarser data is magnified from level 0).
-            let stride_log2 = (TILE_SIZE / entry.tex_size as usize).trailing_zeros() as i32;
-            let level = (k as i32 - stride_log2 - p.climb as i32 - entry.base as i32)
-                .clamp(0, entry.levels as i32 - 1) as f32;
-            let base = verts.len() as u32;
+            let stride_log2 = (TILE_SIZE / shape.tex_size as usize).trailing_zeros() as i32;
+            let level = (k as i32 - stride_log2 - p.climb as i32 - shape.base as i32)
+                .clamp(0, shape.levels as i32 - 1) as f32;
             let [x0, y0] = to_clip(p.px0, p.py0);
             let [x1, y1] = to_clip(p.px1, p.py1);
             let (u0, v0, u1, v1) = (p.u0, p.v0, p.u1, p.v1);
-            verts.extend_from_slice(&[
-                Vertex { pos: [x0, y0], uv: [u0, v0], level },
-                Vertex { pos: [x1, y0], uv: [u1, v0], level },
-                Vertex { pos: [x0, y1], uv: [u0, v1], level },
-                Vertex { pos: [x1, y0], uv: [u1, v0], level },
-                Vertex { pos: [x1, y1], uv: [u1, v1], level },
-                Vertex { pos: [x0, y1], uv: [u0, v1], level },
-            ]);
-            draw_keys.push((&p.src, base));
+            quads.push(((shape, chunk), [
+                Vertex { pos: [x0, y0], uv: [u0, v0], level, layer },
+                Vertex { pos: [x1, y0], uv: [u1, v0], level, layer },
+                Vertex { pos: [x0, y1], uv: [u0, v1], level, layer },
+                Vertex { pos: [x1, y0], uv: [u1, v0], level, layer },
+                Vertex { pos: [x1, y1], uv: [u1, v1], level, layer },
+                Vertex { pos: [x0, y1], uv: [u0, v1], level, layer },
+            ]));
+        }
+        quads.sort_by_key(|(chunk, _)| *chunk);
+        let verts: Vec<Vertex> = quads.iter().flat_map(|(_, q)| *q).collect();
+        // (chunk, first vertex, vertex count)
+        let mut draws: Vec<((Shape, usize), u32, u32)> = Vec::new();
+        for (i, (chunk, _)) in quads.iter().enumerate() {
+            match draws.last_mut() {
+                Some((c, _, n)) if c == chunk => *n += 6,
+                _ => draws.push((*chunk, i as u32 * 6, 6)),
+            }
         }
 
         // Progress bar: advance the animation and build its geometry.
@@ -838,11 +894,10 @@ impl GpuCompositor {
                 });
                 pass.set_pipeline(&self.pipeline);
                 pass.set_vertex_buffer(0, vbuf.slice(..));
-                for (key, base) in &draw_keys {
-                    if let Some(entry) = self.tiles.get(*key) {
-                        pass.set_bind_group(0, &entry.bind_group, &[]);
-                        pass.draw(*base..*base + 6, 0..1);
-                    }
+                for ((shape, chunk), first, n) in &draws {
+                    let chunk = self.pools[shape][*chunk].as_ref().expect("chunk in use");
+                    pass.set_bind_group(0, &chunk.draw, &[]);
+                    pass.draw(*first..*first + *n, 0..1);
                 }
             }
         }
@@ -890,8 +945,12 @@ impl GpuCompositor {
         self.queue.submit(recolour.into_iter().chain([enc.finish()]));
         self.queue.present(frame);
 
-        // Drop GPU textures for tiles that have been evicted from the CPU store.
-        self.tiles.retain(|key, _| store.get(key).is_some());
+        // Free the slots of tiles evicted from the CPU store.
+        let evicted: Vec<TileKey> = self.tiles.keys().filter(|key| store.get(key).is_none()).cloned().collect();
+        for key in evicted {
+            let entry = self.tiles.remove(&key).unwrap();
+            self.release(entry.slot);
+        }
         animating
     }
 
@@ -948,125 +1007,144 @@ impl GpuCompositor {
         let base = level.saturating_sub(stride.trailing_zeros()).min(max_level);
         let levels = (max_level - base + 1).min(span);
 
+        let shape = Shape { tex_size, base, levels };
         let entry = self.tiles.get(key);
-        let same_shape = entry.is_some_and(|e| e.tex_size == tex_size && e.base == base && e.levels == levels);
+        let same_shape = entry.is_some_and(|e| e.slot.shape == shape);
         let contents = !same_shape || entry.is_some_and(|e| e.version != version);
         let recolour = contents || entry.is_some_and(|e| e.palette_gen != self.palette_gen);
-        recolour.then(|| Upload { key: key.clone(), tile, stride, tex_size, base, levels, version, same_shape, contents })
+        recolour.then(|| Upload { key: key.clone(), tile, stride, shape, version, same_shape, contents })
     }
 
     /// Bring the stale tiles' textures up to date: upload the iteration
     /// data of those whose contents changed, then colour them all on the GPU
     /// (after a palette change: every tile on screen, from the iteration
-    /// data already there). Returns the colouring commands, to be submitted
-    /// before the frame that draws them.
+    /// data already there), one dispatch per chunk and mip level. Returns
+    /// the colouring commands, to be submitted before the frame that draws
+    /// them.
     fn upload_textures(&mut self, uploads: Vec<Upload>) -> Option<wgpu::CommandBuffer> {
         let max = uploads.iter().map(|u| u.tile.iterations.load(Ordering::Relaxed)).max()?;
         self.sync_palette(max);
         let data: Vec<Option<Vec<u32>>> = uploads
             .par_iter()
-            .map(|u| u.contents.then(|| iteration_texels(&u.tile, u.stride, u.tex_size)))
+            .map(|u| u.contents.then(|| iteration_texels(&u.tile, u.stride, u.shape.tex_size)))
             .collect();
-        let keys: Vec<TileKey> = uploads.iter().map(|u| u.key.clone()).collect();
+        // layers to colour, per chunk
+        let mut jobs: HashMap<(Shape, usize), Vec<u32>> = HashMap::new();
         for (u, data) in uploads.into_iter().zip(data) {
-            self.update_entry(u, data);
+            let slot = self.update_entry(u, data);
+            jobs.entry((slot.shape, slot.chunk)).or_default().push(slot.layer);
         }
+        let mut jobs: Vec<((Shape, usize), Vec<u32>)> = jobs.into_iter().collect();
+        jobs.sort_by_key(|(k, _)| *k);
+
+        // One job list per dispatch group, each in its own JOB_SLOT.
+        let slot_len = JOB_SLOT as usize / 4;
+        let mut lists = vec![0u32; jobs.len() * slot_len];
+        for (g, (_, layers)) in jobs.iter().enumerate() {
+            lists[g * slot_len..][..layers.len()].copy_from_slice(layers);
+        }
+        if (lists.len() * 4) as u64 > self.jobs.size() {
+            self.jobs = jobs_buffer(&self.device, jobs.len().next_power_of_two());
+        }
+        self.queue.write_buffer(&self.jobs, 0, bytemuck::cast_slice(&lists));
+        let inputs = self.recolour.inputs(&self.device, &self.palette_gpu.buffer, &self.jobs);
 
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&self.recolour.pipeline);
-            pass.set_bind_group(0, &self.palette_gpu.bind_group, &[]);
-            for key in &keys {
-                let entry = &self.tiles[key];
-                for (i, bg) in entry.recolour.iter().enumerate() {
-                    let groups = (entry.tex_size >> (entry.base + i as u32)).div_ceil(8);
+            for (g, ((shape, chunk), layers)) in jobs.iter().enumerate() {
+                let chunk = self.pools[shape][*chunk].as_ref().expect("chunk in use");
+                pass.set_bind_group(0, &inputs, &[g as u32 * JOB_SLOT]);
+                for (i, bg) in chunk.recolour.iter().enumerate() {
+                    let groups = (shape.tex_size >> (shape.base + i as u32)).div_ceil(8);
                     pass.set_bind_group(1, bg, &[]);
-                    pass.dispatch_workgroups(groups, groups, 1);
+                    pass.dispatch_workgroups(groups, groups, layers.len() as u32);
                 }
             }
         }
         Some(enc.finish())
     }
 
-    /// (Re)create `u`'s textures if their shape changed and upload its
-    /// iteration `data` if given (a changed tile, not just a recolour).
-    fn update_entry(&mut self, u: Upload, data: Option<Vec<u32>>) {
-        let Upload { key, tex_size, base, levels, version, same_shape, .. } = u;
+    /// Give `u`'s tile a slot of its shape (a new one if the shape changed)
+    /// and upload its iteration `data` if given (a changed tile, not just a
+    /// recolour). Returns the slot.
+    fn update_entry(&mut self, u: Upload, data: Option<Vec<u32>>) -> Slot {
+        let Upload { key, shape, version, same_shape, .. } = u;
         if !same_shape {
-            let entry = self.create_entry(tex_size, base, levels);
-            self.tiles.insert(key.clone(), entry);
+            if let Some(old) = self.tiles.remove(&key) {
+                self.release(old.slot);
+            }
+            let slot = self.alloc(shape);
+            self.tiles.insert(key.clone(), TileEntry { slot, version: 0, palette_gen: 0 });
         }
         let entry = self.tiles.get_mut(&key).unwrap();
+        let slot = entry.slot;
         if let Some(data) = data {
+            let n = shape.tex_size;
+            let iters = &self.pools[&shape][slot.chunk].as_ref().expect("chunk in use").iters;
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
-                    texture: &entry.iters,
+                    texture: iters,
                     mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: slot.layer },
                     aspect: wgpu::TextureAspect::All,
                 },
                 bytemuck::cast_slice(&data),
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(tex_size * 4),
-                    rows_per_image: Some(tex_size),
-                },
-                wgpu::Extent3d { width: tex_size, height: tex_size, depth_or_array_layers: 1 },
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n * 4), rows_per_image: Some(n) },
+                wgpu::Extent3d { width: n, height: n, depth_or_array_layers: 1 },
             );
         }
         entry.version = version;
         entry.palette_gen = self.palette_gen;
+        slot
     }
 
-    /// Textures for a tile with `tex_size`² data texels whose mip levels
-    /// `base..base + levels` are drawn: the iteration data, and the colour
-    /// texture (written by the colouring pass, sampled as sRGB).
-    fn create_entry(&self, tex_size: u32, base: u32, levels: u32) -> TileEntry {
-        let iters = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size: wgpu::Extent3d { width: tex_size, height: tex_size, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Uint,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let size = tex_size >> base;
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
-            mip_level_count: levels,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: COLOUR_STORAGE_FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
-            view_formats: &[TEXTURE_FORMAT],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+    /// A free slot of `shape`, adding a chunk if all are full.
+    fn alloc(&mut self, shape: Shape) -> Slot {
+        let chunks = self.pools.entry(shape).or_default();
+        if let Some((i, c)) = chunks.iter_mut().enumerate().find_map(|(i, c)| c.as_mut().filter(|c| !c.free.is_empty()).map(|c| (i, c))) {
+            return Slot { shape, chunk: i, layer: c.free.pop().unwrap() };
+        }
+        let held: u32 = chunks.iter().flatten().map(|c| c.capacity).sum();
+        let capacity = held.clamp(CHUNK_MIN_LAYERS, CHUNK_MAX_LAYERS);
+        let (iters, colour) = chunk_textures(&self.device, shape, capacity);
+        let view = colour.create_view(&wgpu::TextureViewDescriptor {
             format: Some(TEXTURE_FORMAT),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let draw = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.bgl,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
         });
-        let iters_view = iters.create_view(&Default::default());
-        let recolour = (0..levels)
-            .map(|i| self.recolour.bind_group(&self.device, &iters_view, &texture, i))
-            .collect();
-        TileEntry { iters, bind_group, recolour, tex_size, base, levels, version: 0, palette_gen: 0 }
+        let iters_view = iters.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let recolour = (0..shape.levels).map(|i| self.recolour.tile_group(&self.device, &iters_view, &colour, i)).collect();
+        let mut chunk = Chunk { iters, draw, recolour, free: (0..capacity).rev().collect(), capacity };
+        let layer = chunk.free.pop().unwrap();
+        let chunks = self.pools.get_mut(&shape).unwrap();
+        let i = match chunks.iter().position(Option::is_none) {
+            Some(i) => { chunks[i] = Some(chunk); i }
+            None => { chunks.push(Some(chunk)); chunks.len() - 1 }
+        };
+        Slot { shape, chunk: i, layer }
+    }
+
+    /// Return `slot`; a chunk left empty is dropped.
+    fn release(&mut self, slot: Slot) {
+        let chunks = self.pools.get_mut(&slot.shape).expect("pool");
+        let chunk = chunks[slot.chunk].as_mut().expect("chunk in use");
+        chunk.free.push(slot.layer);
+        if chunk.free.len() as u32 == chunk.capacity {
+            chunks[slot.chunk] = None;
+        }
     }
 
     /// Make the GPU palette cover iterations up to `max` (plus one: escapes
@@ -1084,7 +1162,7 @@ impl GpuCompositor {
             .map(|j| val_to_color(NonZeroUsize::new(j), phase))
             .collect();
         if grow {
-            self.palette_gpu = PaletteGpu::new(&self.device, &self.recolour.palette_bgl, len);
+            self.palette_gpu = PaletteGpu::new(&self.device, len);
         }
         self.queue.write_buffer(&self.palette_gpu.buffer, 0, bytemuck::cast_slice(&table));
         self.palette_gpu.phase = Some(phase);
@@ -1121,12 +1199,56 @@ pub fn color_of_for_tests(iteration: u32) -> u32 {
     val_to_color(NonZeroUsize::new(iteration as usize), PalettePhase::default())
 }
 
+/// Bytes of the jobs buffer per dispatch: a chunk's layers (at most
+/// CHUNK_MAX_LAYERS u32), a multiple of the storage offset alignment (256).
+const JOB_SLOT: u32 = CHUNK_MAX_LAYERS * 4;
+
+/// A jobs buffer with room for `dispatches` job lists.
+fn jobs_buffer(device: &wgpu::Device, dispatches: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("recolour jobs"),
+        size: dispatches as u64 * JOB_SLOT as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// A chunk's textures for `capacity` tiles of `shape`: the iteration data
+/// (R32Uint) and the colour levels (written as `COLOUR_STORAGE_FORMAT`,
+/// sampled as `TEXTURE_FORMAT`).
+fn chunk_textures(device: &wgpu::Device, shape: Shape, capacity: u32) -> (wgpu::Texture, wgpu::Texture) {
+    let n = shape.tex_size;
+    let iters = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tile iterations"),
+        size: wgpu::Extent3d { width: n, height: n, depth_or_array_layers: capacity },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Uint,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let m = n >> shape.base;
+    let colour = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tile colours"),
+        size: wgpu::Extent3d { width: m, height: m, depth_or_array_layers: capacity },
+        mip_level_count: shape.levels,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: COLOUR_STORAGE_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[TEXTURE_FORMAT],
+    });
+    (iters, colour)
+}
+
 /// The colouring pass (`gpu_compositor_recolour.wgsl`): iteration data →
-/// colour texture levels, reading the palette (group 0, shared) and one
-/// tile's textures (group 1, per mip level).
+/// colour texture levels. Group 0: the palette and the job lists (a
+/// dynamic offset per dispatch); group 1: one chunk's textures, per level.
 struct Recolour {
     pipeline: wgpu::ComputePipeline,
-    palette_bgl: wgpu::BindGroupLayout,
+    inputs_bgl: wgpu::BindGroupLayout,
     tile_bgl: wgpu::BindGroupLayout,
 }
 
@@ -1136,28 +1258,29 @@ impl Recolour {
             label: Some("recolour"),
             source: wgpu::ShaderSource::Wgsl(RECOLOUR_SHADER.into()),
         });
-        let palette_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("palette"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+        let storage = |binding, dynamic| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: dynamic,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let inputs_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("recolour inputs"),
+            entries: &[storage(0, false), storage(1, true)],
         });
         let tile_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("recolour tile"),
+            label: Some("recolour tiles"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Uint,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                     count: None,
@@ -1168,7 +1291,7 @@ impl Recolour {
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
                         format: COLOUR_STORAGE_FORMAT,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                     },
                     count: None,
                 },
@@ -1176,7 +1299,7 @@ impl Recolour {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("recolour"),
-            bind_group_layouts: &[Some(&palette_bgl), Some(&tile_bgl)],
+            bind_group_layouts: &[Some(&inputs_bgl), Some(&tile_bgl)],
             immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1187,13 +1310,34 @@ impl Recolour {
             compilation_options: Default::default(),
             cache: None,
         });
-        Self { pipeline, palette_bgl, tile_bgl }
+        Self { pipeline, inputs_bgl, tile_bgl }
     }
 
-    /// Group 1 for colouring mip level `level` of `colour` from `iters`.
-    fn bind_group(&self, device: &wgpu::Device, iters: &wgpu::TextureView, colour: &wgpu::Texture, level: u32) -> wgpu::BindGroup {
+    /// Group 0: the palette, and a JOB_SLOT window of `jobs`.
+    fn inputs(&self, device: &wgpu::Device, palette: &wgpu::Buffer, jobs: &wgpu::Buffer) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.inputs_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: palette.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: jobs,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(JOB_SLOT as u64),
+                    }),
+                },
+            ],
+        })
+    }
+
+    /// Group 1 for colouring mip level `level` of a chunk's `colour` array
+    /// from its `iters` array.
+    fn tile_group(&self, device: &wgpu::Device, iters: &wgpu::TextureView, colour: &wgpu::Texture, level: u32) -> wgpu::BindGroup {
         let out = colour.create_view(&wgpu::TextureViewDescriptor {
             format: Some(COLOUR_STORAGE_FORMAT),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
             base_mip_level: level,
             mip_level_count: Some(1),
             ..Default::default()
@@ -1213,7 +1357,6 @@ impl Recolour {
 /// (`val_to_color`), read by the colouring pass.
 struct PaletteGpu {
     buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
     /// entries
     len: usize,
     /// phase the contents were built with (None: not yet)
@@ -1221,19 +1364,14 @@ struct PaletteGpu {
 }
 
 impl PaletteGpu {
-    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, len: usize) -> Self {
+    fn new(device: &wgpu::Device, len: usize) -> Self {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("palette"),
             size: (len * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("palette"),
-            layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
-        });
-        Self { buffer, bind_group, len, phase: None }
+        Self { buffer, len, phase: None }
     }
 }
 
@@ -1498,139 +1636,116 @@ mod tests {
         }
     }
 
+    /// A GPU device for the `--ignored` tests.
+    fn test_device() -> (wgpu::Device, wgpu::Queue) {
+        pollster::block_on(async {
+            let adapter = wgpu::Instance::default()
+                .request_adapter(&Default::default()).await.expect("no GPU adapter");
+            adapter.request_device(&Default::default()).await.expect("no device")
+        })
+    }
+
+    /// Record the colouring of `layers` of a chunk, one dispatch per level
+    /// (as `upload_textures` does), with the job list at offset 0 of `jobs`.
+    fn record_recolour(enc: &mut wgpu::CommandEncoder, r: &Recolour, inputs: &wgpu::BindGroup,
+                       groups: &[wgpu::BindGroup], shape: Shape, layers: u32) {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&r.pipeline);
+        pass.set_bind_group(0, inputs, &[0]);
+        for (i, bg) in groups.iter().enumerate() {
+            let g = (shape.tex_size >> (shape.base + i as u32)).div_ceil(8);
+            pass.set_bind_group(1, bg, &[]);
+            pass.dispatch_workgroups(g, g, layers);
+        }
+    }
+
     /// DIAG: time a recolour (palette change) of a whole screen of full
     /// tiles on this machine's GPU: `DIAG_TILES` tiles (default 24000, a
-    /// 3000x2000 view at s = 4) drawn from mip level `DIAG_BASE` (default 2).
+    /// 3000x2000 view at s = 4) drawn from mip level `DIAG_BASE` (default 2),
+    /// in chunks of CHUNK_MAX_LAYERS as the compositor does.
     #[test]
     #[ignore]
     fn diag_recolour_speed() {
         let env = |k: &str, d: u32| std::env::var(k).ok().map_or(d, |v| v.parse().unwrap());
         let (n_tiles, base) = (env("DIAG_TILES", 24000), env("DIAG_BASE", 2));
-        let (device, queue) = pollster::block_on(async {
-            let adapter = wgpu::Instance::default()
-                .request_adapter(&Default::default()).await.expect("no GPU adapter");
-            adapter.request_device(&Default::default()).await.expect("no device")
-        });
+        let (device, queue) = test_device();
         let r = Recolour::new(&device);
-        let palette = PaletteGpu::new(&device, &r.palette_bgl, 4096);
+        let palette = PaletteGpu::new(&device, 4096);
         let table: Vec<u32> = (0..4096).map(|j| val_to_color(NonZeroUsize::new(j), PalettePhase::default())).collect();
         queue.write_buffer(&palette.buffer, 0, bytemuck::cast_slice(&table));
+        let jobs = jobs_buffer(&device, 1);
+        queue.write_buffer(&jobs, 0, bytemuck::cast_slice(&(0..CHUNK_MAX_LAYERS).collect::<Vec<u32>>()));
+        let inputs = r.inputs(&device, &palette.buffer, &jobs);
         let n = TILE_SIZE as u32;
-        let data: Vec<u32> = (0..n * n).map(|i| (i * 7919) % 2000).collect();
-        let bgs: Vec<wgpu::BindGroup> = (0..n_tiles).map(|_| {
-            let iters = device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d { width: n, height: n, depth_or_array_layers: 1 },
-                mip_level_count: 1, sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R32Uint,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
+        let shape = Shape { tex_size: n, base, levels: 1 };
+        let data: Vec<u32> = (0..n * n * CHUNK_MAX_LAYERS).map(|i| (i * 7919) % 2000).collect();
+        let chunks: Vec<(Vec<wgpu::BindGroup>, u32)> = (0..n_tiles.div_ceil(CHUNK_MAX_LAYERS)).map(|c| {
+            let layers = (n_tiles - c * CHUNK_MAX_LAYERS).min(CHUNK_MAX_LAYERS);
+            let (iters, colour) = chunk_textures(&device, shape, CHUNK_MAX_LAYERS);
             queue.write_texture(iters.as_image_copy(), bytemuck::cast_slice(&data),
                 wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n * 4), rows_per_image: Some(n) },
                 iters.size());
-            let size = n >> base;
-            let colour = device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
-                mip_level_count: 1, sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: COLOUR_STORAGE_FORMAT,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[TEXTURE_FORMAT],
+            let view = iters.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default()
             });
-            r.bind_group(&device, &iters.create_view(&Default::default()), &colour, 0)
+            (vec![r.tile_group(&device, &view, &colour, 0)], layers)
         }).collect();
         queue.submit([]);
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         for round in 0..3 {
             let t = std::time::Instant::now();
             let mut enc = device.create_command_encoder(&Default::default());
-            {
-                let mut pass = enc.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&r.pipeline);
-                pass.set_bind_group(0, &palette.bind_group, &[]);
-                let g = (n >> base).div_ceil(8);
-                if std::env::var("DIAG_ONE_DISPATCH").is_ok() {
-                    // the same work as one dispatch (every tile's invocations
-                    // write the first tile): the pure GPU cost
-                    pass.set_bind_group(1, &bgs[0], &[]);
-                    pass.dispatch_workgroups(g, g, n_tiles);
-                } else {
-                    for bg in &bgs {
-                        pass.set_bind_group(1, bg, &[]);
-                        pass.dispatch_workgroups(g, g, 1);
-                    }
-                }
+            for (groups, layers) in &chunks {
+                record_recolour(&mut enc, &r, &inputs, groups, shape, *layers);
             }
             let cmd = enc.finish();
             let encoded = t.elapsed();
             queue.submit([cmd]);
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-            eprintln!("round {round}: {n_tiles} tiles from level {base}: encode {encoded:?}, total {:?}", t.elapsed());
+            eprintln!("round {round}: {n_tiles} tiles from level {base} in {} chunks: encode {encoded:?}, total {:?}",
+                chunks.len(), t.elapsed());
         }
     }
 
     /// The colouring pass on this machine's GPU (`--ignored`): mip levels
     /// and sub-pass gaps average in linear light, so a black/white
     /// checkerboard becomes the sRGB encoding of 50% linear grey (188), not
-    /// the gamma-space average (128); a uniform tile stays uniform.
+    /// the gamma-space average (128); a uniform tile stays uniform. The tile
+    /// sits in layer 2 of a 3-layer chunk.
     #[test]
     #[ignore]
     fn recolour_averages_in_linear_light() {
-        let (device, queue) = pollster::block_on(async {
-            let adapter = wgpu::Instance::default()
-                .request_adapter(&Default::default()).await.expect("no GPU adapter");
-            adapter.request_device(&Default::default()).await.expect("no device")
-        });
+        let (device, queue) = test_device();
         let r = Recolour::new(&device);
         // palette: 0 black, 1 white, 2 grey 77
-        let palette = PaletteGpu::new(&device, &r.palette_bgl, 256);
+        let palette = PaletteGpu::new(&device, 256);
         let mut table = vec![0u32; 256];
         table[1] = 0xFFFFFF;
         table[2] = 0x4D4D4D;
         queue.write_buffer(&palette.buffer, 0, bytemuck::cast_slice(&table));
+        let jobs = jobs_buffer(&device, 1);
+        queue.write_buffer(&jobs, 0, bytemuck::cast_slice(&[2u32]));
+        let inputs = r.inputs(&device, &palette.buffer, &jobs);
+        const LAYER: u32 = 2;
 
         // One 8×8 data tile, drawn at `levels` from `base`: every output byte.
         let run = |data: &[u32], base: u32, levels: u32| -> Vec<Vec<u8>> {
             let n = 8u32;
-            let iters = device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d { width: n, height: n, depth_or_array_layers: 1 },
-                mip_level_count: 1, sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R32Uint,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            queue.write_texture(iters.as_image_copy(), bytemuck::cast_slice(data),
+            let shape = Shape { tex_size: n, base, levels };
+            let (iters, colour) = chunk_textures(&device, shape, LAYER + 1);
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &iters, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: LAYER }, aspect: wgpu::TextureAspect::All },
+                bytemuck::cast_slice(data),
                 wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n * 4), rows_per_image: Some(n) },
-                iters.size());
-            let size = n >> base;
-            let colour = device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
-                mip_level_count: levels, sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: COLOUR_STORAGE_FORMAT,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[TEXTURE_FORMAT],
+                wgpu::Extent3d { width: n, height: n, depth_or_array_layers: 1 });
+            let view = iters.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default()
             });
-            let iters_view = iters.create_view(&Default::default());
+            let groups: Vec<_> = (0..levels).map(|i| r.tile_group(&device, &view, &colour, i)).collect();
             let mut enc = device.create_command_encoder(&Default::default());
-            {
-                let mut pass = enc.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&r.pipeline);
-                pass.set_bind_group(0, &palette.bind_group, &[]);
-                for i in 0..levels {
-                    let bg = r.bind_group(&device, &iters_view, &colour, i);
-                    pass.set_bind_group(1, &bg, &[]);
-                    let g = (size >> i).div_ceil(8);
-                    pass.dispatch_workgroups(g, g, 1);
-                }
-            }
+            record_recolour(&mut enc, &r, &inputs, &groups, shape, 1);
             // read back every level (rows padded to 256 bytes)
+            let size = n >> base;
             let bufs: Vec<(wgpu::Buffer, u32)> = (0..levels).map(|i| {
                 let m = size >> i;
                 let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1639,7 +1754,7 @@ mod tests {
                     mapped_at_creation: false,
                 });
                 enc.copy_texture_to_buffer(
-                    wgpu::TexelCopyTextureInfo { texture: &colour, mip_level: i, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyTextureInfo { texture: &colour, mip_level: i, origin: wgpu::Origin3d { x: 0, y: 0, z: LAYER }, aspect: wgpu::TextureAspect::All },
                     wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(m) } },
                     wgpu::Extent3d { width: m, height: m, depth_or_array_layers: 1 });
                 (buf, m)
