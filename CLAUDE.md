@@ -389,3 +389,25 @@ coding):
    ~1–2 s wait still bothers the user): move on to later passes while
    deferred pixels are pending. Tricky: a tile finishes a pass only once all
    its pixels are stored, and later passes would defer more pixels too.
+7. **Memory ceiling for s** (agreed 2026-09-25, not built): a resize can
+   make a formerly fine s too big (the view's tiles are never evicted, so
+   the budget can't help). Keep the *requested* s (←/→) and derive an
+   *effective* s: shrink the 3× cache factor towards 1× first, then lower s
+   in 0.5 steps until the view's tiles (~w·h·r²/128², r ∈ [s, 2s); ~64 KiB
+   CPU + 64 KiB GPU iterations + colour each) fit a per-platform ceiling
+   (native: a fraction of physical RAM; wasm: ~3 GiB). Recompute on resize
+   and s change; shrinking the window restores the requested s. **Must be
+   visible in the debug info** (user): title like `s 4 (→3)`, plus a log
+   line when it clamps. Never clamp silently.
+8. **wasm port** (discussed 2026-09-25, not started): one codebase, not two.
+   Shared as is: all WGSL, the math (dashu, nucleus, BLA, store), the
+   compositor. The one real refactor: make the compute driver async
+   (`run_generation` → `render_pass_batch` → the chunk loop in gpu.rs
+   awaiting readbacks instead of blocking; native runs it under
+   `pollster::block_on` on its thread at no cost, web in a Web Worker with
+   its own WebGPU device). Behind a small platform module: spawning
+   (thread vs worker), `Instant` (`web-time`), clipboard, logging (no
+   `gpu.log`), event-loop startup. rayon via `wasm-bindgen-rayon` needs
+   COOP/COEP headers: fine, the user hosts on Cloudflare. wasm32's 4 GiB
+   address space is what item 7's wasm ceiling is for. First step: the
+   async chunk loop on native alone, checked with the existing GPU tests.
