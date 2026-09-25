@@ -179,8 +179,8 @@ not yet checked in a browser.
 - Memory: 3 GiB ceiling for the tiles (see the tile budget); native has none.
 - **Deploy**: served at `games.gorilskij.com/mandelbrot/` by the site's
   router Worker (`~/code/site/gorilskij.com`, `GAMES` in
-  `router/src/index.js`) proxying the Cloudflare Pages project `mandelbrot`
-  (GitHub-connected; build `bash web/cf-build.sh`, output `web/dist`),
+  `router/src/index.js`) proxying the Cloudflare Pages project `mandelbrot` at
+  `mandelbrot-6pr.pages.dev` (`mandelbrot.pages.dev` was taken; GitHub-connected; build `bash web/cf-build.sh`, output `web/dist`),
   like hex_snake. Branch flow: work → `master` → `test-website` (preview)
   → `pub-website` (production); other branches are skipped. `cf-build.sh`
   installs rustup and builds without debug info (Pages rejects files over
