@@ -32,8 +32,12 @@ detection); the CPU one is older (per-group references, no BLA).
 
 ## Layout
 
-- `src/main.rs` — app, input, view state, title/log diagnostics. Builds `Toggle`
-  (CPU/GPU) + `GpuState`.
+- `src/main.rs` — app, input, view state, title/log diagnostics.
+- `src/platform.rs` — everything that differs between native and the web
+  build (see Web build): spawning threads/workers, sleeping, logging,
+  clipboard, the debug line, UI-thread maps.
+- `web/` — the web build: `build.sh`, `serve.py`, `index.html`, `_headers`,
+  README.
 - `src/rendering.rs` — `calculate_orbit` (returns `(Orbit<FBig>, Orbit<Pf>)`),
   `check_orbit`, `check_divergence_delta` (the reference CPU delta loop),
   `val_to_color` (the palette), and `Pf` (the perturbation working float).
@@ -88,7 +92,9 @@ detection); the CPU one is older (per-group references, no BLA).
 - `src/tiles/perturb/shaders/` — `floatexp.wgsl` (helpers), `perturb_common.wgsl`
   (BLA lookup/apply, jump limits, interior check), `perturbation.wgsl` (f32
   body), `perturbation_floatexp.wgsl` (deep body). Assembled by `shader_source`.
-- `src/drawing/renderer/multithreaded.rs` — the compute thread, which calls `run_generation`.
+- `src/drawing/renderer/multithreaded.rs` — the compute thread: one async
+  loop (`compute_loop`) that makes the backends (`Toggle`: CPU/GPU) and
+  awaits `run_generation` per requested view.
 - `src/gpu_compositor.rs` — draws the tiles to screen (its own wgpu device,
   separate from the compute backend) on the render thread.
   - **Colouring on the GPU**: a tile's iteration counts are uploaded
@@ -137,6 +143,38 @@ detection); the CPU one is older (per-group references, no BLA).
   make it jerk. `render()` returns
   whether the bar is still moving, and the render thread keeps drawing at
   vsync until it settles.
+
+## Web build (`web/`, `platform.rs`)
+
+The same code compiled to wasm on WebGPU (`web/build.sh` → `web/dist`,
+`web/serve.py` serves it with the headers; Cloudflare Pages via `_headers`).
+Checked in headless Chrome driven over CDP (render, zoom, palette, s, the
+ceiling); deep zoom (floatexp pipeline, BLA, nucleus search at depth) is
+not yet checked in a browser.
+
+- **Threads are Web Workers sharing one wasm memory** (`wasm_thread`, with
+  our own worker script: theirs closes the worker when the thread function
+  returns). Needs cross-origin isolation (COOP/COEP headers), nightly with
+  `-Z build-std` and the flags in `.cargo/config.toml` (atomics, shared
+  imported memory up to 4 GiB, TLS exports; current nightlies no longer add
+  the shared-memory link args for `+atomics`). parking_lot needs its
+  `nightly` feature there, or parking panics.
+- **The compute path is async** (`BatchFuture`, `run_generation`, the GPU
+  dispatch chain): a worker can't block on a GPU readback (the mapping
+  resolves from its event loop). Natively the compute thread drives it with
+  `pollster` and `wait` still blocks on `device.poll`, so nothing changed
+  (checked: same timing). GPU objects never leave their thread (on the web
+  they are `!Send`), so the compute loop makes its own `GpuState`.
+- **The browser's main thread must never block** (a contended lock or a
+  wait throws): the compositor draws there (`WebRenderer`, on each
+  animation frame, instead of the render thread), with no rayon
+  (`platform::ui_map`); the compute worker, the search and rayon's pool run
+  in workers. The main thread still takes the view channel's lock briefly
+  (`waker_interrupter::Sender::send`); contention is rare, but a true fix
+  would be a lock-free send.
+- The window is the page's `<canvas id="canvas">`; its size comes from the
+  layout until winit's resize observer fires (`initial_size`).
+- Memory: 3 GiB ceiling for the tiles (see the tile budget); native has none.
 
 ## Perturbation math
 
@@ -400,15 +438,3 @@ coding):
    ~1–2 s wait still bothers the user): move on to later passes while
    deferred pixels are pending. Tricky: a tile finishes a pass only once all
    its pixels are stored, and later passes would defer more pixels too.
-7. **wasm port** (discussed 2026-09-25, not started): one codebase, not two.
-   Shared as is: all WGSL, the math (dashu, nucleus, BLA, store), the
-   compositor. The one real refactor: make the compute driver async
-   (`run_generation` → `render_pass_batch` → the chunk loop in gpu.rs
-   awaiting readbacks instead of blocking; native runs it under
-   `pollster::block_on` on its thread at no cost, web in a Web Worker with
-   its own WebGPU device). Behind a small platform module: spawning
-   (thread vs worker), `Instant` (`web-time`), clipboard, logging (no
-   `gpu.log`), event-loop startup. rayon via `wasm-bindgen-rayon` needs
-   COOP/COEP headers: fine, the user hosts on Cloudflare. wasm32's 4 GiB
-   address space is what the wasm memory ceiling is for (see the tile budget). First step: the
-   async chunk loop on native alone, checked with the existing GPU tests.
