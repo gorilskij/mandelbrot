@@ -87,12 +87,59 @@ pub const GROUP_TILES: usize = 1 << GROUP_POW;
 /// beyond the budget, which grows with the view (`set_view_tiles`).
 pub const MEMORY_BUDGET_BYTES: usize = 1 << 30; // 1 GiB ~ 16k tiles
 
-/// The tile budget is at least this many times the current view's tiles:
-/// room for their ancestors (+1/3, for previews and seeding) and for recent
-/// views to go back to. No ceiling: the view itself is bounded, e.g. at s = 4
-/// a 3000x2000 window needs up to ~24k tiles (1.5 GiB), so ~4.5 GiB.
+/// The tile budget is this many times the current view's tiles (at least
+/// the floor, at most the memory ceiling): room for their ancestors (+1/3,
+/// for previews and seeding) and for recent views to go back to. E.g. at
+/// s = 4 a 3000x2000 window needs up to ~24k tiles.
 const VIEW_BUDGET_FACTOR: usize = 3;
 const TILE_BYTES: usize = TILE_LEN * size_of::<u32>();
+
+/// Memory per cached tile, counting every copy: the CPU store's pixels
+/// (TILE_BYTES), the compositor's iterations on the GPU (as many) and its
+/// colour levels (at most levels 0 and 1: 1.25×).
+const TILE_TOTAL_BYTES: usize = TILE_BYTES * 13 / 4;
+
+/// Sampling ratio s (←/→): steps and range.
+pub const SAMPLING_STEP: f64 = 0.5;
+pub const SAMPLING_MIN:  f64 = 0.5;
+pub const SAMPLING_MAX:  f64 = 4.0;
+
+/// Memory ceiling for the tile cache (all copies, see TILE_TOTAL_BYTES):
+/// half the physical RAM; on wasm 3 GiB (a 4 GiB address space); 8 GiB
+/// where the RAM can't be read.
+pub fn memory_ceiling_bytes() -> usize {
+    #[cfg(unix)]
+    {
+        // SAFETY: sysconf only reads system configuration.
+        let (pages, page) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+        if pages > 0 && page > 0 {
+            return (pages as usize).saturating_mul(page as usize) / 2;
+        }
+    }
+    if cfg!(target_arch = "wasm32") { 3 << 30 } else { 8 << 30 }
+}
+
+/// Worst-case number of tiles covering a `w`×`h` px window at sampling
+/// ratio s: a screen pixel spans up to 2s tile pixels per axis (just before
+/// a depth switch), plus a partial tile at each edge.
+pub fn view_tiles_worst(s: f64, w: usize, h: usize) -> usize {
+    let axis = |px: usize| (px as f64 * 2.0 * s / TILE_SIZE as f64).ceil() as usize + 1;
+    axis(w) * axis(h)
+}
+
+/// The sampling ratio actually used: the largest s ≤ `requested`, in
+/// SAMPLING_STEP steps, whose view fits `ceiling_tiles` even in the worst
+/// case (so it doesn't flip while zooming); SAMPLING_MIN if none does. The
+/// view's tiles are never evicted, so a view over the ceiling can't be
+/// helped by the budget; before s drops, the cache around the view (the
+/// VIEW_BUDGET_FACTOR) shrinks towards 1× (`set_view_tiles`).
+pub fn effective_ratio(requested: f64, w: usize, h: usize, ceiling_tiles: usize) -> f64 {
+    let mut s = requested;
+    while s > SAMPLING_MIN && view_tiles_worst(s, w, h) > ceiling_tiles {
+        s -= SAMPLING_STEP;
+    }
+    s.max(SAMPLING_MIN)
+}
 
 /// log2 of units per pixel at a given depth
 pub fn upp_log2(depth: i64) -> i64 {
@@ -357,11 +404,21 @@ pub struct TileStore {
     reset: AtomicBool,
     /// Floor of the tile budget (`MEMORY_BUDGET_BYTES` in tiles).
     min_tiles: usize,
-    /// Current tile budget: max(min_tiles, VIEW_BUDGET_FACTOR × view tiles).
+    /// Ceiling of the tile budget (`memory_ceiling_bytes` in tiles).
+    ceiling_tiles: usize,
+    /// Current tile budget: VIEW_BUDGET_FACTOR × view tiles, within
+    /// [min_tiles, ceiling_tiles].
     max_tiles: AtomicUsize,
-    /// Sampling: the smallest number of tile pixels per screen pixel (per
-    /// axis) to render at, as f32 bits; see `depth_for_view`.
+    /// tiles of the current view (`set_view_tiles`)
+    view_tiles: AtomicUsize,
+    /// Sampling ratio s as requested (←/→), as f32 bits.
+    requested_ratio: AtomicU32,
+    /// Sampling ratio in use (`effective_ratio`): the smallest number of
+    /// tile pixels per screen pixel (per axis) to render at, as f32 bits;
+    /// see `depth_for_view`.
     min_ratio: AtomicU32,
+    /// window size in physical pixels (w << 32 | h), for `effective_ratio`
+    window: AtomicU64,
 }
 
 impl TileStore {
@@ -373,20 +430,65 @@ impl TileStore {
             generation: AtomicU64::new(0),
             reset: AtomicBool::new(false),
             min_tiles: (memory_budget_bytes / TILE_BYTES).max(64),
+            ceiling_tiles: (memory_ceiling_bytes() / TILE_TOTAL_BYTES).max(64),
             max_tiles: AtomicUsize::new((memory_budget_bytes / TILE_BYTES).max(64)),
+            view_tiles: AtomicUsize::new(0),
+            requested_ratio: AtomicU32::new(1.0f32.to_bits()),
             min_ratio: AtomicU32::new(1.0f32.to_bits()),
+            window: AtomicU64::new(0),
         }
     }
 
     /// Sampling ratio s: tiles are rendered at the depth where one screen
     /// pixel spans between s and 2s tile pixels per axis (s = 1: between
     /// 1:1 and 2:1; the compositor averages them down to the screen).
+    /// This is the effective s (see `effective_ratio`), which is below
+    /// `requested_ratio` when that doesn't fit the memory ceiling.
     pub fn min_ratio(&self) -> f64 {
         f32::from_bits(self.min_ratio.load(Ordering::Relaxed)) as f64
     }
 
-    pub fn set_min_ratio(&self, s: f64) {
-        self.min_ratio.store((s as f32).to_bits(), Ordering::Relaxed);
+    /// The sampling ratio set with ←/→.
+    pub fn requested_ratio(&self) -> f64 {
+        f32::from_bits(self.requested_ratio.load(Ordering::Relaxed)) as f64
+    }
+
+    pub fn set_requested_ratio(&self, s: f64) {
+        self.requested_ratio.store((s as f32).to_bits(), Ordering::Relaxed);
+        self.update_ratio(true);
+    }
+
+    /// The window size changed: an s that fitted may no longer (or again).
+    pub fn set_window(&self, w: usize, h: usize) {
+        self.window.store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
+        self.update_ratio(false);
+    }
+
+    /// Recompute the effective s. Logged when it changes, or (after an s
+    /// change, `requested`) whenever it is clamped: never clamped silently.
+    fn update_ratio(&self, requested: bool) {
+        let window = self.window.load(Ordering::Relaxed);
+        let (w, h) = ((window >> 32) as usize, (window & 0xFFFF_FFFF) as usize);
+        let want = self.requested_ratio();
+        let s = effective_ratio(want, w, h, self.ceiling_tiles);
+        let old = f32::from_bits(self.min_ratio.swap((s as f32).to_bits(), Ordering::Relaxed)) as f64;
+        if s < want && (s != old || requested) {
+            log::warn!(
+                "sampling: s = {want} needs up to {} tiles for a {w}x{h} window, over the memory \
+                 ceiling of {} tiles ({:.1} GiB); using s = {s}",
+                view_tiles_worst(want, w, h), self.ceiling_tiles,
+                (self.ceiling_tiles * TILE_TOTAL_BYTES) as f64 / (1u64 << 30) as f64,
+            );
+        } else if s != old {
+            log::info!("sampling: s = {s} fits a {w}x{h} window again");
+        }
+    }
+
+    /// The tile budget over the current view's tiles: VIEW_BUDGET_FACTOR,
+    /// unless the memory ceiling cut it (None before the first view).
+    pub fn cache_factor(&self) -> Option<f64> {
+        let view = self.view_tiles.load(Ordering::Relaxed);
+        (view > 0).then(|| self.max_tiles.load(Ordering::Relaxed) as f64 / view as f64)
     }
 
     /// The depth to render a view at (units per screen pixel) with the
@@ -522,8 +624,12 @@ impl TileStore {
     /// Size the budget for a view of `n` tiles: it grows with the view (a
     /// high sampling ratio needs many more tiles) and shrinks back when the
     /// view needs fewer, so memory is released by the next `evict_excess`.
+    /// Capped by the memory ceiling (never below the view itself, which is
+    /// never evicted; `effective_ratio` keeps it under the ceiling).
     pub fn set_view_tiles(&self, n: usize) {
-        self.max_tiles.store(self.min_tiles.max(VIEW_BUDGET_FACTOR * n), Ordering::Relaxed);
+        let budget = self.min_tiles.max(VIEW_BUDGET_FACTOR * n).min(self.ceiling_tiles.max(n));
+        self.max_tiles.store(budget, Ordering::Relaxed);
+        self.view_tiles.store(n, Ordering::Relaxed);
     }
 
     /// Drop least-recently-displayed tiles until the cache fits the budget.
@@ -599,13 +705,51 @@ mod tests {
         for i in 0..10 { assert!(store.get(&key(5, i)).is_some(), "current tile {i} evicted"); }
     }
 
+    /// The effective s is the requested one while the worst-case view fits
+    /// the ceiling, else the largest step that does (never below the
+    /// minimum); shrinking the window gives the requested s back.
+    #[test]
+    fn effective_ratio_fits_the_ceiling() {
+        let (w, h) = (3000, 2000);
+        // s = 4: (ceil(3000·8/128) + 1) × (ceil(2000·8/128) + 1)
+        assert_eq!(view_tiles_worst(4.0, w, h), 189 * 126);
+        assert_eq!(effective_ratio(4.0, w, h, 1 << 30), 4.0);
+        assert_eq!(effective_ratio(4.0, w, h, 189 * 126), 4.0);
+        assert_eq!(effective_ratio(4.0, w, h, 189 * 126 - 1), 3.5);
+        let fits_3 = view_tiles_worst(3.0, w, h);
+        assert_eq!(effective_ratio(4.0, w, h, fits_3), 3.0);
+        assert_eq!(effective_ratio(4.0, w, h, 1), SAMPLING_MIN);
+        assert_eq!(effective_ratio(4.0, w / 2, h / 2, fits_3), 4.0);
+        assert_eq!(effective_ratio(1.0, w, h, fits_3), 1.0);
+    }
+
+    /// The store applies it on window and s changes, and caps the budget.
+    #[test]
+    fn store_clamps_s_to_the_ceiling() {
+        let store = TileStore::new(1 << 20);
+        let ceiling = store.ceiling_tiles;
+        // a window so large that s = 4 can't fit (but s = 0.5 can)
+        let side = ((ceiling as f64).sqrt() * TILE_SIZE as f64 / 4.0) as usize;
+        store.set_window(side, side);
+        store.set_requested_ratio(4.0);
+        assert_eq!(store.requested_ratio(), 4.0);
+        assert!(store.min_ratio() < 4.0, "effective {}", store.min_ratio());
+        assert!(view_tiles_worst(store.min_ratio(), side, side) <= ceiling);
+        store.set_window(100, 100);
+        assert_eq!(store.min_ratio(), 4.0);
+        store.set_view_tiles(ceiling);
+        assert_eq!(store.cache_factor(), Some(1.0));
+        store.set_view_tiles(10);
+        assert!(store.cache_factor().unwrap() >= VIEW_BUDGET_FACTOR as f64);
+    }
+
     /// With sampling ratio s, a screen pixel spans between s and 2s tile
     /// pixels per axis.
     #[test]
     fn depth_follows_sampling_ratio() {
         let store = TileStore::new(1 << 20);
         for s in [0.5, 1.0, 1.5, 2.0, 2.5, 4.0] {
-            store.set_min_ratio(s);
+            store.set_requested_ratio(s);
             for i in 0..200 {
                 let view = (-30.0 + i as f64 * 0.137).exp2();
                 let ratio = view / units_per_pixel(store.depth_for_view(view));

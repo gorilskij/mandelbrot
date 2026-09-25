@@ -112,12 +112,6 @@ struct App {
     bounds: Option<(f64, f64, f64, f64)>,
 }
 
-/// Sampling ratio s (←/→): tile pixels per screen pixel, per axis, at
-/// least; see `TileStore::min_ratio`.
-const SAMPLING_STEP: f64 = 0.5;
-const SAMPLING_MIN:  f64 = 0.5;
-const SAMPLING_MAX:  f64 = 4.0;
-
 /// Palette phase shift per mouse-wheel notch, in turns: hue (Cmd-scroll)
 /// and lightness (Ctrl-scroll).
 const HUE_TURNS_PER_NOTCH:   f64 = 1.0 / 128.0;
@@ -167,6 +161,8 @@ impl App {
             rt.resize(phys_width, phys_height);
         }
         if let Some(drawer) = &mut self.drawer {
+            // before the drawer restarts: the effective s may change
+            drawer.store().set_window(phys_width as usize, phys_height as usize);
             drawer.resize(phys_width as usize, phys_height as usize, self.iterations);
         }
     }
@@ -270,7 +266,17 @@ impl App {
     fn update_title(&self) {
         let Some(window) = &self.window else { return };
         let view  = self.coords.view.inner;
-        let ratio = self.drawer.as_ref().map_or(1.0, |d| d.store().min_ratio());
+        // DIAG: sampling ratio, "s 4 (→3)" when the memory ceiling lowers
+        // it, and the cache around the view when the ceiling cut it below 3×
+        let ratio = self.drawer.as_ref().map_or_else(|| "1".to_string(), |d| {
+            let store = d.store();
+            let (want, s) = (store.requested_ratio(), store.min_ratio());
+            let mut out = if s < want { format!("{want} (→{s})") } else { format!("{s}") };
+            if let Some(f) = store.cache_factor().filter(|&f| f < 2.95) {
+                out += &format!(" cache {f:.1}×");
+            }
+            out
+        });
         let depth = self.drawer.as_ref()
             .map_or_else(|| crate::tiles::store::depth_for_view(view), |d| d.store().depth_for_view(view));
         let upp   = crate::tiles::store::upp_log2(depth);
@@ -546,13 +552,19 @@ impl ApplicationHandler for App {
                     }
                     KeyCode::ArrowLeft | KeyCode::ArrowRight => {
                         if let Some(drawer) = &self.drawer {
+                            use crate::tiles::store::{SAMPLING_MAX, SAMPLING_MIN, SAMPLING_STEP};
                             let step = if code == KeyCode::ArrowRight { SAMPLING_STEP } else { -SAMPLING_STEP };
-                            let s = (drawer.store().min_ratio() + step).clamp(SAMPLING_MIN, SAMPLING_MAX);
-                            drawer.store().set_min_ratio(s);
+                            let store = drawer.store();
+                            let s = (store.requested_ratio() + step).clamp(SAMPLING_MIN, SAMPLING_MAX);
+                            store.set_requested_ratio(s);
                             info!("sampling ratio s = {s}");
                             self.pending_update =
                                 self.pending_update.max(UpdateKind::AroundCursor);
-                            self.note_action(&format!("s = {s}"));
+                            let action = match store.min_ratio() {
+                                e if e < s => format!("s = {s} (→{e}: memory ceiling)"),
+                                _ => format!("s = {s}"),
+                            };
+                            self.note_action(&action);
                         }
                     }
                     _ if ctrl && letter == "c" => {
