@@ -79,24 +79,37 @@ detection); the CPU one is older (per-group references, no BLA).
   body), `perturbation_floatexp.wgsl` (deep body). Assembled by `shader_source`.
 - `src/drawing/renderer/multithreaded.rs` — the compute thread, which calls `run_generation`.
 - `src/gpu_compositor.rs` — draws the tiles to screen (its own wgpu device,
-  separate from the compute backend) on the render thread. Colours tiles at
-  upload through a palette table (`Palette`, grown before colouring),
-  re-uploads a tile when its `version` or the palette (`palette_gen`)
-  changes, reconstructs sub-pass gaps from neighbours (`reconstruct`).
-  Colouring runs in parallel (rayon) over the frame's stale tiles
-  (`stale_texture` → `upload_textures`): 23 Mpx (s = 1, 3000×2000) take
-  ~4 ms (30 ms sequential), so a palette scroll is near-instant up to about
-  s = 2; at s = 4 expect ~0.1 s (estimated). If that is too slow: colour on
-  the GPU from uploaded iterations.
+  separate from the compute backend) on the render thread.
+  - **Colouring on the GPU**: a tile's iteration counts are uploaded
+    (`iteration_texels`: the stride grid or the whole tile; 0 = black, incl.
+    pixels being recomputed after ↑; `NONE_RAW` = sub-pass gap) when its
+    `version` changes, and a compute pass (`gpu_compositor_recolour.wgsl`)
+    makes the colour texture's drawn mip levels: palette, gap fill (mean of
+    the computed axis neighbours) and mip averaging, all in linear light. A
+    palette change (`palette_gen`) re-runs only that pass. The palette is
+    **computed in the shader** (`colour`, a 16-byte uniform of the phases);
+    `rendering::val_to_color` is the test-only reference, kept in sync by
+    `recolour_matches_cpu` (change both). A table lookup was the pass's
+    main cost on noisy tiles (a gather by iteration).
+  - **Chunks**: tiles of one `Shape` (data size, drawn levels) share 2D
+    array textures (`Chunk`, 16…256 layers, a slot per tile, dropped once
+    empty): colouring is one dispatch per chunk and level (layer lists via
+    a dynamic offset), drawing one draw call per chunk. Metal serialises
+    dispatches (~10–15 µs each), so per-tile dispatches took 365 ms for a
+    recolour at s = 4. `diag_recolour_speed` (M2 Pro, full 3000×2000 screen):
+    s = 4 (24000 tiles) 25–30 ms, s = 1 ~10 ms. RAM: the iterations stay
+    on the GPU (64 KiB per full tile; ~1.5 GiB at s = 4), accepted by the
+    user for fast recolouring.
   - **Sampling and antialiasing**: tiles are rendered at the depth where a
     screen pixel spans r ∈ [s, 2s) tile pixels per axis (`TileStore::
     min_ratio` / `depth_for_view`; s shared with the compute thread through
-    the store). Tile textures are sRGB with mip levels built on the CPU as
-    2×2 box averages in linear light (`mip_chain`), holding only the one or
+    the store). Tile colour textures are sampled as sRGB, each level the
+    area average in linear light of the data texels it covers (colouring
+    pass), holding only the one or
     two levels drawn at the current s (`drawn_levels`: level 0 at s ≤ 1,
     level 2 at s = 4, i.e. 1/16 of the texels; finer per use for parent
-    previews); the CPU store keeps full resolution and a change of s
-    re-uploads. Tiles are drawn 1:1 into an offscreen
+    previews); a change of s changes the tiles' shapes, so re-uploads and
+    recolours. Tiles are drawn 1:1 into an offscreen
     sRGB image (≤ 2× the surface per axis) from the level k that leaves
     q = r/2^k ∈ [1, 2) texels per screen pixel, grid-aligned; the downsample
     pass (`gpu_compositor_downsample.wgsl`) takes each screen pixel's exact
@@ -364,12 +377,11 @@ coding):
 4. **CPU backend** lacks the GPU's nucleus references, rebasing, BLA and
    interior detection; the GPU lacks the CPU's black-fill. Not solid
    guessing (fill a cell whose corners match): the user said not yet.
-5. **Compositor draw calls at high s** (user: don't forget): one draw call
-   and bind group per tile, ~16k per frame at s = 4 (and thousands of
-   re-uploads per frame in the early passes). s = 4 is "slow af" mostly from
-   the 16–64× work, but this may add to it; measure first (do compute
-   chunks still shrink to the minimum at s = 4?). Fix would be a texture
-   atlas / array to batch tiles.
+5. **Compositor draw calls at high s**: done with the chunks (one draw call
+   per chunk, see the compositor). Still to measure: whether compute
+   chunks shrink to the minimum at s = 4 ("slow af" is mostly the 16–64×
+   work). Not done: freeing mostly-empty chunks (a chunk is dropped only
+   when entirely empty, so eviction can leave sparse ones).
 6. **Don't wait for the search at the end of pass 0** (optional, only if the
    ~1–2 s wait still bothers the user): move on to later passes while
    deferred pixels are pending. Tricky: a tile finishes a pass only once all
