@@ -40,7 +40,8 @@ detection); the CPU one is older (per-group references, no BLA).
   build (see Web build): spawning threads/workers, sleeping, logging,
   clipboard, the debug line, UI-thread maps.
 - `web/` — the web build: `build.sh`, `serve.py`, `index.html`, `_headers`,
-  README.
+  `cf-build.sh` (Cloudflare Pages), README. `rust-toolchain.toml` pins the
+  nightly for both builds.
 - `src/rendering.rs` — `calculate_orbit` (returns `(Orbit<FBig>, Orbit<Pf>)`),
   `check_orbit`, `check_divergence_delta` (the reference CPU delta loop),
   `val_to_color` (the palette), and `Pf` (the perturbation working float).
@@ -81,7 +82,8 @@ detection); the CPU one is older (per-group references, no BLA).
   seeds them, sorts them by distance from the cursor, and for each pass calls
   `backend.render_pass_batch(ctx, &batch, pass, &int)` once with every tile that
   still needs that pass. Owns `GroupCache` (the CPU's per-group reference orbits).
-- `src/tiles/perturb/mod.rs` — the `Perturbator` trait (`render_pass_batch`),
+- `src/tiles/perturb/mod.rs` — the `Perturbator` trait (`render_pass_batch`,
+  `reset` for Space),
   `PassBatchCtx` (incl. the store's `progress` counter), `TileItem`, `Toggle`.
 - `src/tiles/perturb/cpu.rs` — CPU backend. Runs tiles through `rayon` `par_iter`
   (`DETERMINISTIC` const = sequential). A glitched pixel computes its own exact
@@ -176,7 +178,12 @@ not yet checked in a browser.
   (`waker_interrupter::Sender::send`); contention is rare, but a true fix
   would be a lock-free send.
 - The window is the page's `<canvas id="canvas">`; its size comes from the
-  layout until winit's resize observer fires (`initial_size`).
+  layout until winit's resize observer fires (`initial_size`). It is
+  configured as Display P3: natively the Metal layer has no colour space,
+  so macOS shows the values unconverted (as P3 on a P3 display); the
+  browser's sRGB default looked duller.
+- `…/#<Cmd-C string>` opens that view (applied like a paste): for sharing
+  views and reproducing them in a (headless) browser.
 - Memory: 3 GiB ceiling for the tiles (see the tile budget); native has none.
 - **Deploy**: served at `games.gorilskij.com/mandelbrot/` by the site's
   router Worker (`~/code/site/gorilskij.com`, `GAMES` in
@@ -402,10 +409,14 @@ Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
   `dispatch_is_deterministic_even_when_killed`,
   `bla_with_escaping_reference_matches_plain`,
   `zero_delta_escapes_with_reference`, `recolour_matches_cpu` (compositor
-  colouring vs `val_to_color`), plus `diag_*` measurements
+  colouring vs `val_to_color`), `view_2026_09_25_black_disc` (a nucleus of
+  another period: prints black counts vs exact, no assertion), plus `diag_*`
+  measurements
   (`diag_recolour_speed`: a full-screen recolour, `DIAG_TILES`,
   `DIAG_BASE`, `DIAG_SMOOTH`)
   (`diag_bla_ab`, `diag_switch_threshold`, `diag_interior_detection`,
+  `diag_view_2026_09_25b_references`: nuclei of other periods vs the view's
+  own, with and without interior detection,
   `diag_reference_precision`, `diag_far_reference`: accuracy with a reused
   far-away nucleus, `diag_deep_nucleus_search`: search timing
   zooming below the 2⁻³¹⁴ view, `DIAG_LEVELS=-316,-320`, `DIAG_PIPE=1` for
@@ -427,7 +438,7 @@ Parameters are the `INTERIOR_*` consts in gpu.rs, passed via uniforms.
   `f64`, which reaches far deeper. Ask before changing it.
 - Commit each logical step separately.
 
-## Open threads (as of 2026-09-24)
+## Open threads (as of 2026-09-26)
 
 Done: bounded chunked dispatch, nucleus references, rebasing, sub-passes,
 quadtree seeding, iteration retargeting, interior detection, BLA, the floatexp
@@ -436,7 +447,11 @@ underflow, dropped-dispatch and floatexp-orbit fixes, deep nucleus search
 momentum progress bar, CPU/GPU overlap, background nucleus search, GPU as
 the default backend, the sampling ratio s with area-averaging
 antialiasing (incl. a tile budget that follows the view), palette
-scrolling, GPU recolouring, and the web build (see Web build). Decided: render order stays pass-major (each
+scrolling, GPU recolouring, the web build and its deploy (see Web build),
+Space searching for a nucleus afresh, and interior detection's return test
+(no false positives with a nucleus of another period; pixels near a
+minibrot of another period than the reference now run to the iteration
+limit instead: correct, slower). Decided: render order stays pass-major (each
 pass completes, rippling out from the cursor, before the next starts); the
 user rejected ring-by-ring refinement. Still open (talk through before
 coding):
@@ -473,8 +488,3 @@ coding):
    possible, e.g. zooming during a render. Fix in waker_interrupter: a
    lock-free send (store the message in an atomic slot, wake the receiver
    without blocking) and an atomic-flag interrupter check.
-8. **Bugged nucleus, the set takes weird shapes**: fixed on branch
-   `interior-fix` (interior detection's return test, see Perturbation math).
-   Not yet merged. Pixels near a minibrot of another period than the
-   reference now run to the iteration limit instead of being detected
-   (correct, slower); a view's own nucleus avoids that.

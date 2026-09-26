@@ -21,8 +21,11 @@ animation frame.
 
 ## Deploy (Cloudflare Pages)
 
-Upload `web/dist` (e.g. `npx wrangler pages deploy web/dist`); the `_headers`
-file in it sets the two headers.
+Live at <https://games.gorilskij.com/mandelbrot/>. The Pages project
+`mandelbrot` (`mandelbrot-6pr.pages.dev`) is connected to GitHub and builds
+with `bash web/cf-build.sh` into `web/dist`: pushing `test-website` updates
+the preview, pushing `pub-website` production (see CLAUDE.md, Web build).
+The `_headers` file in `web/dist` sets the two headers.
 
 ## Differences from native
 
