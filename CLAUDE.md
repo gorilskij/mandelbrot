@@ -40,8 +40,9 @@ detection); the CPU one is older (per-group references, no BLA).
   build (see Web build): spawning threads/workers, sleeping, logging,
   clipboard, the debug line, UI-thread maps.
 - `web/` — the web build: `build.sh`, `serve.py`, `index.html`, `_headers`,
-  `cf-build.sh` (Cloudflare Pages), README. `rust-toolchain.toml` pins the
-  nightly for both builds.
+  `cf-build.sh` (Workers Builds), `worker.js` (the 404 fall-through), README;
+  `wrangler.toml` at the root. `rust-toolchain.toml` pins the nightly for both
+  builds.
 - `src/rendering.rs` — `calculate_orbit` (returns `(Orbit<FBig>, Orbit<Pf>)`),
   `check_orbit`, `check_divergence_delta` (the reference CPU delta loop),
   `val_to_color` (the palette), and `Pf` (the perturbation working float).
@@ -151,8 +152,9 @@ detection); the CPU one is older (per-group references, no BLA).
 
 ## Web build (`web/`, `platform.rs`)
 
-The same code compiled to wasm on WebGPU (`web/build.sh` → `web/dist`,
-`web/serve.py` serves it with the headers; Cloudflare Pages via `_headers`).
+The same code compiled to wasm on WebGPU (`web/build.sh` → `web/dist/mandelbrot`,
+`web/serve.py` serves it at `/mandelbrot/` with the headers; deployed, `_headers`
+sets them).
 Checked in headless Chrome driven over CDP (render, zoom, palette, s, the
 ceiling); deep zoom (floatexp pipeline, BLA, nucleus search at depth) is
 not yet checked in a browser.
@@ -185,14 +187,18 @@ not yet checked in a browser.
 - `…/#<Cmd-C string>` opens that view (applied like a paste): for sharing
   views and reproducing them in a (headless) browser.
 - Memory: 3 GiB ceiling for the tiles (see the tile budget); native has none.
-- **Deploy**: served at `games.gorilskij.com/mandelbrot/` by the site's
-  router Worker (`~/code/site/gorilskij.com`, `GAMES` in
-  `router/src/index.js`) proxying the Cloudflare Pages project `mandelbrot` at
-  `mandelbrot-6pr.pages.dev` (`mandelbrot.pages.dev` was taken; GitHub-connected; build `bash web/cf-build.sh`, output `web/dist`),
-  like hex_snake. Branch flow: work → `master` → `test-website` (preview)
-  → `pub-website` (production); other branches are skipped. `cf-build.sh`
-  installs rustup and builds without debug info (Pages rejects files over
-  25 MiB). `rust-toolchain.toml` pins the nightly (TODO: move it forward
+- **Deploy**: served at `gorilskij.com/mandelbrot/` (test:
+  `test.gorilskij.com/mandelbrot/`, behind Access) by the Workers
+  `mandelbrot` / `mandelbrot-test` (`wrangler.toml`): static assets from
+  `web/dist`, whose files live under `mandelbrot/`, on a Worker route in
+  front of the site's Worker; `web/worker.js` only runs on a miss and passes
+  it on to the site (its 404 page). No `*.workers.dev`/preview addresses.
+  Workers Builds: build `bash web/cf-build.sh`, deploy `npx wrangler deploy`
+  (`pub-website`) / `npx wrangler deploy --env test` (`test-website`). The
+  whole hosting picture (all projects) is in the site repo's CLAUDE.md
+  (`~/code/site/gorilskij.com`, Hosting). Branch flow: work → `master` →
+  `test-website` → `pub-website`. `cf-build.sh` installs rustup and builds
+  without debug info (static assets reject files over 25 MiB). `rust-toolchain.toml` pins the nightly (TODO: move it forward
   now and then; `+atomics` is being phased out, so a newer one may need
   changes). `Cargo.lock` is committed: the wasm-bindgen CLI must match the
   library exactly. `waker_interrupter` is a git dependency (public repo;

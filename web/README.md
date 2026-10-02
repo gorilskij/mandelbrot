@@ -16,16 +16,17 @@ animation frame.
 
 ## Build and run locally
 
-    web/build.sh          # -> web/dist (installs the matching wasm-bindgen CLI into web/.tools once)
-    web/serve.py          # http://localhost:8000, with the headers above
+    web/build.sh          # -> web/dist/mandelbrot (installs the matching wasm-bindgen CLI into web/.tools once)
+    web/serve.py          # http://localhost:8000/mandelbrot/, with the headers above
 
-## Deploy (Cloudflare Pages)
+## Deploy (Cloudflare Workers)
 
-Live at <https://games.gorilskij.com/mandelbrot/>. The Pages project
-`mandelbrot` (`mandelbrot-6pr.pages.dev`) is connected to GitHub and builds
-with `bash web/cf-build.sh` into `web/dist`: pushing `test-website` updates
-the preview, pushing `pub-website` production (see CLAUDE.md, Web build).
-The `_headers` file in `web/dist` sets the two headers.
+Served at <https://gorilskij.com/mandelbrot/> by the Worker `mandelbrot`
+(`wrangler.toml`), and at `test.gorilskij.com/mandelbrot/` (behind Access)
+by `mandelbrot-test`. Workers Builds builds with `bash web/cf-build.sh`:
+pushing `test-website` deploys test, pushing `pub-website` production (see
+CLAUDE.md, Web build). The `_headers` file in `web/dist` sets the two
+headers.
 
 ## Differences from native
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve web/dist on http://localhost:8000 with the headers the web build
+"""Serve web/dist on http://localhost:8000/mandelbrot/ with the headers the web build
 needs (cross-origin isolation, for the wasm memory shared with its Web
 Workers) and without caching, so a rebuild shows on reload."""
 import functools, http.server, os, sys
@@ -17,5 +17,5 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
 root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist")
 handler = functools.partial(Handler, directory=root)
-print(f"serving {root} on http://localhost:{port}")
+print(f"serving {root} on http://localhost:{port}/mandelbrot/")
 http.server.ThreadingHTTPServer(("localhost", port), handler).serve_forever()

@@ -1,6 +1,7 @@
 #!/bin/sh
-# Build the web version into web/dist (serve it with web/serve.py, or deploy
-# the folder to Cloudflare Pages; _headers sets the headers it needs).
+# Build the web version into web/dist/mandelbrot (served at /mandelbrot/: run
+# web/serve.py, or deploy web/dist with `wrangler deploy`; _headers sets the
+# headers it needs).
 set -e
 cd "$(dirname "$0")/.."
 
@@ -14,8 +15,9 @@ fi
 # std rebuilt with atomics (target flags in .cargo/config.toml)
 cargo build --release --target wasm32-unknown-unknown -Z build-std=std,panic_abort
 
-rm -rf web/dist && mkdir -p web/dist
+rm -rf web/dist && mkdir -p web/dist/mandelbrot
 "$BINDGEN" target/wasm32-unknown-unknown/release/mandelbrot.wasm \
-    --out-dir web/dist --target web --no-typescript
-cp web/index.html web/_headers web/dist/
+    --out-dir web/dist/mandelbrot --target web --no-typescript
+cp web/index.html web/dist/mandelbrot/
+cp web/_headers web/dist/
 echo "built web/dist ($(du -sh web/dist | cut -f1))"
