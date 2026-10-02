@@ -1,0 +1,27 @@
+# The web build at gorilskij.com/mandelbrot/: a Worker with static assets
+# (web/dist, whose files live under mandelbrot/) on a route in front of the
+# site's Worker. Deployed by Workers Builds: `pub-website` -> prod
+# (`npx wrangler deploy`), `test-website` -> test (`npx wrangler deploy --env test`).
+name = "mandelbrot"
+main = "web/worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = false
+preview_urls = false
+routes = [
+  { pattern = "gorilskij.com/mandelbrot", zone_name = "gorilskij.com" },
+  { pattern = "gorilskij.com/mandelbrot/*", zone_name = "gorilskij.com" },
+]
+
+[assets]
+directory = "./web/dist"
+html_handling = "auto-trailing-slash"
+
+# `name`, `routes` and `workers_dev`/`preview_urls` do not inherit into an env.
+[env.test]
+name = "mandelbrot-test"
+workers_dev = false
+preview_urls = false
+routes = [
+  { pattern = "test.gorilskij.com/mandelbrot", zone_name = "gorilskij.com" },
+  { pattern = "test.gorilskij.com/mandelbrot/*", zone_name = "gorilskij.com" },
+]

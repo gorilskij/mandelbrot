@@ -7,3 +7,4 @@ flamegraph.svg
 gpu.log
 /web/.tools
 /web/dist
+/.wrangler
