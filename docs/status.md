@@ -30,7 +30,6 @@ a Cloudflare Worker; before that `games.gorilskij.com/mandelbrot/` on Pages). Op
 | `test-website`, `pub-website` | deploy branches ([deploy](how-to/deploy.md)) |
 | `bla`, `fix-glitches`, `gpu-recolour`, `interior-fix`, `palette-scroll`, `s-ceiling`, `wasm`, `better-gpu-v2`, `colors`, `continuous-generation`, `delta_performance`, `implement-deltas`, `performance`, `ref_orbit_list_prepend` | merged feature branches, kept as pointers |
 | `deltas` (13 commits), `scaled_precision` (7), `f128` (4), `blur` (2), `better-gpu-v1`, `change-z`, `ill-fated`, `ref_orbit_list`, `simd` (1 each) | **unmerged** experiments, 2025-01 – 2026-06 (e.g. `simd` "BROKEN - WIP", `scaled_precision` "this was not to be") |
-| `workers` | the 2026-10-02 hosting change, merged; local only |
 
 ## Tests
 
