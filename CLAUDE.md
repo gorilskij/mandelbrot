@@ -191,9 +191,7 @@ not yet checked in a browser.
   whole hosting picture (all projects) is in the site repo's CLAUDE.md
   (`~/code/site/gorilskij.com`, Hosting). Branch flow: work → `master` →
   `test-website` → `pub-website`. `cf-build.sh` installs rustup and builds
-  without debug info (static assets reject files over 25 MiB). (Until the
-  2026-10 migration is cut over, prod is still the old Pages project behind
-  the site's router at `games.gorilskij.com/mandelbrot/`.) `rust-toolchain.toml` pins the nightly (TODO: move it forward
+  without debug info (static assets reject files over 25 MiB). `rust-toolchain.toml` pins the nightly (TODO: move it forward
   now and then; `+atomics` is being phased out, so a newer one may need
   changes). `Cargo.lock` is committed: the wasm-bindgen CLI must match the
   library exactly. `waker_interrupter` is a git dependency (public repo;
