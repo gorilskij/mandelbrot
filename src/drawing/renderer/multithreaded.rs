@@ -1,9 +1,8 @@
 use crate::rendering::{CoordinatesBox, Pixels};
 use crate::support::Point;
 use crate::tiles::perturb::{Toggle, gpu::{Gpu, GpuState}};
-use crate::tiles::render::{GroupCache, run_generation};
+use crate::tiles::render::run_generation;
 use crate::tiles::store::TileStore;
-use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use waker_interrupter as wi;
@@ -59,8 +58,7 @@ pub fn spawn(store: Arc<TileStore>, use_gpu: Arc<AtomicBool>) -> Handle {
 async fn compute_loop(store: Arc<TileStore>, receiver: wi::Receiver<Message>, use_gpu: Arc<AtomicBool>) {
     crate::platform::init_worker_threads();
     let backend = Toggle::new(Gpu(Arc::new(GpuState::new().await)), use_gpu);
-    let group_cache = Mutex::new(GroupCache::new());
     while let Some(((coords, iterations, cursor, width, height), int)) = receiver.recv_multithreaded() {
-        run_generation(&store, &group_cache, width, height, &coords, iterations, cursor, int, &backend).await;
+        run_generation(&store, width, height, &coords, iterations, cursor, int, &backend).await;
     }
 }
