@@ -20,16 +20,16 @@ a Cloudflare Worker; before that `games.gorilskij.com/mandelbrot/` on Pages). Op
 | prod | `gorilskij.com/mandelbrot/` | `pub-website` | 2026-10-02 (the code of 2026-09-25, 3833930, plus the hosting change) |
 | test | `test.gorilskij.com/mandelbrot/` (behind Access) | `test-website` | the same |
 
-`master` has one more docs-only commit and these docs; no code differs from what is deployed.
+`master` is ahead of what is deployed by the Firefox readback workaround and chunk sizing from
+GPU timestamps (merged 2026-10-07, [history](history/2026-10-07-firefox-readbacks.md)): not deployed yet.
 
 ## Branches
 
 | branch | state (2026-10-03) |
 |---|---|
 | `master` | the working branch and GitHub's default; everything merged |
-| `firefox-nudge` | the Firefox readback workaround (2026-10-07), awaiting the owner's check |
 | `test-website`, `pub-website` | deploy branches ([deploy](how-to/deploy.md)) |
-| `bla`, `fix-glitches`, `gpu-recolour`, `interior-fix`, `palette-scroll`, `s-ceiling`, `wasm`, `better-gpu-v2`, `colors`, `continuous-generation`, `delta_performance`, `implement-deltas`, `performance`, `ref_orbit_list_prepend` | merged feature branches, kept as pointers |
+| `firefox-nudge`, `bla`, `fix-glitches`, `gpu-recolour`, `interior-fix`, `palette-scroll`, `s-ceiling`, `wasm`, `better-gpu-v2`, `colors`, `continuous-generation`, `delta_performance`, `implement-deltas`, `performance`, `ref_orbit_list_prepend` | merged feature branches, kept as pointers |
 | `deltas` (13 commits), `scaled_precision` (7), `f128` (4), `blur` (2), `better-gpu-v1`, `change-z`, `ill-fated`, `ref_orbit_list`, `simd` (1 each) | **unmerged** experiments, 2025-01 – 2026-06 (e.g. `simd` "BROKEN - WIP", `scaled_precision` "this was not to be") |
 
 ## Tests
