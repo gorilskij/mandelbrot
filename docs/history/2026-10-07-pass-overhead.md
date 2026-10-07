@@ -39,3 +39,22 @@ exact in f64). All 16 GPU tests pass, the BLA ones included.
 **Overall** (baseline → both): native ~1370 → ~850 ms, Firefox ~2450 → ~1360 ms, Chrome
 ~1820 → ~915 ms. What is left of the GPU's idle time: waiting on each dispatch beyond its
 compute, and collecting each pass's pixels ([backlog](../backlog.md)).
+
+**Does the CPU work scale with the GPU's?** (2026-10-07, browsers, one run each.) Three views:
+the default (2048 iterations), `bugs.txt`'s "black is not black" (1.05e-54, 32768 iterations,
+floatexp) and the GPU tests' view "b" (1.8e-92, 2⁻³⁰⁵, 32768 iterations). Opened from the URL
+hash, so generation 1 is the view itself.
+
+| | default | 1e-54 | 2⁻³⁰⁵ |
+|---|---|---|---|
+| total, Chrome / Firefox | 922 / 1483 ms | 5305 / 6220 ms | 2824 / 3316 ms |
+| pass 0, Chrome / Firefox (GPU busy) | 47 / – ms | 2341 / 2448 ms (2 %) | 1833 / 1918 ms (1 %) |
+| GPU busy in passes 3–6, Chrome / Firefox | 36–40 % / 24–28 % | 83–85 % / 73–77 % | 70–76 % / 60–63 % |
+
+The per-pixel CPU work does not grow with the iterations, so harder pixels raise the GPU's
+share of passes 1–6. What grows is pass 0, nearly all CPU, before and while the first pixels
+are computed: on the 1e-54 view in Chrome, 1.6 s in `run_generation` building the batch before
+the backend starts, then a provisional reference orbit (356 ms) and the wait for the nucleus
+search (325 ms). The 1.6 s is `group_list`: a bigfloat reference orbit per group of tiles,
+sequential, which only the CPU backend uses (`TileItem::refs`); the GPU backend never reads
+them ([backlog](../backlog.md)).

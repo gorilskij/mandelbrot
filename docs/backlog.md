@@ -64,6 +64,14 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
     2D ignores `colorSpace: "display-p3"`; WebGL2 accepts `drawingBufferColorSpace =
     "display-p3"` (unchecked whether it shows P3; moot while the window is sRGB).
 
+11. **Group reference orbits are computed for the GPU backend, which never uses them**
+    (2026-10-07, [history](history/2026-10-07-pass-overhead.md#the-cpu-work-between-passes-2026-10-07)):
+    `run_generation` builds each pass's batch with `group_list`, a sequential bigfloat orbit
+    per group of tiles, used only by the CPU backend (`TileItem::refs`). On hard views it is
+    most of pass 0: 1.6 s of the 1e-54 view's 2.3 s pass 0 in Chrome, with the GPU idle. Cached
+    across passes and generations with the same iteration count. To talk through: compute
+    them only when the CPU backend is the one running.
+
 ## Maintenance
 
 - **Move the pinned nightly forward** now and then ([update the toolchain](how-to/update-the-toolchain.md));
