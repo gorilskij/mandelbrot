@@ -49,6 +49,15 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
    in `src/main.rs`, `with_canvas`), which cancels every keyboard, wheel and context-menu
    event. Possible fix: `with_prevent_default(false)` and cancel only the events the app uses.
 
+10. **Colours differ in Firefox (web)**, reported 2026-10-07: Firefox's WebGPU canvas has no
+    `colorSpace`, so our Display P3 values are shown as sRGB: duller
+    ([web build](reference/web-build.md#how-it-runs)). Options, to talk through: accept it;
+    or detect the missing support and convert P3 → sRGB in the compositor's shader there
+    (same colours wherever sRGB can show them, clipped beyond). Other canvases in Firefox 157:
+    2D ignores `colorSpace: "display-p3"`; WebGL2 accepts `drawingBufferColorSpace =
+    "display-p3"` (whether it then shows P3 is unchecked), but would need a separate WebGL
+    output path.
+
 ## Maintenance
 
 - **Move the pinned nightly forward** now and then ([update the toolchain](how-to/update-the-toolchain.md));

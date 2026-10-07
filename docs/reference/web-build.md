@@ -40,7 +40,10 @@ and serving: [build the web version](../how-to/build-the-web-version.md); deploy
   (the native window title). The canvas size comes from the layout until winit's resize
   observer fires (`initial_size`). The surface is **Display P3**: natively the Metal layer has
   no colour space, so macOS shows the values unconverted (as P3 on a P3 display), and a
-  browser's sRGB default looked duller.
+  browser's sRGB default looked duller. **Firefox ignores it** (as of Firefox 157,
+  2026-10-07: `configure` never reads `colorSpace`, and `getConfiguration()` has none;
+  [bug 1846608](https://bugzilla.mozilla.org/show_bug.cgi?id=1846608), open since 2023), so
+  there the same values are shown as sRGB: duller than in Chrome ([backlog](../backlog.md)).
 - **Views in the URL:** `…/#<Cmd-C string>` opens that view, applied like a paste (for sharing
   views and reproducing them in a headless browser).
 - **Memory:** wasm32 has 4 GiB; the tile store has a 3 GiB ceiling there, which can lower s
