@@ -45,9 +45,6 @@ and serving: [build the web version](../how-to/build-the-web-version.md); deploy
   views and reproducing them in a headless browser).
 - **Memory:** wasm32 has 4 GiB; the tile store has a 3 GiB ceiling there, which can lower s
   ([tiles](tiles.md#the-memory-budget)).
-- **Firefox reads back slowly**: a `mapAsync` resolves ~100 ms after submit however little
-  the dispatch computes (measured in Zen, 2026-10-07), against ~30 ms chunks elsewhere. Chunk
-  sizing does not account for it yet ([backlog](../backlog.md)).
 - Logging goes to the browser console; clipboard copy/paste goes through the browser (which
   may ask for permission); some browser shortcuts win over the app's (Cmd-W; pinch or
   Ctrl-wheel zoom where the browser keeps the wheel event).
@@ -68,6 +65,19 @@ and serving: [build the web version](../how-to/build-the-web-version.md); deploy
 - **The release profile keeps debug info** (for native profiling), which would make the wasm
   too big for static assets (25 MiB per file); `cf-build.sh` turns it off for the deployed build.
 - `waker_interrupter` is a git dependency (the owner's own crate, public on GitHub).
+
+## Firefox reads back late
+
+Firefox's GPU process (as of Firefox 155, 2026-10) learns that GPU work has finished only
+from a timer that polls every 100 ms, or when the same device gets a `queue.submit`. Every
+`mapAsync` and `onSubmittedWorkDone` therefore resolves up to 100 ms late, however little the
+work computes: measured in Zen on 2026-10-07 as ~100 ms per 1024 px chunk of cheap pixels.
+Submitting an empty command buffer while waiting delivers the result at the next submit
+(another site measured 100 ms → 21 ms with one every 20 ms). Submits on another device (the
+compositor's) do not help. Mozilla's fix (a polling thread that waits only while work is in
+flight) is
+[bug 1870699](https://bugzilla.mozilla.org/show_bug.cgi?id=1870699), open as of 2026-09-24.
+Chunk sizing does not account for this yet ([backlog](../backlog.md)).
 
 ## Checked so far
 
