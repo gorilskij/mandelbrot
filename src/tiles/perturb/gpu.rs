@@ -1135,13 +1135,18 @@ impl Gpu {
         // ----------------------------------------------------------------
         let t_ref = web_time::Instant::now(); // DIAG
         let Some((mut reference, mut searching)) = state.initial_reference(ctx, &geom, int) else { return };
-        // Bound on |δ₀| over the whole pass, for the BLA table's radii.
+        // Bound on |δ₀| over the whole pass, for the BLA table's radii: the
+        // largest squared distance, one sqrt (a hypot per pixel cost ~140 ms
+        // per pass on the web).
         let pass_dc = |r: &Reference| {
             let (rx, ry) = ref_px(&r.c, ctx);
-            let max = pixel_refs.iter()
-                .map(|pr| (pr.col as f64 - rx).hypot(pr.row as f64 - ry))
+            let max2 = pixel_refs.iter()
+                .map(|pr| {
+                    let (dx, dy) = (pr.col as f64 - rx, pr.row as f64 - ry);
+                    dx * dx + dy * dy
+                })
                 .fold(0.0, f64::max);
-            log2_dc(&[(max, 0.0)], upp)
+            log2_dc(&[(max2.sqrt(), 0.0)], upp)
         };
         let t_prep = web_time::Instant::now(); // DIAG
         let mut gref = Arc::new(state.prepare(&reference, pass_dc(&reference), upp));
@@ -1887,16 +1892,15 @@ mod tests {
     /// GPU backend, then read the tiles back at the sample points. Returns
     /// the values per generation; `None` = pixel not stored.
     fn run_pipeline(v: &ViewSample, backend: &Gpu, store: &crate::tiles::store::TileStore, generations: usize) -> Vec<Vec<Option<u32>>> {
-        use crate::tiles::render::{GroupCache, run_generation};
+        use crate::tiles::render::run_generation;
         let mut out = vec![];
         for generation in 0..generations {
             if generation > 0 { store.clear(); } // what Space does to the tiles
-            let group_cache = parking_lot::Mutex::new(GroupCache::new());
             let (tx, rx) = waker_interrupter::channel::<()>();
             tx.send(());
             let mut tx = Some(tx);
             rx.run_multithreaded(None, None, |(), int| {
-                pollster::block_on(run_generation(store, &group_cache, v.ctx.width, v.ctx.height, &v.ctx.coords,
+                pollster::block_on(run_generation(store, v.ctx.width, v.ctx.height, &v.ctx.coords,
                     v.ctx.iterations, None, int, backend));
                 if let Some(tx) = tx.take() { tx.terminate(); }
             });

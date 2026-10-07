@@ -1,17 +1,21 @@
 //! CPU perturbation backend: f32 delta iteration with on-the-fly promotion of
 //! new reference orbits (the original algorithm). A glitched pixel computes
 //! its own high-precision orbit, projects it, and pushes it into the shared
-//! group list so later pixels reuse it.
+//! group list so later pixels reuse it. The group lists (one reference orbit
+//! per group of tiles to start from) are made here, on first use, so nothing
+//! is computed for this backend while the GPU one runs.
 
 use super::{BatchFuture, PassBatchCtx, Perturbator, RefList, RefOrbit, TileItem};
 use crate::rendering::{Pf, calculate_orbit, check_divergence_delta, check_orbit};
 use crate::tiles::store::{
-    GROUP_POW, GROUP_TILES, NUM_PASSES, TILE_SIZE, Tile, floor_div_pow2, pass_pixels,
+    GROUP_POW, GROUP_TILES, NUM_PASSES, TILE_SIZE, Tile, TileKey, floor_div_pow2, pass_pixels,
     pixel_to_coord, units_per_pixel, working_precision,
 };
 use dashu::integer::IBig;
 use itertools::iproduct;
 use num::Complex;
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use rayon::prelude::*;
 use std::num::NonZeroUsize;
 use waker_interrupter::MultiInterrupter;
@@ -20,7 +24,9 @@ use waker_interrupter::MultiInterrupter;
 const DETERMINISTIC: bool = false;
 
 /// CPU perturbation backend.
-pub struct Cpu;
+pub struct Cpu {
+    groups: Mutex<GroupCache>,
+}
 
 impl Perturbator for Cpu {
     fn render_pass_batch<'a>(
@@ -32,26 +38,114 @@ impl Perturbator for Cpu {
     ) -> BatchFuture<'a> {
         Box::pin(async move { self.render_pass(ctx, tiles, pass, int) })
     }
+
+    fn reset(&self) {
+        self.groups.lock().clear();
+    }
 }
 
 impl Cpu {
-    fn render_pass(&self, _ctx: &PassBatchCtx, tiles: &[TileItem], pass: u8, int: &MultiInterrupter) {
+    pub fn new() -> Self {
+        Cpu { groups: Mutex::new(GroupCache::new()) }
+    }
+
+    fn render_pass(&self, ctx: &PassBatchCtx, tiles: &[TileItem], pass: u8, int: &MultiInterrupter) {
+        let groups: Vec<GroupRef> = tiles.iter()
+            .map(|item| group_list(&self.groups, &group_of(&item.tile.key), ctx.iterations))
+            .collect();
         if DETERMINISTIC {
-            for item in tiles {
+            for (item, g) in tiles.iter().zip(&groups) {
                 if int.interrupted() { return; }
-                render_tile_pass(&item.tile, &item.refs, item.anchor_px, pass, _ctx.iterations, int);
+                render_tile_pass(&item.tile, &g.list, g.anchor_px, pass, ctx.iterations, int);
             }
         } else {
-            tiles.par_iter().for_each(|item| {
+            tiles.par_iter().zip(&groups).for_each(|(item, g)| {
                 if !int.interrupted() {
                     render_tile_pass(
-                        &item.tile, &item.refs, item.anchor_px,
-                        pass, _ctx.iterations, int,
+                        &item.tile, &g.list, g.anchor_px,
+                        pass, ctx.iterations, int,
                     );
                 }
             });
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Group reference lists
+// ---------------------------------------------------------------------------
+
+const GROUP_SIDE_PX: i64 = (GROUP_TILES * TILE_SIZE) as i64;
+const GROUP_CACHE_CAP: usize = 256;
+
+/// TEST: use a random point per group instead of the centre.
+const RANDOM_REFERENCE: bool = false;
+
+#[derive(Clone)]
+struct GroupRef {
+    list:      RefList,
+    anchor_px: (i64, i64),
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct GroupKey {
+    depth: i64,
+    gx:    IBig,
+    gy:    IBig,
+}
+
+fn group_of(key: &TileKey) -> GroupKey {
+    GroupKey {
+        depth: key.depth,
+        gx:    floor_div_pow2(&key.x, GROUP_POW),
+        gy:    floor_div_pow2(&key.y, GROUP_POW),
+    }
+}
+
+pub struct GroupCache {
+    iterations: usize,
+    map:        HashMap<GroupKey, GroupRef>,
+}
+
+impl GroupCache {
+    pub fn new() -> Self { Self { iterations: 0, map: HashMap::new() } }
+    pub fn clear(&mut self) { self.iterations = 0; self.map.clear(); }
+}
+
+fn group_list(cache: &Mutex<GroupCache>, gkey: &GroupKey, iterations: usize) -> GroupRef {
+    {
+        let c = cache.lock();
+        if c.iterations == iterations
+            && let Some(gref) = c.map.get(gkey) { return gref.clone(); }
+    }
+
+    let anchor_px = if RANDOM_REFERENCE {
+        let pick = || ((rand::random::<f64>() * GROUP_SIDE_PX as f64) as i64)
+            .clamp(0, GROUP_SIDE_PX - 1);
+        (pick(), pick())
+    } else {
+        (GROUP_SIDE_PX / 2, GROUP_SIDE_PX / 2)
+    };
+
+    let prec       = working_precision(gkey.depth);
+    let group_px   = IBig::from((GROUP_TILES * TILE_SIZE) as u64);
+    let anchor     = Complex {
+        re: pixel_to_coord(&gkey.gx * &group_px + IBig::from(anchor_px.0), gkey.depth, prec),
+        im: pixel_to_coord(&gkey.gy * &group_px + IBig::from(anchor_px.1), gkey.depth, prec),
+    };
+    let (_, orbit) = calculate_orbit(anchor, iterations);
+
+    let list = RefList::new();
+    list.push_front(RefOrbit { delta_corr: Complex::ZERO, orbit });
+    let gref = GroupRef { list, anchor_px };
+
+    let mut c = cache.lock();
+    if c.iterations != iterations {
+        c.iterations = iterations;
+        c.map.clear();
+    }
+    if c.map.len() >= GROUP_CACHE_CAP { c.map.clear(); }
+    c.map.entry(gkey.clone()).or_insert(gref).clone()
 }
 
 // ---------------------------------------------------------------------------

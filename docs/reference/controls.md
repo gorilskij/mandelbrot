@@ -39,5 +39,7 @@ modifiers, and the last key with what it did.
 
 Natively, logs go to stderr **and** `gpu.log` in the working directory (overwritten each
 launch, gitignored); the level defaults to `info`, `RUST_LOG` overrides it. On the web, to
-the browser console. `[diag gpu]` / `[diag tiles]` lines give per-pass and per-chunk timings,
-references, glitch rounds and result statistics.
+the browser console. `[diag gpu]` lines give per-pass and per-chunk timings, references,
+glitch rounds and per-chunk result statistics. `[diag tiles] gen G pass P done: … ms into
+the generation, … ms since the first` times a whole render, across the generations that
+restart it (e.g. after a resize): the "since the first" of the last pass.

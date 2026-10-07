@@ -23,10 +23,10 @@ src/
     renderer/multithreaded.rs the compute thread (compute_loop)
   tiles/
     store.rs                  grid math, passes, Tile, TileStore, the memory budget
-    render.rs                 run_generation, GroupCache
+    render.rs                 run_generation
     perturb/
       mod.rs                  the Perturbator trait, PassBatchCtx, TileItem, Toggle
-      cpu.rs                  the CPU backend
+      cpu.rs                  the CPU backend (and its per-group reference lists, GroupCache)
       gpu.rs                  the GPU backend (and its test module: harnesses, GPU tests)
       firefox_nudge.rs        web only: the Firefox readback workaround (to remove when Firefox is fixed)
       nucleus.rs              nucleus search

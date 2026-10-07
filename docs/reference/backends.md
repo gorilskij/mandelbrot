@@ -22,8 +22,7 @@ pub trait Perturbator {
 - `PassBatchCtx`: the view's coordinates, the tile-grid depth and origin, the screen size, the
   iteration count, and the store's `progress` counter (bumped after tiles finish mid-pass so
   the compositor picks them up).
-- `TileItem`: the tile, its group's CPU reference list (`refs`) and its offset in the group
-  (`anchor_px`); the GPU ignores the last two.
+- `TileItem`: the tile.
 - **`Toggle`** holds both backends and delegates by a shared `use_gpu: AtomicBool` (Escape
   flips it; it starts `true`).
 
@@ -40,7 +39,10 @@ a `waker_interrupter` channel. Natively a thread driven by `pollster`; on the we
 The original algorithm, kept as the second backend:
 
 - **f32 delta iteration** against reference orbits shared per **group** of 16 × 16 tiles
-  (`RefList`, an append-only list, in `GroupCache` in `render.rs`).
+  (`RefList`, an append-only list, in the backend's own `GroupCache`, `GROUP_CACHE_CAP` = 256
+  groups). A group's list starts with the orbit of its centre, computed when the backend first
+  needs it, so nothing is computed for it while the GPU backend runs; `reset` (Space, Escape)
+  clears the cache.
 - **A glitched pixel computes its own exact orbit** (`calculate_orbit`), and pushes it onto
   the front of its group's list so later pixels reuse it.
 - Tiles run in parallel with rayon `par_iter`; `DETERMINISTIC = true` makes it sequential, in a
