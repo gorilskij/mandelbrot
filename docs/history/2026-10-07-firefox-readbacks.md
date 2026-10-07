@@ -64,3 +64,20 @@ counted from the GPU finishing, not from the estimate. Next step in the [backlog
 Research found no report of Firefox computing slower per pixel; the one similar report
 ([wgpu#9199](https://github.com/gfx-rs/wgpu/issues/9199), "20× slower on Firefox") was the
 100 ms poll again.
+
+**The fix, the same day.** The nudge now starts 4 ms before an estimate from GPU timestamps
+(the owner's suggestion: a chunk that finishes early is caught, at the cost of about one more
+nudge), or at half of an estimate from submit → readback times, and chunks are sized from the
+timestamps where the device has them (+0.8 ms per dispatch, so cheap chunks do not make the
+next one huge). Reusing one timestamp pair made Firefox report the previous dispatch's
+timestamps in 35 of 191 dispatches (Chrome never); rotating over 16 pairs left only genuine
+near-zero readings. Default view, all 7 passes, two runs each:
+
+| | Firefox 157 | Chrome 154 |
+|---|---|---|
+| nudge from the estimate | 6.5, 11.4 s | 1.75, 1.80 s |
+| from before it, sized from timestamps | 2.14, 2.12 s; GPU busy ~40 % of submit → readback | 1.62, 1.58 s |
+| the same, timestamps off (a temporary override) | 2.15, 2.08 s | 1.64, 1.61 s |
+
+The earlier start did the work; timestamp sizing measured no faster here. Whether to keep it is
+open ([backlog](../backlog.md)). Longest dispatch: 52.6 ms of GPU time (Firefox).

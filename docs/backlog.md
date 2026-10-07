@@ -36,15 +36,13 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
    (store the message in an atomic slot, wake the receiver without blocking) and an
    atomic-flag interrupter check.
 
-8. **Chunks in Firefox are mostly waiting (web)**, found 2026-10-07 with GPU timestamps
-   ([web build](reference/web-build.md#firefox-reads-back-late)): the GPU work is 26–40 ns/px
-   (Chrome 23–26), but submit → readback is 170–490 ns/px (Chrome ~45), because the nudge
-   starts at an estimate made from past submit → readback times, which then cannot fall.
-   (Earlier the same day this was read as Firefox computing 4–25× slower; it is not.)
-   Options, to talk through: size chunks from the GPU timestamps where the adapter has them
-   (Firefox 155+, Chrome), so the estimate is the real GPU time and the nudge starts when the
-   GPU should be done; where it has none, start nudging at a fraction of the estimate so it can
-   fall. Optionally also fit time = a + b·n.
+8. **Sizing chunks from GPU timestamps: keep it?** **(owner)** Added 2026-10-07 with the
+   earlier nudge start, it measured no faster than the earlier start alone (Firefox 2.12–2.14 s
+   against 2.08–2.15 s with timestamps off; Chrome 1.58–1.62 against 1.61–1.64), and it also
+   changes native sizing, which has not been measured
+   ([web build](reference/web-build.md#firefox-reads-back-late)). Options: keep it (exact
+   costs, independent of readback delays), or size from submit → readback everywhere as before
+   and keep the timestamps for the diagnostics only.
 9. **The page swallows browser shortcuts and the context menu (web)**, reported 2026-10-07: in
    Firefox/Zen, right-click does nothing and Cmd-L (and likely other browser shortcuts) don't
    work over the canvas. Probably winit's web default `prevent_default = true` (canvas set up

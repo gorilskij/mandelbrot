@@ -94,6 +94,16 @@ const TARGET_CHUNK_MS: f64 = 30.0;
 /// pixels near a deep minibrot cost ~0.06 ms each, so even this is ~60 ms).
 const MIN_CHUNK_PX: usize = 1024;
 
+/// Fixed cost per dispatch added to its GPU timestamps when sizing chunks
+/// (the overhead MIN_CHUNK_PX speaks of): timestamps cover only the compute
+/// pass, so a chunk of cheap pixels would otherwise make the next one huge.
+const DISPATCH_OVERHEAD_MS: f64 = 0.8;
+
+/// Timestamp pairs used in turn by successive dispatches. Reusing one pair
+/// made Firefox 157 sometimes report the previous dispatch's timestamps
+/// (35 of 191 dispatches; never in Chrome).
+const TIMESTAMP_SLOTS: u32 = 16;
+
 /// First chunk of every pass: a small probe that measures the cost of the
 /// pixels nearest the cursor (usually the most expensive) before sizing the
 /// rest; the previous pass ended far from the cursor, where pixels are cheap.
@@ -352,9 +362,11 @@ pub struct GpuState {
     /// `max_storage_buffer_binding_size`; dispatches are chunked to stay under
     /// it (the delta buffer is the largest binding).
     max_binding: usize,
-    /// DIAG: a begin/end timestamp pair written by every dispatch, when the
-    /// device has `TIMESTAMP_QUERY`.
+    /// A begin/end timestamp pair written by every dispatch, when the device
+    /// has `TIMESTAMP_QUERY`; `wait` sizes chunks from it.
     timestamps:  Option<wgpu::QuerySet>,
+    /// Dispatches so far, choosing each one's pair in `timestamps`.
+    dispatches:  std::sync::atomic::AtomicU32,
     /// Best reference found so far, reused across passes and nearby views.
     reference:   Mutex<Option<Arc<Reference>>>,
     /// (centre, radius, iterations) of the last view whose centre-seeded
@@ -388,16 +400,17 @@ impl GpuState {
                 .await
                 .expect("no GPU adapter found");
 
-            // DIAG: GPU timestamps per dispatch, where the adapter has them.
+            // GPU timestamps per dispatch, where the adapter has them: chunk
+            // sizing uses them instead of submit → readback times.
             let ts_feature = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
             let (device, queue) = adapter
                 .request_device(&wgpu::DeviceDescriptor { required_features: ts_feature, ..Default::default() })
                 .await
                 .expect("failed to create GPU device");
             let timestamps = (!ts_feature.is_empty()).then(|| device.create_query_set(&wgpu::QuerySetDescriptor {
-                label: Some("dispatch_timestamps"), ty: wgpu::QueryType::Timestamp, count: 2,
+                label: Some("dispatch_timestamps"), ty: wgpu::QueryType::Timestamp, count: 2 * TIMESTAMP_SLOTS,
             }));
-            log::info!("[diag gpu] timestamp queries: {}", if timestamps.is_some() { "yes" } else { "no" }); // DIAG
+            log::info!("[diag gpu] timestamp queries: {}", if timestamps.is_some() { "yes" } else { "no" });
 
             let max_binding = device.limits().max_storage_buffer_binding_size as usize;
 
@@ -438,6 +451,7 @@ impl GpuState {
 
             GpuState {
                 device, queue, pipeline, pipeline_fe, bgl, max_binding, timestamps,
+                dispatches: Default::default(),
                 reference: Mutex::new(None),
                 failed_search: Mutex::new(None),
                 failed_glitch_search: Mutex::new(None),
@@ -617,9 +631,16 @@ impl GpuState {
         ((TARGET_CHUNK_MS / *self.ms_per_px.lock()) as usize).max(MIN_CHUNK_PX)
     }
 
-    /// Record a chunk's measured cost.  Tail chunks much smaller than the
-    /// floor are dominated by fixed overhead and would skew the estimate.
+    /// Record a chunk's submit → readback time, used for sizing only where
+    /// the device has no timestamps (`wait` records those): a readback can
+    /// arrive late (Firefox, see `firefox_nudge`), which would count as cost.
     fn record_chunk(&self, n_px: usize, ms: f64) {
+        if self.timestamps.is_none() { self.set_cost(n_px, ms); }
+    }
+
+    /// Set the cost per pixel from one dispatch. Tail chunks much smaller
+    /// than the floor are dominated by fixed overhead and would skew it.
+    fn set_cost(&self, n_px: usize, ms: f64) {
         if n_px >= MIN_CHUNK_PX / 4 {
             *self.ms_per_px.lock() = (ms / n_px as f64).max(1e-7);
         }
@@ -796,7 +817,7 @@ impl GpuState {
             contents: &vec![0xFFu8; output_size as usize],
             usage:    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
-        // DIAG: the dispatch's two timestamps go after the results.
+        // The dispatch's two timestamps go after the results.
         let ts_size = if self.timestamps.is_some() { 16 } else { 0 };
         let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label:              None,
@@ -817,12 +838,13 @@ impl GpuState {
             ],
         });
 
+        let slot = 2 * (self.dispatches.fetch_add(1, Ordering::Relaxed) % TIMESTAMP_SLOTS);
         let mut enc = device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: None,
                 timestamp_writes: self.timestamps.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
-                    query_set: qs, beginning_of_pass_write_index: Some(0), end_of_pass_write_index: Some(1),
+                    query_set: qs, beginning_of_pass_write_index: Some(slot), end_of_pass_write_index: Some(slot + 1),
                 }),
             });
             pass.set_pipeline(pipeline);
@@ -830,13 +852,13 @@ impl GpuState {
             pass.dispatch_workgroups(gx, gy, 1);
         }
         enc.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
-        if let Some(qs) = &self.timestamps { // DIAG
+        if let Some(qs) = &self.timestamps {
             let resolve = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None, size: 16,
                 usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
-            enc.resolve_query_set(qs, 0..2, &resolve, 0);
+            enc.resolve_query_set(qs, slot..slot + 2, &resolve, 0);
             enc.copy_buffer_to_buffer(&resolve, 0, &staging_buf, output_size, 16);
         }
         let t_submit = web_time::Instant::now(); // DIAG
@@ -857,7 +879,7 @@ impl GpuState {
         self.device.poll(wgpu::PollType::Wait { submission_index: Some(f.index), timeout: None }).unwrap();
         #[cfg(target_arch = "wasm32")]
         let nudges = super::firefox_nudge::wait(
-            &self.device, &self.queue, &mut f.mapped, f.expected.saturating_sub(f.t_submit.elapsed()),
+            &self.device, &self.queue, &mut f.mapped, f.expected, f.t_submit.elapsed(), self.timestamps.is_some(),
         ).await;
         #[cfg(not(target_arch = "wasm32"))]
         let nudges = 0;
@@ -866,10 +888,11 @@ impl GpuState {
         let staging_buf = f.staging;
         let slice = staging_buf.slice(..);
         let data = slice.get_mapped_range().expect("staging buffer mapped");
-        let gpu_ms = (data.len() > f.n * 4).then(|| { // DIAG
+        let gpu_ms = (data.len() > f.n * 4).then(|| {
             let t = data[f.n * 4..].as_chunks::<8>().0.iter().map(|b| u64::from_le_bytes(*b)).collect::<Vec<_>>();
             t[1].saturating_sub(t[0]) as f64 * self.queue.get_timestamp_period() as f64 / 1e6
         });
+        if let Some(g) = gpu_ms { self.set_cost(f.n, g + DISPATCH_OVERHEAD_MS); }
         log::info!( // DIAG
             "[diag gpu] dispatch {} px done {done_ms:.1} ms after submit (expected {:.1}), {nudges} nudges, prep {:.1} ms, gpu {}",
             f.n, f.expected.as_secs_f64() * 1e3, f.prep_ms,
@@ -931,8 +954,8 @@ struct InFlight {
     index:    wgpu::SubmissionIndex,
     /// fires once the staging buffer is mapped
     mapped:   crate::platform::Fired,
-    /// estimated GPU time (from `ms_per_px`), after which the web build
-    /// nudges the device (`firefox_nudge`)
+    /// estimated time to completion (from `ms_per_px`), around which the web
+    /// build starts nudging the device (`firefox_nudge`)
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     expected: std::time::Duration,
     n:        usize,

@@ -80,23 +80,23 @@ Submits on another device (the compositor's) do not help. Mozilla's fix (a polli
 waits only while work is in flight) is
 [bug 1870699](https://bugzilla.mozilla.org/show_bug.cgi?id=1870699), open as of 2026-09-24.
 
-**The workaround** (`src/tiles/perturb/firefox_nudge.rs`, web only): once a readback is late,
-past the chunk's estimated GPU time, submit an empty command buffer on the compute device
-every 4 ms until it arrives. No browser check: where readbacks arrive on time (Chrome, and
-Firefox once fixed) it rarely fires. The `[diag gpu] dispatch` log line shows the expected
-time and the nudges per dispatch. Measured 2026-10-07 (M2 Pro, default view, all 7 passes):
+**The workaround** (`src/tiles/perturb/firefox_nudge.rs`, web only): submit an empty command
+buffer on the compute device every 4 ms from shortly before the chunk's estimated completion
+until the readback arrives: 4 ms before an estimate from GPU timestamps, or at half of one from
+submit → readback times (that estimate includes Firefox's lateness, and must be able to fall:
+nudging only from the estimate itself left the GPU busy ~10 % of each chunk). No browser check:
+where readbacks arrive on time it fires about once per chunk. The `[diag gpu] dispatch` log
+line shows the estimate and the nudges. Measured 2026-10-07 (M2 Pro, default view, all 7
+passes, two runs each):
 
-| | Firefox 157 | Chrome |
+| | Firefox 157 | Chrome 154 |
 |---|---|---|
-| before | ~10k px/s, chunks at the 1024 px floor at ~100 ms each; pass 2 after 40 s | 1.71–1.74 s |
-| with the nudge | 6.5–11.4 s, chunks up to ~650k px at ~30 ms, ~1 nudge each | 1.75–1.80 s, ~0 nudges after the first chunk |
+| no nudge | ~10k px/s, chunks at the 1024 px floor at ~100 ms each; pass 2 after 40 s | 1.71–1.74 s |
+| nudge from the estimate | 6.5–11.4 s | 1.75–1.80 s |
+| nudge from before it, sized from timestamps | 2.12–2.14 s | 1.58–1.62 s |
+| the same, timestamps off | 2.08–2.15 s | 1.61–1.64 s |
 
-**The nudge still leaves Firefox waiting ~90 % of each chunk.** GPU timestamps (2026-10-07,
-passes 2–6 of the default view) put the GPU work at 26–40 ns/px in Firefox against
-23–26 ns/px in Chrome, but submit → readback at 170–490 ns/px against ~45. The nudge starts
-only at the estimated time, and the estimate is the last chunks' submit → readback time, so in
-Firefox a result rarely arrives earlier than estimated and the estimate cannot fall to the
-real cost ([backlog](../backlog.md)).
+The GPU work itself is 26–40 ns/px in Firefox against 23–26 in Chrome (timestamps, passes 2–6).
 
 ## Checked so far
 
