@@ -48,6 +48,12 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
      workaround; removable once Firefox fixes its bug);
    - fit time = a + b·n and size chunks from b only;
    - keep several chunks in flight (each submit then also delivers earlier results).
+   Agreed 2026-10-07: the workaround stays quarantined (one marked place, easy to strip
+   when Firefox is fixed). Sizing with it: a fixed delay a per chunk settles chunks at
+   b·n = TARGET_CHUNK_MS − a (n_next = 30·n/(b·n + a)), so it only collapses to the floor when
+   a ≥ 30 ms; a nudge every ~4 ms (also the browsers' clamp on nested timers) costs ~10%.
+   Exact alternative: `timestamp-query` for real GPU time (Firefox 155 has it), optional with
+   a fallback.
 9. **The page swallows browser shortcuts and the context menu (web)**, reported 2026-10-07: in
    Firefox/Zen, right-click does nothing and Cmd-L (and likely other browser shortcuts) don't
    work over the canvas. Probably winit's web default `prevent_default = true` (canvas set up
