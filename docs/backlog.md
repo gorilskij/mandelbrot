@@ -36,13 +36,23 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
    (store the message in an atomic slot, wake the receiver without blocking) and an
    atomic-flag interrupter check.
 
-8. **Sizing chunks from GPU timestamps: keep it?** **(owner)** Added 2026-10-07 with the
-   earlier nudge start, it measured no faster than the earlier start alone (Firefox 2.12–2.14 s
-   against 2.08–2.15 s with timestamps off; Chrome 1.58–1.62 against 1.61–1.64), and it also
-   changes native sizing, which has not been measured
-   ([web build](reference/web-build.md#firefox-reads-back-late)). Options: keep it (exact
-   costs, independent of readback delays), or size from submit → readback everywhere as before
-   and keep the timestamps for the diagnostics only.
+8. **The GPU idles most of a render**, measured 2026-10-07 (default view, temporary timers,
+   reverted): GPU compute is 15–24 % of the time the compute thread spends. Per render:
+
+   | ms | Firefox 157 | Chrome 154 | native |
+   |---|---|---|---|
+   | GPU compute (timestamps) | 330 | 328 | 305 |
+   | waiting on dispatches (submit → readback) | 916 | 632 | 503 |
+   | `log_tile_colors` (DIAG, after each pass, hashes every pixel) | 535 | 468 | 468 |
+   | `pass_dc` (a `hypot` per pixel, for the BLA radius bound) | 569 | 472 | 47 |
+   | collecting the pass's pixels | 136 | 108 | 241 |
+
+   (Native: a 3000×2000 window, 18.4M px against 14.2M, and one restarted generation.)
+   Candidates, to talk through: make `log_tile_colors` cheap or skip it unless asked for (it
+   is diagnostics); `pass_dc` from squared distances (one `sqrt`) or the pixels' bounding
+   box; then the rest of each dispatch's wait (four buffers created per dispatch, the
+   `NOT_RUN` fill uploaded, a new staging buffer; in Firefox also the nudge's granularity), and
+   the CPU work between passes, during which the GPU has nothing queued.
 9. **The page swallows browser shortcuts and the context menu (web)**, reported 2026-10-07: in
    Firefox/Zen, right-click does nothing and Cmd-L (and likely other browser shortcuts) don't
    work over the canvas. Probably winit's web default `prevent_default = true` (canvas set up

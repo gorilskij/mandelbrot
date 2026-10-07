@@ -79,5 +79,6 @@ near-zero readings. Default view, all 7 passes, two runs each:
 | from before it, sized from timestamps | 2.14, 2.12 s; GPU busy ~40 % of submit → readback | 1.62, 1.58 s |
 | the same, timestamps off (a temporary override) | 2.15, 2.08 s | 1.64, 1.61 s |
 
-The earlier start did the work; timestamp sizing measured no faster here. Whether to keep it is
-open ([backlog](../backlog.md)). Longest dispatch: 52.6 ms of GPU time (Firefox).
+The earlier start did the work; timestamp sizing measured no faster here. The owner kept it
+anyway (exact costs, independent of readback delays); its effect on native sizing has not been
+measured. Longest dispatch: 52.6 ms of GPU time (Firefox).
