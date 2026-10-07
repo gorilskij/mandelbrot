@@ -69,8 +69,11 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
     `run_generation` builds each pass's batch with `group_list`, a sequential bigfloat orbit
     per group of tiles, used only by the CPU backend (`TileItem::refs`). On hard views it is
     most of pass 0: 1.6 s of the 1e-54 view's 2.3 s pass 0 in Chrome, with the GPU idle. Cached
-    across passes and generations with the same iteration count. To talk through: compute
-    them only when the CPU backend is the one running.
+    across passes and generations with the same iteration count, up to `GROUP_CACHE_CAP` = 256
+    orbits held in memory (f32 pairs: 256 KiB each at 32768 iterations). Apart from this the CPU
+    backend is dormant while the GPU runs (`Cpu` is a stateless unit struct; the rayon pool is
+    shared). Agreed 2026-10-07 that it must change; how, to talk through: let the CPU backend
+    fetch its group lists itself (pass it the cache instead of `TileItem::refs`).
 
 ## Maintenance
 
