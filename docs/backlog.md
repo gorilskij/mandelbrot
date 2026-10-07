@@ -48,8 +48,8 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
    | collecting the pass's pixels | 136 | 108 | 241 |
 
    (Native: a 3000×2000 window, 18.4M px against 14.2M, and one restarted generation.)
-   Candidates, to talk through: make `log_tile_colors` cheap or skip it unless asked for (it
-   is diagnostics); `pass_dc` from squared distances (one `sqrt`) or the pixels' bounding
+   `log_tile_colors` is gone ([history](history/2026-10-07-pass-overhead.md)). Candidates,
+   to talk through: `pass_dc` from squared distances (one `sqrt`) or the pixels' bounding
    box; then the rest of each dispatch's wait (four buffers created per dispatch, the
    `NOT_RUN` fill uploaded, a new staging buffer; in Firefox also the nudge's granularity), and
    the CPU work between passes, during which the GPU has nothing queued.

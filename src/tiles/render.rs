@@ -193,7 +193,6 @@ pub async fn run_generation(
 
         backend.render_pass_batch(&ctx, &batch, pass, &int).await;
         store.bump_progress();
-        log_tile_colors(generation, pass, &tiles);
         info!( // DIAG
             "[diag tiles] gen {generation} pass {pass} done: {:.0} ms into the generation, {:.0} ms since the first",
             t_gen.elapsed().as_secs_f64() * 1e3, t_first.elapsed().as_secs_f64() * 1e3,
@@ -206,32 +205,3 @@ pub async fn run_generation(
 /// DIAG: when the first generation started, for timing a whole render
 /// across the generations that restart it.
 static FIRST_GENERATION: std::sync::OnceLock<web_time::Instant> = std::sync::OnceLock::new();
-
-/// DIAG: backend-agnostic check of what actually landed in the visible tiles
-/// after a pass: how many pixels are set, how many distinct colours, and the
-/// share of the most common one (values are escape iterations). A
-/// "monochrome screen" shows up as distinct≈1–2 here if the compute side
-/// produced it.
-fn log_tile_colors(
-    generation: impl std::fmt::Display,
-    pass:       u8,
-    tiles:      &[(OrderedFloat<f64>, Arc<crate::tiles::store::Tile>)],
-) {
-    let mut counts = HashMap::<u32, usize>::new();
-    let mut unset  = 0usize;
-    for (_, tile) in tiles {
-        for idx in 0..crate::tiles::store::TILE_LEN {
-            match tile.load(idx).get() {
-                Some(c) => *counts.entry(c).or_default() += 1,
-                None    => unset += 1,
-            }
-        }
-    }
-    let set: usize = counts.values().sum();
-    let (top, top_n) = counts.iter().max_by_key(|(_, n)| **n).map(|(c, n)| (*c, *n)).unwrap_or((0, 0));
-    info!(
-        "[diag tiles] gen {generation} pass {pass}: {} tiles, set {set}, unset {unset}, \
-         distinct values {}, top value {top} @ {:.1}%",
-        tiles.len(), counts.len(), 100.0 * top_n as f64 / set.max(1) as f64,
-    );
-}
