@@ -61,8 +61,21 @@ later one by f32 rounding in a few pixels (1 of 15000 at 2⁻³⁰⁵).
   ([precision](precision.md)).
 - **Chunks:** a pass's pixels are collected in cursor order and dispatched in chunks of about
   `TARGET_CHUNK_MS` = 30 ms: a `PROBE_CHUNK_PX` = 2048 probe first, then sized from the last
-  chunk's measured ms per pixel, floor `MIN_CHUNK_PX` = 1024 (each dispatch costs ~0.8 ms
-  fixed). The interrupt is checked between chunks; in-flight GPU work cannot be cancelled.
+  measured ms per pixel, floor `MIN_CHUNK_PX` = 1024. The interrupt is checked between chunks;
+  in-flight GPU work cannot be cancelled.
+- **The cost per pixel** (`ms_per_px`): where the device has `TIMESTAMP_QUERY` (requested when
+  available), each dispatch's compute-pass time from a begin/end timestamp pair plus
+  `DISPATCH_OVERHEAD_MS` = 0.8 (without it a chunk of cheap pixels would make the next one
+  huge), set in `wait`. The pairs rotate over `TIMESTAMP_SLOTS` = 16: reusing one made Firefox
+  report the previous dispatch's. Otherwise a chunk's submit → readback time (`record_chunk`),
+  where any readback delay counts as cost: a fixed delay a settles chunks at b·n = 30 ms − a,
+  and at a ≥ 30 ms they collapse to the floor ([web build](web-build.md#firefox-reads-back-late)).
+- **Waiting for a readback on the web** (`wait`): `firefox_nudge` submits an empty command
+  buffer every 4 ms from shortly before the estimated completion (`ms_per_px` × pixels, kept in
+  `InFlight::expected`) until the result arrives. Natively `wait` blocks in `device.poll`.
+- **Diagnostics per dispatch** (the `[diag gpu] dispatch` line): submit → readback time, the
+  estimate, nudges, `prep` (buffer creation and encoding before the submit) and `gpu` (the
+  timestamps, where available).
 - **Per chunk:** dispatch → glitch rounds (up to `MAX_GLITCH_PASSES` = 8, each against a
   better reference) → residual exact resolve on the CPU (`calculate_orbit` + `check_orbit`,
   in parallel, interruptible) → store → finish every tile whose pixels are all stored → bump

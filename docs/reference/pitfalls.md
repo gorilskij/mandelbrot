@@ -41,6 +41,10 @@ Traps this project has fallen into, or nearly. Each: the symptom, the cause, wha
 - **GPU objects are `!Send` on the web**: each thread makes its own.
 - **The wasm-bindgen CLI must match the library exactly**: keep `Cargo.lock` committed;
   `build.sh` installs the matching CLI.
+- **Firefox delivers readbacks only on its 100 ms poll or a submit**: `firefox_nudge.rs`
+  works around it. Remove that file (and its call in `wait`) once Firefox ships
+  [bug 1870699](https://bugzilla.mozilla.org/show_bug.cgi?id=1870699); the sign is
+  readbacks arriving with 0 nudges in Firefox ([web build](web-build.md#firefox-reads-back-late)).
 - **The release profile keeps debug info**: a deployed build must turn it off (static assets
   reject files over 25 MiB). `cf-build.sh` does.
 

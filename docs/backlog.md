@@ -36,34 +36,50 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
    (store the message in an atomic slot, wake the receiver without blocking) and an
    atomic-flag interrupter check.
 
-8. **Slow on Firefox (web)**, reported 2026-10-07. Measured in Zen (Firefox) that day: chunks
-   stuck at the 1024 px floor, each taking ~100 ms from submit to readback, for cheap pixels
-   (escaped by iteration 51, so the computation itself takes about a millisecond). Cause:
-   Firefox's GPU process polls for finished GPU work on a 100 ms timer, and the other trigger is
-   a `queue.submit` on the same device
-   ([web build](reference/web-build.md#firefox-reads-back-late)). With one chunk in flight,
-   `record_chunk` counts that delay as cost per pixel, so `chunk_len` shrinks to `MIN_CHUNK_PX`
-   and the GPU mostly idles: about 10k px/s. Candidate fixes, to talk through:
-   - submit an empty command buffer every few ms while a readback is pending (the known
-     workaround; removable once Firefox fixes its bug);
-   - fit time = a + b·n and size chunks from b only;
-   - keep several chunks in flight (each submit then also delivers earlier results).
-   Agreed 2026-10-07: the workaround stays quarantined (one marked place, easy to strip
-   when Firefox is fixed). Sizing with it: a fixed delay a per chunk settles chunks at
-   b·n = TARGET_CHUNK_MS − a (n_next = 30·n/(b·n + a)), so it only collapses to the floor when
-   a ≥ 30 ms; a nudge every ~4 ms (also the browsers' clamp on nested timers) costs ~10%.
-   Exact alternative: `timestamp-query` for real GPU time (Firefox 155 has it), optional with
-   a fallback.
+8. **The GPU idles most of a render**, measured 2026-10-07 (default view, temporary timers,
+   reverted): GPU compute is 15–24 % of the time the compute thread spends. Per render:
+
+   | ms | Firefox 157 | Chrome 154 | native |
+   |---|---|---|---|
+   | GPU compute (timestamps) | 330 | 328 | 305 |
+   | waiting on dispatches (submit → readback) | 916 | 632 | 503 |
+   | `log_tile_colors` (DIAG, after each pass, hashes every pixel) | 535 | 468 | 468 |
+   | `pass_dc` (a `hypot` per pixel, for the BLA radius bound) | 569 | 472 | 47 |
+   | collecting the pass's pixels | 136 | 108 | 241 |
+
+   (Native: a 3000×2000 window, 18.4M px against 14.2M, and one restarted generation.)
+   Candidates, to talk through: make `log_tile_colors` cheap or skip it unless asked for (it
+   is diagnostics); `pass_dc` from squared distances (one `sqrt`) or the pixels' bounding
+   box; then the rest of each dispatch's wait (four buffers created per dispatch, the
+   `NOT_RUN` fill uploaded, a new staging buffer; in Firefox also the nudge's granularity), and
+   the CPU work between passes, during which the GPU has nothing queued.
 9. **The page swallows browser shortcuts and the context menu (web)**, reported 2026-10-07: in
    Firefox/Zen, right-click does nothing and Cmd-L (and likely other browser shortcuts) don't
    work over the canvas. Probably winit's web default `prevent_default = true` (canvas set up
    in `src/main.rs`, `with_canvas`), which cancels every keyboard, wheel and context-menu
    event. Possible fix: `with_prevent_default(false)` and cancel only the events the app uses.
 
+10. **Colours differ in Firefox (web)** — TODO (owner, 2026-10-07): convert P3 → sRGB where unsupported. Reported 2026-10-07: Firefox's WebGPU canvas has no
+    `colorSpace`, so our Display P3 values are shown as sRGB: duller
+    ([web build](reference/web-build.md#how-it-runs)). Firefox has no wide gamut anywhere
+    yet: on macOS it tags its windows sRGB by default (`gfx.color_management.native_srgb`),
+    so even CSS `color(display-p3 …)` is clipped to sRGB; Mozilla's wide-gamut work
+    ([bug 1626624](https://bugzilla.mozilla.org/show_bug.cgi?id=1626624)) has no date. The
+    usual practice (three.js, for one): colour in a working space, convert to the output space
+    in the final shader, and request `display-p3` only where `getConfiguration()` reports it
+    (some add `matchMedia("(color-gamut: p3)")`). For us: detect the missing support and
+    convert P3 → sRGB in the compositor's shader (linearise, 3×3 matrix, clip, re-encode):
+    the same colours as Chrome wherever sRGB can show them. Other canvases in Firefox 157:
+    2D ignores `colorSpace: "display-p3"`; WebGL2 accepts `drawingBufferColorSpace =
+    "display-p3"` (unchecked whether it shows P3; moot while the window is sRGB).
+
 ## Maintenance
 
 - **Move the pinned nightly forward** now and then ([update the toolchain](how-to/update-the-toolchain.md));
   `+atomics` is being phased out, so a newer one may need changes to the web build.
+- **Remove the Firefox readback workaround** (`firefox_nudge.rs`) once Firefox ships
+  [bug 1870699](https://bugzilla.mozilla.org/show_bug.cgi?id=1870699)
+  ([pitfalls](reference/pitfalls.md#the-web)).
 - **Publish `waker_interrupter`** (e.g. on crates.io) and depend on a version instead of the
   git repo (`Cargo.toml` TODO).
 - **Check deep zoom in a browser**: the floatexp pipeline, BLA and the nucleus search at depth

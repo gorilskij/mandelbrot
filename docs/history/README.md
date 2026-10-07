@@ -10,6 +10,7 @@ say what is true now; this says how it came to be. Newest last.
 | 2026-09-23 – 24 | [Deep zoom on the GPU](2026-09-23-deep-zoom-on-the-gpu.md) — nucleus references, chunked dispatch, rebasing, interior detection, BLA, the floatexp orbit, background search, s and antialiasing |
 | 2026-09-25 – 26 | [Palette scrolling, GPU colouring, the web build](2026-09-25-colouring-and-the-web.md) — chunks of array textures, the wasm memory ceiling, WebGPU and Web Workers, the interior return test |
 | 2026-10-02 – 03 | [Hosting on Workers, and these docs](2026-10-02-workers-and-docs.md) — `gorilskij.com/mandelbrot/`; `docs/` |
+| 2026-10-07 | [Firefox's late readbacks](2026-10-07-firefox-readbacks.md) — the 100 ms poll, the empty-submit nudge |
 
 The notes these entries were drawn from are kept verbatim:
 [working notes as of 2026-10-03](working-notes-2026-10-03.md).

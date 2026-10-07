@@ -28,6 +28,7 @@ src/
       mod.rs                  the Perturbator trait, PassBatchCtx, TileItem, Toggle
       cpu.rs                  the CPU backend
       gpu.rs                  the GPU backend (and its test module: harnesses, GPU tests)
+      firefox_nudge.rs        web only: the Firefox readback workaround (to remove when Firefox is fixed)
       nucleus.rs              nucleus search
       bla.rs                  the BLA table
       shaders/                floatexp.wgsl, perturb_common.wgsl, perturbation.wgsl, perturbation_floatexp.wgsl

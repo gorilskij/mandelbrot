@@ -40,7 +40,10 @@ and serving: [build the web version](../how-to/build-the-web-version.md); deploy
   (the native window title). The canvas size comes from the layout until winit's resize
   observer fires (`initial_size`). The surface is **Display P3**: natively the Metal layer has
   no colour space, so macOS shows the values unconverted (as P3 on a P3 display), and a
-  browser's sRGB default looked duller.
+  browser's sRGB default looked duller. **Firefox ignores it** (as of Firefox 157,
+  2026-10-07: `configure` never reads `colorSpace`, and `getConfiguration()` has none;
+  [bug 1846608](https://bugzilla.mozilla.org/show_bug.cgi?id=1846608), open since 2023), so
+  there the same values are shown as sRGB: duller than in Chrome ([backlog](../backlog.md)).
 - **Views in the URL:** `…/#<Cmd-C string>` opens that view, applied like a paste (for sharing
   views and reproducing them in a headless browser).
 - **Memory:** wasm32 has 4 GiB; the tile store has a 3 GiB ceiling there, which can lower s
@@ -72,12 +75,28 @@ Firefox's GPU process (as of Firefox 155, 2026-10) learns that GPU work has fini
 from a timer that polls every 100 ms, or when the same device gets a `queue.submit`. Every
 `mapAsync` and `onSubmittedWorkDone` therefore resolves up to 100 ms late, however little the
 work computes: measured in Zen on 2026-10-07 as ~100 ms per 1024 px chunk of cheap pixels.
-Submitting an empty command buffer while waiting delivers the result at the next submit
-(another site measured 100 ms → 21 ms with one every 20 ms). Submits on another device (the
-compositor's) do not help. Mozilla's fix (a polling thread that waits only while work is in
-flight) is
+Submitting an empty command buffer while waiting delivers the result at the next submit.
+Submits on another device (the compositor's) do not help. Mozilla's fix (a polling thread that
+waits only while work is in flight) is
 [bug 1870699](https://bugzilla.mozilla.org/show_bug.cgi?id=1870699), open as of 2026-09-24.
-Chunk sizing does not account for this yet ([backlog](../backlog.md)).
+
+**The workaround** (`src/tiles/perturb/firefox_nudge.rs`, web only): submit an empty command
+buffer on the compute device every 4 ms from shortly before the chunk's estimated completion
+until the readback arrives: 4 ms before an estimate from GPU timestamps, or at half of one from
+submit → readback times (that estimate includes Firefox's lateness, and must be able to fall:
+nudging only from the estimate itself left the GPU busy ~10 % of each chunk). No browser check:
+where readbacks arrive on time it fires about once per chunk. The `[diag gpu] dispatch` log
+line shows the estimate and the nudges. Measured 2026-10-07 (M2 Pro, default view, all 7
+passes, two runs each):
+
+| | Firefox 157 | Chrome 154 |
+|---|---|---|
+| no nudge | ~10k px/s, chunks at the 1024 px floor at ~100 ms each; pass 2 after 40 s | 1.71–1.74 s |
+| nudge from the estimate | 6.5–11.4 s | 1.75–1.80 s |
+| nudge from before it, sized from timestamps | 2.12–2.14 s | 1.58–1.62 s |
+| the same, timestamps off | 2.08–2.15 s | 1.61–1.64 s |
+
+The GPU work itself is 26–40 ns/px in Firefox against 23–26 in Chrome (timestamps, passes 2–6).
 
 ## Checked so far
 

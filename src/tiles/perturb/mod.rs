@@ -11,6 +11,8 @@
 
 pub mod bla;
 pub mod cpu;
+#[cfg(target_arch = "wasm32")]
+mod firefox_nudge;
 pub mod gpu;
 pub mod nucleus;
 
