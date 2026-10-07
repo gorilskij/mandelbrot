@@ -49,7 +49,7 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
    in `src/main.rs`, `with_canvas`), which cancels every keyboard, wheel and context-menu
    event. Possible fix: `with_prevent_default(false)` and cancel only the events the app uses.
 
-10. **Colours differ in Firefox (web)**, reported 2026-10-07: Firefox's WebGPU canvas has no
+10. **Colours differ in Firefox (web)** — TODO (owner, 2026-10-07): convert P3 → sRGB where unsupported. Reported 2026-10-07: Firefox's WebGPU canvas has no
     `colorSpace`, so our Display P3 values are shown as sRGB: duller
     ([web build](reference/web-build.md#how-it-runs)). Firefox has no wide gamut anywhere
     yet: on macOS it tags its windows sRGB by default (`gfx.color_management.native_srgb`),
