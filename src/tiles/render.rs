@@ -1,97 +1,17 @@
 //! Tile rendering orchestration: enumerate the tiles intersecting the
-//! viewport, manage the per-group reference lists, and drive the progressive
-//! passes. The actual per-pixel work is delegated to a `Perturbator` backend
+//! viewport and drive the progressive passes. The actual per-pixel work is delegated to a `Perturbator` backend
 //! via `render_pass_batch` — one call per pass with *all* tiles that need it.
 
-use crate::rendering::{CoordinatesBox, Pixels, calculate_orbit};
+use crate::rendering::{CoordinatesBox, Pixels};
 use crate::support::Point;
-use crate::tiles::perturb::{PassBatchCtx, Perturbator, RefList, RefOrbit, TileItem};
-use crate::tiles::store::{
-    GROUP_POW, GROUP_TILES, NUM_PASSES, TILE_SIZE, TileKey, TileStore,
-    floor_div_pow2, pixel_to_coord, tile_index, units_per_pixel, working_precision,
-};
+use crate::tiles::perturb::{PassBatchCtx, Perturbator, TileItem};
+use crate::tiles::store::{NUM_PASSES, TILE_SIZE, TileKey, TileStore, tile_index, units_per_pixel};
 use dashu::integer::IBig;
 use itertools::iproduct;
 use log::info;
-use num::Complex;
 use ordered_float::OrderedFloat;
-use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::sync::Arc;
 use waker_interrupter::MultiInterrupter;
-
-const GROUP_SIDE_PX: i64 = (GROUP_TILES * TILE_SIZE) as i64;
-const GROUP_CACHE_CAP: usize = 256;
-
-/// TEST: use a random point per group instead of the centre.
-const RANDOM_REFERENCE: bool = false;
-
-#[derive(Clone)]
-struct GroupRef {
-    list:      RefList,
-    anchor_px: (i64, i64),
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct GroupKey {
-    depth: i64,
-    gx:    IBig,
-    gy:    IBig,
-}
-
-fn group_of(key: &TileKey) -> GroupKey {
-    GroupKey {
-        depth: key.depth,
-        gx:    floor_div_pow2(&key.x, GROUP_POW),
-        gy:    floor_div_pow2(&key.y, GROUP_POW),
-    }
-}
-
-pub struct GroupCache {
-    iterations: usize,
-    map:        HashMap<GroupKey, GroupRef>,
-}
-
-impl GroupCache {
-    pub fn new() -> Self { Self { iterations: 0, map: HashMap::new() } }
-    pub fn clear(&mut self) { self.iterations = 0; self.map.clear(); }
-}
-
-fn group_list(cache: &Mutex<GroupCache>, gkey: &GroupKey, iterations: usize) -> GroupRef {
-    {
-        let c = cache.lock();
-        if c.iterations == iterations
-            && let Some(gref) = c.map.get(gkey) { return gref.clone(); }
-    }
-
-    let anchor_px = if RANDOM_REFERENCE {
-        let pick = || ((rand::random::<f64>() * GROUP_SIDE_PX as f64) as i64)
-            .clamp(0, GROUP_SIDE_PX - 1);
-        (pick(), pick())
-    } else {
-        (GROUP_SIDE_PX / 2, GROUP_SIDE_PX / 2)
-    };
-
-    let prec       = working_precision(gkey.depth);
-    let group_px   = IBig::from((GROUP_TILES * TILE_SIZE) as u64);
-    let anchor     = Complex {
-        re: pixel_to_coord(&gkey.gx * &group_px + IBig::from(anchor_px.0), gkey.depth, prec),
-        im: pixel_to_coord(&gkey.gy * &group_px + IBig::from(anchor_px.1), gkey.depth, prec),
-    };
-    let (_, orbit) = calculate_orbit(anchor, iterations);
-
-    let list = RefList::new();
-    list.push_front(RefOrbit { delta_corr: Complex::ZERO, orbit });
-    let gref = GroupRef { list, anchor_px };
-
-    let mut c = cache.lock();
-    if c.iterations != iterations {
-        c.iterations = iterations;
-        c.map.clear();
-    }
-    if c.map.len() >= GROUP_CACHE_CAP { c.map.clear(); }
-    c.map.entry(gkey.clone()).or_insert(gref).clone()
-}
 
 /// Render all tiles visible in `coords`, coarse-to-fine, returning early when
 /// interrupted. For each progressive pass the entire set of tiles needing that
@@ -99,7 +19,6 @@ fn group_list(cache: &Mutex<GroupCache>, gkey: &GroupKey, iterations: usize) -> 
 /// (see `BatchFuture`).
 pub async fn run_generation(
     store:       &TileStore,
-    group_cache: &Mutex<GroupCache>,
     width:       usize,
     height:      usize,
     coords:      &CoordinatesBox,
@@ -110,7 +29,6 @@ pub async fn run_generation(
 ) {
     if store.take_reset() {
         store.clear();
-        group_cache.lock().clear();
         backend.reset();
         info!("reset: dumped all tiles, reference lists and the GPU's cached reference");
     }
@@ -179,14 +97,7 @@ pub async fn run_generation(
         let batch: Vec<TileItem> = tiles
             .iter()
             .filter(|(_, tile)| tile.passes_done() <= pass)
-            .map(|(_, tile)| {
-                let gref = group_list(group_cache, &group_of(&tile.key), iterations);
-                TileItem {
-                    tile:      tile.clone(),
-                    refs:      gref.list,
-                    anchor_px: gref.anchor_px,
-                }
-            })
+            .map(|(_, tile)| TileItem { tile: tile.clone() })
             .collect();
 
         if batch.is_empty() { continue; }

@@ -63,11 +63,7 @@ pub struct PassBatchCtx {
 
 /// One tile's entry in a batch.
 pub struct TileItem {
-    pub tile:      Arc<Tile>,
-    /// CPU uses this to look up existing reference orbits.
-    pub refs:      RefList,
-    /// CPU uses this — pixel offset of the group anchor within the group.
-    pub anchor_px: (i64, i64),
+    pub tile: Arc<Tile>,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,7 +106,7 @@ pub struct Toggle {
 
 impl Toggle {
     pub fn new(gpu: Gpu, use_gpu: Arc<AtomicBool>) -> Self {
-        Toggle { cpu: Cpu, gpu, use_gpu }
+        Toggle { cpu: Cpu::new(), gpu, use_gpu }
     }
 }
 

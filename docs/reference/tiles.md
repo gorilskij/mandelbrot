@@ -37,7 +37,7 @@ the cursor, before the next starts (the owner rejected ring-by-ring refinement, 
 `run_generation` (`render.rs`) is one render of a requested view: it lists the visible tiles,
 retargets and seeds them, sorts them by distance from the cursor, then for each pass calls
 `backend.render_pass_batch(ctx, &batch, pass, &int)` **once** with every tile that still
-needs that pass. It also owns `GroupCache`, the CPU backend's per-group reference orbits. The
+needs that pass. The
 compute thread runs one generation per requested view and abandons it when a newer view
 arrives (the interrupt is checked between chunks of work).
 

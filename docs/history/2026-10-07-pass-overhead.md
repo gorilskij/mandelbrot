@@ -58,3 +58,23 @@ the backend starts, then a provisional reference orbit (356 ms) and the wait for
 search (325 ms). The 1.6 s is `group_list`: a bigfloat reference orbit per group of tiles,
 sequential, which only the CPU backend uses (`TileItem::refs`); the GPU backend never reads
 them ([backlog](../backlog.md)).
+
+**The group orbits moved into the CPU backend** (the owner: "that needs to change"). Apart from
+them the CPU backend was already dormant while the GPU ran (`Cpu` was a stateless unit
+struct). Now `Cpu` owns the `GroupCache` and builds a pass's group lists itself; `TileItem` is
+just the tile, and `run_generation` no longer computes anything per group. The moved code is
+unchanged. Checked by hand: Escape to the CPU backend renders all 7 passes (Firefox; its pass
+0 now includes the group orbits, 1.3 s at the default view). Browsers, two runs each after:
+
+| | before | after |
+|---|---|---|
+| 1e-54: total, Chrome / Firefox | 5305 / 6220 ms | 4477, 4784 / 5085, 5322 ms |
+| 1e-54: pass 0, Chrome / Firefox | 2341 / 2448 ms | 1353, 1448 / 1443, 1364 ms |
+| 2⁻³⁰⁵: total, Chrome / Firefox | 2824 / 3316 ms | 1839, 1942 / 2415, 2259 ms |
+| 2⁻³⁰⁵: pass 0, Chrome / Firefox | 1833 / 1918 ms | 869, 944 / 869, 898 ms |
+
+The default view, 3 runs each: native 829, 843, 820 ms; Firefox 1294, 1339, 1356; Chrome 895,
+883, 891 (before: 916, 827, 818 / 1483, 1257, 1353 / 922, 891, 928): unchanged, one group
+orbit of 2048 iterations having been cheap. Native hard views were not measured (opening a view
+natively needs a paste). What is left of pass 0 on the hard views: the provisional reference
+orbit and the wait for the nucleus search, which now overlap (678 and 617 ms on the 1e-54 view).
