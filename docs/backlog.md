@@ -36,13 +36,15 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
    (store the message in an atomic slot, wake the receiver without blocking) and an
    atomic-flag interrupter check.
 
-8. **Firefox computes slowly per pixel (web)**, found 2026-10-07 while fixing its late
-   readbacks ([web build](reference/web-build.md#firefox-reads-back-late)): 40–1200 ns/px
-   against Chrome's ~40 ns/px on the same passes, varying between runs. Unexplained.
-   Suspects: the time includes Firefox's copies of the seed and output buffers through its
-   GPU process (we create four buffers per dispatch), or slower shader code. `timestamp-query`
-   (Firefox 155+ has it) would separate GPU time from the rest. Also, optionally: fit
-   time = a + b·n and size chunks from b, so a fixed delay can never shrink chunks again.
+8. **Chunks in Firefox are mostly waiting (web)**, found 2026-10-07 with GPU timestamps
+   ([web build](reference/web-build.md#firefox-reads-back-late)): the GPU work is 26–40 ns/px
+   (Chrome 23–26), but submit → readback is 170–490 ns/px (Chrome ~45), because the nudge
+   starts at an estimate made from past submit → readback times, which then cannot fall.
+   (Earlier the same day this was read as Firefox computing 4–25× slower; it is not.)
+   Options, to talk through: size chunks from the GPU timestamps where the adapter has them
+   (Firefox 155+, Chrome), so the estimate is the real GPU time and the nudge starts when the
+   GPU should be done; where it has none, start nudging at a fraction of the estimate so it can
+   fall. Optionally also fit time = a + b·n.
 9. **The page swallows browser shortcuts and the context menu (web)**, reported 2026-10-07: in
    Firefox/Zen, right-click does nothing and Cmd-L (and likely other browser shortcuts) don't
    work over the canvas. Probably winit's web default `prevent_default = true` (canvas set up

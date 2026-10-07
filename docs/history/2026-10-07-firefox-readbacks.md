@@ -43,6 +43,24 @@ compilation, estimated from the initial 1e-4 ms/px) gets up to ~130 nudges once.
   break chunk timing ([GPU backend](../reference/gpu-backend.md)).
 - *Raising the chunk floor on the web*: blunt, and lengthens interrupts.
 
-**Found along the way:** with readbacks fixed, Firefox's GPU time per pixel is still 4–25×
-Chrome's on the same passes, varying between runs ([backlog](../backlog.md)). Also that the
-canvas swallows browser shortcuts and the context menu (winit's `prevent_default`).
+**Found along the way:** the canvas swallows browser shortcuts and the context menu (winit's
+`prevent_default`); Firefox shows the P3 canvas as sRGB (its WebGPU has no `colorSpace`).
+
+**Correction, later that day: GPU timestamps.** With the nudge, submit → readback per pixel
+was still 4–25× Chrome's, first read as Firefox computing slowly. Timestamps per dispatch
+(`TIMESTAMP_QUERY`, both browsers have it) say otherwise; default view, two runs each:
+
+| passes 2–6 | Firefox 157 | Chrome 154 |
+|---|---|---|
+| GPU work (timestamps) | 26–40 ns/px | 23–26 ns/px |
+| submit → readback | 170–490 ns/px | 36–115 ns/px |
+| `prep` (buffers, encoding) | 3–23 ms per pass | 2–12 ms per pass |
+
+So the GPU is busy only ~10 % of a Firefox chunk. The cause is the nudge's own design: it
+starts at an estimate taken from past submit → readback times, so a Firefox result (which
+arrives only on a submit or the 100 ms timer) almost never comes earlier than estimated, and the
+estimate never falls to the real cost. The earlier fixed-delay analysis assumed the delay was
+counted from the GPU finishing, not from the estimate. Next step in the [backlog](../backlog.md).
+Research found no report of Firefox computing slower per pixel; the one similar report
+([wgpu#9199](https://github.com/gfx-rs/wgpu/issues/9199), "20× slower on Firefox") was the
+100 ms poll again.

@@ -352,6 +352,9 @@ pub struct GpuState {
     /// `max_storage_buffer_binding_size`; dispatches are chunked to stay under
     /// it (the delta buffer is the largest binding).
     max_binding: usize,
+    /// DIAG: a begin/end timestamp pair written by every dispatch, when the
+    /// device has `TIMESTAMP_QUERY`.
+    timestamps:  Option<wgpu::QuerySet>,
     /// Best reference found so far, reused across passes and nearby views.
     reference:   Mutex<Option<Arc<Reference>>>,
     /// (centre, radius, iterations) of the last view whose centre-seeded
@@ -385,10 +388,16 @@ impl GpuState {
                 .await
                 .expect("no GPU adapter found");
 
+            // DIAG: GPU timestamps per dispatch, where the adapter has them.
+            let ts_feature = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
             let (device, queue) = adapter
-                .request_device(&wgpu::DeviceDescriptor::default())
+                .request_device(&wgpu::DeviceDescriptor { required_features: ts_feature, ..Default::default() })
                 .await
                 .expect("failed to create GPU device");
+            let timestamps = (!ts_feature.is_empty()).then(|| device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("dispatch_timestamps"), ty: wgpu::QueryType::Timestamp, count: 2,
+            }));
+            log::info!("[diag gpu] timestamp queries: {}", if timestamps.is_some() { "yes" } else { "no" }); // DIAG
 
             let max_binding = device.limits().max_storage_buffer_binding_size as usize;
 
@@ -428,7 +437,7 @@ impl GpuState {
             let pipeline_fe = make_pipeline("perturbation_fe", shader_source(SHADER_FE_BODY));
 
             GpuState {
-                device, queue, pipeline, pipeline_fe, bgl, max_binding,
+                device, queue, pipeline, pipeline_fe, bgl, max_binding, timestamps,
                 reference: Mutex::new(None),
                 failed_search: Mutex::new(None),
                 failed_glitch_search: Mutex::new(None),
@@ -750,6 +759,7 @@ impl GpuState {
 
         let device = &self.device;
         let queue  = &self.queue;
+        let t_prep = web_time::Instant::now(); // DIAG
 
         let groups     = n.div_ceil(64);
         let gx         = groups.min(65535);
@@ -786,9 +796,11 @@ impl GpuState {
             contents: &vec![0xFFu8; output_size as usize],
             usage:    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
+        // DIAG: the dispatch's two timestamps go after the results.
+        let ts_size = if self.timestamps.is_some() { 16 } else { 0 };
         let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label:              None,
-            size:               output_size,
+            size:               output_size + ts_size,
             usage:              wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -807,18 +819,33 @@ impl GpuState {
 
         let mut enc = device.create_command_encoder(&Default::default());
         {
-            let mut pass = enc.begin_compute_pass(&Default::default());
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: self.timestamps.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
+                    query_set: qs, beginning_of_pass_write_index: Some(0), end_of_pass_write_index: Some(1),
+                }),
+            });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(gx, gy, 1);
         }
         enc.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
+        if let Some(qs) = &self.timestamps { // DIAG
+            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None, size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            enc.resolve_query_set(qs, 0..2, &resolve, 0);
+            enc.copy_buffer_to_buffer(&resolve, 0, &staging_buf, output_size, 16);
+        }
         let t_submit = web_time::Instant::now(); // DIAG
         let index = queue.submit([enc.finish()]);
         let (signal, mapped) = crate::platform::signal();
         staging_buf.slice(..).map_async(wgpu::MapMode::Read, move |_| signal.fire());
         let expected = std::time::Duration::from_secs_f64(*self.ms_per_px.lock() * n_pixels as f64 / 1e3);
-        Some(InFlight { staging: staging_buf, index, mapped, expected, n: n_pixels, t_submit })
+        let prep_ms = (t_submit - t_prep).as_secs_f64() * 1e3; // DIAG
+        Some(InFlight { staging: staging_buf, index, mapped, expected, n: n_pixels, t_submit, prep_ms })
     }
 
     /// Wait for one submitted dispatch (only that one: later submissions
@@ -835,14 +862,20 @@ impl GpuState {
         #[cfg(not(target_arch = "wasm32"))]
         let nudges = 0;
         (&mut f.mapped).await;
-        log::info!( // DIAG
-            "[diag gpu] dispatch {} px done {:.1} ms after submit (expected {:.1}), {nudges} nudges",
-            f.n, f.t_submit.elapsed().as_secs_f64() * 1e3, f.expected.as_secs_f64() * 1e3,
-        );
+        let done_ms = f.t_submit.elapsed().as_secs_f64() * 1e3; // DIAG
         let staging_buf = f.staging;
         let slice = staging_buf.slice(..);
         let data = slice.get_mapped_range().expect("staging buffer mapped");
-        let results: Vec<u32> = data
+        let gpu_ms = (data.len() > f.n * 4).then(|| { // DIAG
+            let t = data[f.n * 4..].as_chunks::<8>().0.iter().map(|b| u64::from_le_bytes(*b)).collect::<Vec<_>>();
+            t[1].saturating_sub(t[0]) as f64 * self.queue.get_timestamp_period() as f64 / 1e6
+        });
+        log::info!( // DIAG
+            "[diag gpu] dispatch {} px done {done_ms:.1} ms after submit (expected {:.1}), {nudges} nudges, prep {:.1} ms, gpu {}",
+            f.n, f.expected.as_secs_f64() * 1e3, f.prep_ms,
+            gpu_ms.map_or("n/a".into(), |g| format!("{g:.2} ms")),
+        );
+        let results: Vec<u32> = data[..f.n * 4]
             .as_chunks::<4>().0.iter()
             .map(|b| u32::from_le_bytes(*b))
             .collect();
@@ -904,6 +937,7 @@ struct InFlight {
     expected: std::time::Duration,
     n:        usize,
     t_submit: web_time::Instant, // DIAG
+    prep_ms:  f64,               // DIAG: buffer creation and encoding before the submit
 }
 
 /// A chunk submitted with `submit_offsets`: its seeds and reference are

@@ -91,9 +91,12 @@ time and the nudges per dispatch. Measured 2026-10-07 (M2 Pro, default view, all
 | before | ~10k px/s, chunks at the 1024 px floor at ~100 ms each; pass 2 after 40 s | 1.71–1.74 s |
 | with the nudge | 6.5–11.4 s, chunks up to ~650k px at ~30 ms, ~1 nudge each | 1.75–1.80 s, ~0 nudges after the first chunk |
 
-**Firefox's GPU work is also slower per pixel**, apart from the readbacks: with the nudge,
-40–1200 ns/px against Chrome's ~40 ns/px on the same passes, varying between runs.
-Not yet explained ([backlog](../backlog.md)).
+**The nudge still leaves Firefox waiting ~90 % of each chunk.** GPU timestamps (2026-10-07,
+passes 2–6 of the default view) put the GPU work at 26–40 ns/px in Firefox against
+23–26 ns/px in Chrome, but submit → readback at 170–490 ns/px against ~45. The nudge starts
+only at the estimated time, and the estimate is the last chunks' submit → readback time, so in
+Firefox a result rarely arrives earlier than estimated and the estimate cannot fall to the
+real cost ([backlog](../backlog.md)).
 
 ## Checked so far
 

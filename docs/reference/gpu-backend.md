@@ -69,6 +69,12 @@ later one by f32 rounding in a few pixels (1 of 15000 at 2⁻³⁰⁵).
 - **Waiting for a readback on the web** (`wait`): past the chunk's estimated time
   (`ms_per_px` × pixels, kept in `InFlight::expected`), `firefox_nudge` submits an empty
   command buffer every 4 ms until the result arrives. Natively `wait` blocks in `device.poll`.
+  Known flaw: since the estimate comes from past submit → readback times, Firefox's results
+  arrive no earlier than estimated and the estimate never falls ([backlog](../backlog.md)).
+- **Diagnostics per dispatch** (the `[diag gpu] dispatch` line): submit → readback time, the
+  estimate, nudges, `prep` (buffer creation and encoding before the submit) and, where the
+  adapter has `TIMESTAMP_QUERY` (requested when available), `gpu`: the compute pass's own
+  time from a begin/end timestamp pair, resolved into the staging buffer after the results.
 - **Per chunk:** dispatch → glitch rounds (up to `MAX_GLITCH_PASSES` = 8, each against a
   better reference) → residual exact resolve on the CPU (`calculate_orbit` + `check_orbit`,
   in parallel, interruptible) → store → finish every tile whose pixels are all stored → bump
