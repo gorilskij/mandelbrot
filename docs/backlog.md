@@ -51,12 +51,17 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
 
 10. **Colours differ in Firefox (web)**, reported 2026-10-07: Firefox's WebGPU canvas has no
     `colorSpace`, so our Display P3 values are shown as sRGB: duller
-    ([web build](reference/web-build.md#how-it-runs)). Options, to talk through: accept it;
-    or detect the missing support and convert P3 → sRGB in the compositor's shader there
-    (same colours wherever sRGB can show them, clipped beyond). Other canvases in Firefox 157:
+    ([web build](reference/web-build.md#how-it-runs)). Firefox has no wide gamut anywhere
+    yet: on macOS it tags its windows sRGB by default (`gfx.color_management.native_srgb`),
+    so even CSS `color(display-p3 …)` is clipped to sRGB; Mozilla's wide-gamut work
+    ([bug 1626624](https://bugzilla.mozilla.org/show_bug.cgi?id=1626624)) has no date. The
+    usual practice (three.js, for one): colour in a working space, convert to the output space
+    in the final shader, and request `display-p3` only where `getConfiguration()` reports it
+    (some add `matchMedia("(color-gamut: p3)")`). For us: detect the missing support and
+    convert P3 → sRGB in the compositor's shader (linearise, 3×3 matrix, clip, re-encode):
+    the same colours as Chrome wherever sRGB can show them. Other canvases in Firefox 157:
     2D ignores `colorSpace: "display-p3"`; WebGL2 accepts `drawingBufferColorSpace =
-    "display-p3"` (whether it then shows P3 is unchecked), but would need a separate WebGL
-    output path.
+    "display-p3"` (unchecked whether it shows P3; moot while the window is sRGB).
 
 ## Maintenance
 
