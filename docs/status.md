@@ -34,9 +34,9 @@ GPU timestamps (merged 2026-10-07, [history](history/2026-10-07-firefox-readback
 
 ## Tests
 
-`cargo test` (2026-10-03, M2 Pro): **35 passed, 16 ignored** (the GPU tests) in the crate, 2 + 2
+`cargo test` (2026-10-07, M2 Pro): **35 passed, 16 ignored** (the GPU tests) in the crate, 2 + 2
 in the benchmark files, and the docs check. `cargo test --release -- --ignored` (the GPU
-tests and measurements): **16 passed**, 3.5 min (2026-10-03).
+tests and measurements): **16 passed**, 3.4 min (2026-10-07).
 
 ## Uncommitted work
 
