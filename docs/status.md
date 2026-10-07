@@ -1,7 +1,7 @@
 # Status
 
 The living "where are we" page. Update it whenever any of this changes. Dates are absolute.
-Last updated: **2026-10-03**.
+Last updated: **2026-10-07**.
 
 ## In one paragraph
 
@@ -27,6 +27,7 @@ a Cloudflare Worker; before that `games.gorilskij.com/mandelbrot/` on Pages). Op
 | branch | state (2026-10-03) |
 |---|---|
 | `master` | the working branch and GitHub's default; everything merged |
+| `firefox-nudge` | the Firefox readback workaround (2026-10-07), awaiting the owner's check |
 | `test-website`, `pub-website` | deploy branches ([deploy](how-to/deploy.md)) |
 | `bla`, `fix-glitches`, `gpu-recolour`, `interior-fix`, `palette-scroll`, `s-ceiling`, `wasm`, `better-gpu-v2`, `colors`, `continuous-generation`, `delta_performance`, `implement-deltas`, `performance`, `ref_orbit_list_prepend` | merged feature branches, kept as pointers |
 | `deltas` (13 commits), `scaled_precision` (7), `f128` (4), `blur` (2), `better-gpu-v1`, `change-z`, `ill-fated`, `ref_orbit_list`, `simd` (1 each) | **unmerged** experiments, 2025-01 – 2026-06 (e.g. `simd` "BROKEN - WIP", `scaled_precision` "this was not to be") |

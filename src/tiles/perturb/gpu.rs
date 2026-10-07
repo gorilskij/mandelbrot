@@ -817,19 +817,27 @@ impl GpuState {
         let index = queue.submit([enc.finish()]);
         let (signal, mapped) = crate::platform::signal();
         staging_buf.slice(..).map_async(wgpu::MapMode::Read, move |_| signal.fire());
-        Some(InFlight { staging: staging_buf, index, mapped, n: n_pixels, t_submit })
+        let expected = std::time::Duration::from_secs_f64(*self.ms_per_px.lock() * n_pixels as f64 / 1e3);
+        Some(InFlight { staging: staging_buf, index, mapped, expected, n: n_pixels, t_submit })
     }
 
     /// Wait for one submitted dispatch (only that one: later submissions
     /// keep the GPU busy meanwhile) and read back its results. Natively
     /// this blocks on the device (the mapping callback fires inside the
     /// poll); on the web it yields until the browser has mapped the buffer.
-    async fn wait(&self, f: InFlight) -> Vec<u32> {
+    async fn wait(&self, mut f: InFlight) -> Vec<u32> {
         #[cfg(not(target_arch = "wasm32"))]
         self.device.poll(wgpu::PollType::Wait { submission_index: Some(f.index), timeout: None }).unwrap();
-        f.mapped.await;
+        #[cfg(target_arch = "wasm32")]
+        let nudges = super::firefox_nudge::wait(
+            &self.device, &self.queue, &mut f.mapped, f.expected.saturating_sub(f.t_submit.elapsed()),
+        ).await;
+        #[cfg(not(target_arch = "wasm32"))]
+        let nudges = 0;
+        (&mut f.mapped).await;
         log::info!( // DIAG
-            "[diag gpu] dispatch {} px done {:.1} ms after submit", f.n, f.t_submit.elapsed().as_secs_f64() * 1e3,
+            "[diag gpu] dispatch {} px done {:.1} ms after submit (expected {:.1}), {nudges} nudges",
+            f.n, f.t_submit.elapsed().as_secs_f64() * 1e3, f.expected.as_secs_f64() * 1e3,
         );
         let staging_buf = f.staging;
         let slice = staging_buf.slice(..);
@@ -890,6 +898,10 @@ struct InFlight {
     index:    wgpu::SubmissionIndex,
     /// fires once the staging buffer is mapped
     mapped:   crate::platform::Fired,
+    /// estimated GPU time (from `ms_per_px`), after which the web build
+    /// nudges the device (`firefox_nudge`)
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    expected: std::time::Duration,
     n:        usize,
     t_submit: web_time::Instant, // DIAG
 }

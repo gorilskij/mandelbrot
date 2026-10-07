@@ -63,6 +63,12 @@ later one by f32 rounding in a few pixels (1 of 15000 at 2⁻³⁰⁵).
   `TARGET_CHUNK_MS` = 30 ms: a `PROBE_CHUNK_PX` = 2048 probe first, then sized from the last
   chunk's measured ms per pixel, floor `MIN_CHUNK_PX` = 1024 (each dispatch costs ~0.8 ms
   fixed). The interrupt is checked between chunks; in-flight GPU work cannot be cancelled.
+  A chunk's measured time is submit → readback, so anything that delays readbacks counts as
+  cost per pixel: a fixed delay a settles chunks at b·n = 30 ms − a, and at a ≥ 30 ms they
+  collapse to the floor (Firefox's, [web build](web-build.md#firefox-reads-back-late)).
+- **Waiting for a readback on the web** (`wait`): past the chunk's estimated time
+  (`ms_per_px` × pixels, kept in `InFlight::expected`), `firefox_nudge` submits an empty
+  command buffer every 4 ms until the result arrives. Natively `wait` blocks in `device.poll`.
 - **Per chunk:** dispatch → glitch rounds (up to `MAX_GLITCH_PASSES` = 8, each against a
   better reference) → residual exact resolve on the CPU (`calculate_orbit` + `check_orbit`,
   in parallel, interruptible) → store → finish every tile whose pixels are all stored → bump

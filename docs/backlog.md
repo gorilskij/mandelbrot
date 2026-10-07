@@ -36,24 +36,13 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
    (store the message in an atomic slot, wake the receiver without blocking) and an
    atomic-flag interrupter check.
 
-8. **Slow on Firefox (web)**, reported 2026-10-07. Measured in Zen (Firefox) that day: chunks
-   stuck at the 1024 px floor, each taking ~100 ms from submit to readback, for cheap pixels
-   (escaped by iteration 51, so the computation itself takes about a millisecond). Cause:
-   Firefox's GPU process polls for finished GPU work on a 100 ms timer, and the other trigger is
-   a `queue.submit` on the same device
-   ([web build](reference/web-build.md#firefox-reads-back-late)). With one chunk in flight,
-   `record_chunk` counts that delay as cost per pixel, so `chunk_len` shrinks to `MIN_CHUNK_PX`
-   and the GPU mostly idles: about 10k px/s. Candidate fixes, to talk through:
-   - submit an empty command buffer every few ms while a readback is pending (the known
-     workaround; removable once Firefox fixes its bug);
-   - fit time = a + b·n and size chunks from b only;
-   - keep several chunks in flight (each submit then also delivers earlier results).
-   Agreed 2026-10-07: the workaround stays quarantined (one marked place, easy to strip
-   when Firefox is fixed). Sizing with it: a fixed delay a per chunk settles chunks at
-   b·n = TARGET_CHUNK_MS − a (n_next = 30·n/(b·n + a)), so it only collapses to the floor when
-   a ≥ 30 ms; a nudge every ~4 ms (also the browsers' clamp on nested timers) costs ~10%.
-   Exact alternative: `timestamp-query` for real GPU time (Firefox 155 has it), optional with
-   a fallback.
+8. **Firefox computes slowly per pixel (web)**, found 2026-10-07 while fixing its late
+   readbacks ([web build](reference/web-build.md#firefox-reads-back-late)): 40–1200 ns/px
+   against Chrome's ~40 ns/px on the same passes, varying between runs. Unexplained.
+   Suspects: the time includes Firefox's copies of the seed and output buffers through its
+   GPU process (we create four buffers per dispatch), or slower shader code. `timestamp-query`
+   (Firefox 155+ has it) would separate GPU time from the rest. Also, optionally: fit
+   time = a + b·n and size chunks from b, so a fixed delay can never shrink chunks again.
 9. **The page swallows browser shortcuts and the context menu (web)**, reported 2026-10-07: in
    Firefox/Zen, right-click does nothing and Cmd-L (and likely other browser shortcuts) don't
    work over the canvas. Probably winit's web default `prevent_default = true` (canvas set up
@@ -64,6 +53,9 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
 
 - **Move the pinned nightly forward** now and then ([update the toolchain](how-to/update-the-toolchain.md));
   `+atomics` is being phased out, so a newer one may need changes to the web build.
+- **Remove the Firefox readback workaround** (`firefox_nudge.rs`) once Firefox ships
+  [bug 1870699](https://bugzilla.mozilla.org/show_bug.cgi?id=1870699)
+  ([pitfalls](reference/pitfalls.md#the-web)).
 - **Publish `waker_interrupter`** (e.g. on crates.io) and depend on a version instead of the
   git repo (`Cargo.toml` TODO).
 - **Check deep zoom in a browser**: the floatexp pipeline, BLA and the nucleus search at depth

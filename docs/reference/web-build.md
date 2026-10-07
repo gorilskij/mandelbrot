@@ -72,12 +72,25 @@ Firefox's GPU process (as of Firefox 155, 2026-10) learns that GPU work has fini
 from a timer that polls every 100 ms, or when the same device gets a `queue.submit`. Every
 `mapAsync` and `onSubmittedWorkDone` therefore resolves up to 100 ms late, however little the
 work computes: measured in Zen on 2026-10-07 as ~100 ms per 1024 px chunk of cheap pixels.
-Submitting an empty command buffer while waiting delivers the result at the next submit
-(another site measured 100 ms → 21 ms with one every 20 ms). Submits on another device (the
-compositor's) do not help. Mozilla's fix (a polling thread that waits only while work is in
-flight) is
+Submitting an empty command buffer while waiting delivers the result at the next submit.
+Submits on another device (the compositor's) do not help. Mozilla's fix (a polling thread that
+waits only while work is in flight) is
 [bug 1870699](https://bugzilla.mozilla.org/show_bug.cgi?id=1870699), open as of 2026-09-24.
-Chunk sizing does not account for this yet ([backlog](../backlog.md)).
+
+**The workaround** (`src/tiles/perturb/firefox_nudge.rs`, web only): once a readback is late,
+past the chunk's estimated GPU time, submit an empty command buffer on the compute device
+every 4 ms until it arrives. No browser check: where readbacks arrive on time (Chrome, and
+Firefox once fixed) it rarely fires. The `[diag gpu] dispatch` log line shows the expected
+time and the nudges per dispatch. Measured 2026-10-07 (M2 Pro, default view, all 7 passes):
+
+| | Firefox 157 | Chrome |
+|---|---|---|
+| before | ~10k px/s, chunks at the 1024 px floor at ~100 ms each; pass 2 after 40 s | 1.71–1.74 s |
+| with the nudge | 6.5–11.4 s, chunks up to ~650k px at ~30 ms, ~1 nudge each | 1.75–1.80 s, ~0 nudges after the first chunk |
+
+**Firefox's GPU work is also slower per pixel**, apart from the readbacks: with the nudge,
+40–1200 ns/px against Chrome's ~40 ns/px on the same passes, varying between runs.
+Not yet explained ([backlog](../backlog.md)).
 
 ## Checked so far
 
