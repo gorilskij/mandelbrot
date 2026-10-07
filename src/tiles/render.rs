@@ -118,6 +118,8 @@ pub async fn run_generation(
     let generation = store.begin_generation();
     let view       = coords.view.inner;
     let depth      = store.depth_for_view(view);
+    let t_gen      = web_time::Instant::now(); // DIAG
+    let t_first    = *FIRST_GENERATION.get_or_init(|| t_gen); // DIAG
 
     info!(
         "render generation {generation}: depth {depth}, iterations {iterations} \
@@ -192,10 +194,18 @@ pub async fn run_generation(
         backend.render_pass_batch(&ctx, &batch, pass, &int).await;
         store.bump_progress();
         log_tile_colors(generation, pass, &tiles);
+        info!( // DIAG
+            "[diag tiles] gen {generation} pass {pass} done: {:.0} ms into the generation, {:.0} ms since the first",
+            t_gen.elapsed().as_secs_f64() * 1e3, t_first.elapsed().as_secs_f64() * 1e3,
+        );
     }
 
     store.bump_progress();
 }
+
+/// DIAG: when the first generation started, for timing a whole render
+/// across the generations that restart it.
+static FIRST_GENERATION: std::sync::OnceLock<web_time::Instant> = std::sync::OnceLock::new();
 
 /// DIAG: backend-agnostic check of what actually landed in the visible tiles
 /// after a pass: how many pixels are set, how many distinct colours, and the
