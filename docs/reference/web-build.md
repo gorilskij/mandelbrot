@@ -45,6 +45,9 @@ and serving: [build the web version](../how-to/build-the-web-version.md); deploy
   views and reproducing them in a headless browser).
 - **Memory:** wasm32 has 4 GiB; the tile store has a 3 GiB ceiling there, which can lower s
   ([tiles](tiles.md#the-memory-budget)).
+- **Firefox reads back slowly**: a `mapAsync` resolves ~100 ms after submit however little
+  the dispatch computes (measured in Zen, 2026-10-07), against ~30 ms chunks elsewhere. Chunk
+  sizing does not account for it yet ([backlog](../backlog.md)).
 - Logging goes to the browser console; clipboard copy/paste goes through the browser (which
   may ask for permission); some browser shortcuts win over the app's (Cmd-W; pinch or
   Ctrl-wheel zoom where the browser keeps the wheel event).

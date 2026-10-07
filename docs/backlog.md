@@ -36,13 +36,14 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
    (store the message in an atomic slot, wake the receiver without blocking) and an
    atomic-flag interrupter check.
 
-8. **Slow on Firefox (web)**, reported 2026-10-07 — hypothesis, not yet measured. Firefox's
-   `mapAsync` probably has a large fixed delay (WebGPU runs in a separate GPU process). With one
-   chunk in flight, `record_chunk` counts that delay as cost per pixel, so `chunk_len` shrinks
-   to `MIN_CHUNK_PX` and the GPU mostly idles. Check: compare the
-   `[diag gpu] dispatch N px done X ms after submit` lines in Firefox and in Chrome. Candidate
-   fixes: fit time = a + b·n and size chunks from b; two chunks in flight; a higher floor on
-   the web only.
+8. **Slow on Firefox (web)**, reported 2026-10-07. Measured in Zen (Firefox) that day: chunks
+   stuck at the 1024 px floor, each taking ~100 ms from submit to readback, for cheap pixels
+   (escaped by iteration 51, so the computation itself takes about a millisecond). Firefox's
+   `mapAsync` has a fixed ~100 ms delay (WebGPU runs in a separate GPU process). With one chunk
+   in flight, `record_chunk` counts that delay as cost per pixel, so `chunk_len` shrinks to
+   `MIN_CHUNK_PX` and the GPU mostly idles: about 10k px/s. Candidate fixes: fit
+   time = a + b·n and size chunks from b only; keep several chunks in flight so the delay
+   overlaps GPU work; a higher floor on the web only.
 9. **The page swallows browser shortcuts and the context menu (web)**, reported 2026-10-07: in
    Firefox/Zen, right-click does nothing and Cmd-L (and likely other browser shortcuts) don't
    work over the canvas. Probably winit's web default `prevent_default = true` (canvas set up
