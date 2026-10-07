@@ -36,6 +36,19 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
    (store the message in an atomic slot, wake the receiver without blocking) and an
    atomic-flag interrupter check.
 
+8. **Slow on Firefox (web)**, reported 2026-10-07 — hypothesis, not yet measured. Firefox's
+   `mapAsync` probably has a large fixed delay (WebGPU runs in a separate GPU process). With one
+   chunk in flight, `record_chunk` counts that delay as cost per pixel, so `chunk_len` shrinks
+   to `MIN_CHUNK_PX` and the GPU mostly idles. Check: compare the
+   `[diag gpu] dispatch N px done X ms after submit` lines in Firefox and in Chrome. Candidate
+   fixes: fit time = a + b·n and size chunks from b; two chunks in flight; a higher floor on
+   the web only.
+9. **The page swallows browser shortcuts and the context menu (web)**, reported 2026-10-07: in
+   Firefox/Zen, right-click does nothing and Cmd-L (and likely other browser shortcuts) don't
+   work over the canvas. Probably winit's web default `prevent_default = true` (canvas set up
+   in `src/main.rs`, `with_canvas`), which cancels every keyboard, wheel and context-menu
+   event. Possible fix: `with_prevent_default(false)` and cancel only the events the app uses.
+
 ## Maintenance
 
 - **Move the pinned nightly forward** now and then ([update the toolchain](how-to/update-the-toolchain.md));
