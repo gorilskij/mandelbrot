@@ -53,9 +53,11 @@ A = A_y·A_x,   B = A_y·B_x + B_y,   R = min(R_x, (R_y − |B_x|·max|δ₀|) /
 single step: R = ε·|2X|
 ```
 
-- The table is a binary tree over the reference orbit (level k: blocks at multiples of 2^k,
-  stored at index `2^(L+1) − 2^(L+1−k)`), built on the CPU in a small floatexp (`Fx`) per pass
-  and reference, with R bounded by the pass's max |δ₀| (`bla.rs`).
+- The table is a binary tree over the reference orbit (level k: blocks at multiples of 2^k),
+  built on the CPU in a small floatexp (`Fx`) per pass and reference, with R bounded by the
+  pass's max |δ₀| (`bla.rs`). Uploaded without level 0 (single steps, which the shaders never
+  jump; half the table): level k ≥ 1 at index `2^L − 2^(L+1−k)` (`gpu_index`), so an orbit of
+  n steps takes (2^⌈log2 n⌉ − 1) × 32 bytes.
 - The shaders search upwards from level 1 (a block's R ≤ its first half's, so the first invalid
   level ends the search; level 0 is never used), with exponential back-off after failed
   searches (reset on a jump or rebase); they apply the block in floatexp, add log|A|² to the

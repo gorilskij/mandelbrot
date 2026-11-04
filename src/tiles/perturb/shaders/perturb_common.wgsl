@@ -26,8 +26,9 @@ struct BlaHit {
 
 // The longest valid block starting at reference index m for |δ| = 2^log2_d,
 // at most max_len steps. Level k holds the blocks starting at multiples of
-// 2^k, at index 2^(L+1) − 2^(L+1−k) + (m >> k). Level 0 (one step) is not
-// used: a plain iteration costs the same and also checks escape/rebase.
+// 2^k, at index 2^L − 2^(L+1−k) + (m >> k) (BlaTable::gpu_index). Level 0
+// (one step) is not in the table: a plain iteration costs the same and also
+// checks escape/rebase.
 //
 // Searched upwards: a block's radius is at most its first half's (R =
 // min(R_x, …)), so once a level is invalid no longer block at m can be
@@ -44,7 +45,7 @@ fn bla_find(m : u32, log2_d_raw : f32, max_len : u32) -> BlaHit {
     loop {
         let len = 1u << k;
         if (k >= uniforms.bla_levels || (m & (len - 1u)) != 0u || len > max_len) { break; }
-        let idx = (2u << size_log2) - (2u << (size_log2 - k)) + (m >> k);
+        let idx = (1u << size_log2) - (2u << (size_log2 - k)) + (m >> k);
         if (!(log2_d < bla_table[idx].log2_r)) { break; }
         best = BlaHit(idx, len);
         k = k + 1u;

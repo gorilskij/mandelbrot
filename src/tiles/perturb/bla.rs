@@ -18,8 +18,11 @@
 //! The table is a binary tree over the reference orbit: level k holds the
 //! blocks of 2^k steps starting at multiples of 2^k, stored level after
 //! level, each level padded to `2^(L−k)` entries (`L = log2_size`), so level
-//! k starts at `2^(L+1) − 2^(L+1−k)`. A block that would need a reference
-//! value past the end of the orbit is invalid.
+//! k starts at `2^(L+1) − 2^(L+1−k)` (`index`). Level 0 (single steps) is
+//! only built from: the shaders never jump one step (a plain iteration costs
+//! the same), so the uploaded entries start at level 1, at `index − 2^L`
+//! (`gpu_index`; half the table). A block that would need a reference value
+//! past the end of the orbit is invalid.
 //!
 //! Coefficients overflow even f64 (A is a product of thousands of factors)
 //! and radii underflow it at depth, so they are built in a small floatexp
@@ -181,15 +184,29 @@ pub struct BlaTable {
     /// Number of levels (level k: blocks of 2^k steps).
     pub levels:    u32,
     pub entries:   Vec<BlaEntry>,
-    /// The same blocks on the CPU, for tests.
+    /// All blocks, level 0 included, on the CPU, for tests (`index`).
     #[cfg(test)]
     pub blocks:    Vec<Block>,
 }
 
 impl BlaTable {
-    /// Index of block `i` of level `k`.
+    /// Index of block `i` of level `k` among all blocks (level 0 included).
     pub fn index(log2_size: u32, k: u32, i: usize) -> usize {
         (1usize << (log2_size + 1)) - (1usize << (log2_size + 1 - k)) + i
+    }
+
+    /// Index of block `i` of level `k ≥ 1` in `entries` (no level 0); must
+    /// match `bla_find` in perturb_common.wgsl.
+    pub fn gpu_index(log2_size: u32, k: u32, i: usize) -> usize {
+        Self::index(log2_size, k, i) - (1usize << log2_size)
+    }
+
+    /// Bytes of `entries` for an orbit of `len` values (as `build` makes
+    /// them), to check against the device's buffer limits beforehand.
+    pub fn entries_bytes(len: usize) -> u64 {
+        let steps = len.saturating_sub(1).max(1);
+        let size = steps.next_power_of_two() as u64;
+        (size - 1).max(1) * std::mem::size_of::<BlaEntry>() as u64
     }
 
     /// Build from the reference orbit `x` (X_0, X_1, …) for pixels with
@@ -209,10 +226,14 @@ impl BlaTable {
                 blocks[Self::index(log2_size, k, i)] = lo.then(hi, log2_dc);
             }
         }
+        // Without level 0; one invalid entry if that leaves none (a one-step
+        // orbit), as buffers cannot be empty.
+        let mut entries: Vec<BlaEntry> = blocks[1usize << log2_size..].iter().map(|b| b.to_gpu()).collect();
+        if entries.is_empty() { entries.push(Block::invalid().to_gpu()); }
         BlaTable {
             log2_size,
             levels,
-            entries: blocks.iter().map(|b| b.to_gpu()).collect(),
+            entries,
             #[cfg(test)]
             blocks,
         }
@@ -267,8 +288,17 @@ mod tests {
         assert_eq!(BlaTable::index(3, 1, 0), 8);
         assert_eq!(BlaTable::index(3, 2, 0), 12);
         assert_eq!(BlaTable::index(3, 3, 0), 14);
+        assert_eq!(BlaTable::gpu_index(3, 1, 0), 0);
+        assert_eq!(BlaTable::gpu_index(3, 3, 0), 6);
         let t = BlaTable::build(&[Complex { re: 0.1, im: 0.2 }; 9], -40.0);
-        assert_eq!((t.log2_size, t.levels, t.entries.len()), (3, 4, 15));
+        assert_eq!((t.log2_size, t.levels, t.entries.len()), (3, 4, 7));
+        assert_eq!(BlaTable::entries_bytes(9), 7 * 32);
+        for k in 1..t.levels {
+            for i in 0..(1usize << (t.log2_size - k)) {
+                let (b, e) = (t.blocks[BlaTable::index(3, k, i)].to_gpu(), t.entries[BlaTable::gpu_index(3, k, i)]);
+                assert_eq!(bytemuck::bytes_of(&b), bytemuck::bytes_of(&e), "level {k} block {i}");
+            }
+        }
     }
 
     /// A block jump equals stepping, within the error the radius promises:
