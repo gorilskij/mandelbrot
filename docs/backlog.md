@@ -78,6 +78,20 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
     interruptible (check every ~1000 iterations); keep a finished orbit instead of dropping it;
     and later extend the centre's orbit on ↑ instead of recomputing it from scratch.
 
+    **Natively the freeze is a crash** (reproduced 2026-11-04 by driving the native app with
+    System Events, the owner taking it on to 8M and zooming): the compute thread panicked on a
+    fatal wgpu validation error, `Device::create_buffer: Buffer size 536870880 is greater than
+    the maximum buffer size (268435456)`, i.e. the BLA table of an 8M-iteration orbit
+    ((2²⁴ − 1) × 32 bytes). With the compute thread dead nothing renders again, whatever the
+    iterations. The device is created with wgpu's default limits (256 MiB per buffer, 128 MiB
+    per storage binding); the M2 Pro's adapter allows 4 GiB for both. Sizes by iterations:
+    BLA table ≈ 2 × 2^⌈log2 n⌉ × 32 B (level 0, unused by the shaders, is half of it), the
+    floatexp orbit n × 16 B; so 2M is the last count that fits the defaults (table 134217696 B
+    of a 134217728 binding). To talk through: request the adapter's limits; check sizes against
+    `device.limits()` before creating buffers and degrade (cap the BLA table, refuse or cap the
+    iterations, visibly) instead of panicking; drop the unused level 0 from the table; and make
+    a dead compute thread visible instead of a silent freeze.
+
 ## Maintenance
 
 - **Move the pinned nightly forward** now and then ([update the toolchain](how-to/update-the-toolchain.md));
