@@ -92,9 +92,10 @@ struct App {
     // Mandelbrot state.
     coords: CoordinatesBox,
     iterations: usize,
-    /// Palette phases, scrolled with Alt (hue) / Ctrl (lightness).
+    /// Palette phases, moved by Cmd-scroll and the drift.
     palette: PalettePhase,
-    /// `[` / `]` drifting the palette phases continuously.
+    /// Which phases the colour controls move (Alt / Ctrl / Shift taps) and
+    /// the drift speed (`[` / `]`, `0`).
     drift: palette_drift::PaletteDrift,
     /// When `drift` last advanced (None while it is at rest).
     drift_tick: Option<Instant>,
@@ -123,8 +124,8 @@ struct App {
     pasted: std::rc::Rc<std::cell::RefCell<Option<String>>>,
 }
 
-/// Palette phase shift per mouse-wheel notch, in turns: hue (Alt-scroll)
-/// and lightness (Ctrl-scroll).
+/// Palette phase shift per mouse-wheel notch with Cmd held, in turns: hue
+/// and lightness (whichever are toggled on, see `palette_drift`).
 const HUE_TURNS_PER_NOTCH:   f64 = 1.0 / 128.0;
 const LIGHT_TURNS_PER_NOTCH: f64 = 1.0 / 32.0;
 
@@ -313,9 +314,9 @@ impl App {
         let (cx, cy) = self.center_coord_f64();
         platform::show_debug(window, &format!(
             "Mandelbrot | {} | view {:.4e} (2^{:.2}) | depth {} upp 2^{} | s {} | iters {} \
-             | palette hue {:.3} light {:.3} | centre {:.17}, {:.17} | mods [{}] | key {}",
+             | palette hue {:.3} light {:.3} {} | centre {:.17}, {:.17} | mods [{}] | key {}",
             pipe, view, view.log2(), depth, upp, ratio, self.iterations,
-            self.palette.hue, self.palette.light, cx, cy,
+            self.palette.hue, self.palette.light, self.drift.describe(), cx, cy,
             mod_symbols(self.modifiers), self.key_debug,
         ));
     }
@@ -442,13 +443,14 @@ impl ApplicationHandler for App {
     ) {
         if let WindowEvent::KeyboardInput { event: ref e, .. } = event {
             self.note_key(e);
-            // Held brackets drift the palette (advanced in about_to_wait).
-            if self.drift.key(e) && e.state == ElementState::Pressed {
-                self.note_action("palette drift");
+            // Palette toggles (modifier taps) and the drift speed (advanced
+            // in about_to_wait).
+            if let Some(action) = self.drift.key(e, self.modifiers) {
+                self.note_action(&action);
             }
         }
-        if let WindowEvent::Focused(false) = event {
-            self.drift.release_all();
+        if let WindowEvent::Focused(false) | WindowEvent::MouseInput { .. } = event {
+            self.drift.cancel_tap();
         }
         match event {
             WindowEvent::CloseRequested => {
@@ -528,22 +530,14 @@ impl ApplicationHandler for App {
                 };
                 let shift = self.modifiers.shift_key();
                 let notches = if shift && y == 0.0 { x } else { y };
-                // Alt (Option) and Ctrl work alike on every platform, natively
-                // and in browsers (Cmd's counterpart on Windows, the Windows
-                // key, opens the Start menu when released).
-                let (hue, light) = (self.modifiers.alt_key(), self.modifiers.control_key());
-                if hue || light {
-                    // Recolour only: shift the palette phases (both with Alt
-                    // and Ctrl held), nothing is recomputed.
-                    if hue {
-                        self.palette.hue = (self.palette.hue + notches * HUE_TURNS_PER_NOTCH).rem_euclid(1.0);
-                    }
-                    if light {
-                        // Shift inverts the lightness direction.
-                        let dir = if shift { -1.0 } else { 1.0 };
-                        self.palette.light = (self.palette.light + dir * notches * LIGHT_TURNS_PER_NOTCH).rem_euclid(1.0);
-                    }
-                    if let Some(rt) = &self.render_thread {
+                self.drift.cancel_tap();
+                if self.modifiers.super_key() {
+                    // Cmd: recolour only, the toggled phases (hue / lightness,
+                    // the latter inverted when toggled so); nothing is
+                    // recomputed.
+                    if self.drift.scroll(notches * HUE_TURNS_PER_NOTCH, notches * LIGHT_TURNS_PER_NOTCH, &mut self.palette)
+                        && let Some(rt) = &self.render_thread
+                    {
                         rt.set_palette(self.palette);
                     }
                 } else if !self.mouse_left_down {
@@ -684,7 +678,7 @@ impl ApplicationHandler for App {
             let now = Instant::now();
             let dt = self.drift_tick.map_or(Duration::ZERO, |t| (now - t).min(Duration::from_millis(100)));
             self.drift_tick = Some(now);
-            if self.drift.tick(dt, self.modifiers, &mut self.palette)
+            if self.drift.tick(dt, &mut self.palette)
                 && let Some(rt) = &self.render_thread
             {
                 rt.set_palette(self.palette);

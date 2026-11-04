@@ -20,8 +20,9 @@ opens on the whole set, computed on the **GPU** (the title says `f32`).
   (a white progress bar fills at the bottom while a view computes).
 - **↑** a few times: more iterations; the boundary fills in without recomputing what was
   already right.
-- **Alt-scroll** / **Ctrl-scroll**: shift the palette's hue / lightness — instant, nothing is
-  recomputed.
+- **Cmd-scroll**: shift the palette's hue — instant, nothing is recomputed. Tap **Ctrl** to
+  move the lightness too (tap **Alt** for the hue, **Shift** to invert the lightness); **`]`**
+  sets them drifting, faster with each press, **`0`** stops.
 - **→**: sampling ratio s = 1.5, 2, …: smoother edges, more work.
 - **Escape**: switch to the CPU backend (title `cpu`) and back.
 

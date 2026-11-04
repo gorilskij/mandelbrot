@@ -12,7 +12,7 @@ wrangler.toml                 the Cloudflare Workers (prod and [env.test])
 bugs.txt                      views the owner found odd (Cmd-C strings), kept for reference
 src/
   main.rs                     the app: window, input, view state, title/log diagnostics
-  palette_drift.rs            `[` / `]` drifting the palette phases (eased speed per phase)
+  palette_drift.rs            the palette controls: phase toggles (modifier taps), drift speed (`[` `]` `{` `}` `0`), Cmd-scroll
   platform.rs                 everything that differs between native and web
   rendering.rs                calculate_orbit, check_orbit, check_divergence_delta, Pf, the palette (val_to_color, PalettePhase)
   gpu_compositor.rs           draws tiles to the screen (its own wgpu device)

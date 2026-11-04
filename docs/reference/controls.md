@@ -7,10 +7,11 @@ and on the web.
 |---|---|
 | scroll | zoom around the cursor: each wheel notch (a trackpad's ~10 px) scales the view by 2.5 %, at most 20 % per event (`apply_scroll_zoom`). The zoomed view shows at once, interpolated from existing tiles, and is recomputed around the cursor. Zooming out and panning stop at the start-up view's rectangle (`bounds`, `clamp_to_bounds`) |
 | drag (left button) | pan |
-| **Alt**-scroll | shift the palette's **hue** phase, 1/128 turn per notch (recolours only, nothing recomputed) |
-| **Ctrl**-scroll | shift the palette's **lightness** phase, 1/32 turn per notch; **Shift** inverts the direction |
-| Alt+Ctrl-scroll | both |
-| **Alt / Ctrl / Alt+Ctrl** + hold **`[` / `]`** | drift the same palette phases continuously, backwards / forwards: hue 1/8 turn per second, lightness 1/2 turn per second; **Shift** inverts the lightness direction (so with Alt+Ctrl+Shift hue and lightness go opposite ways). The speed eases in and out (time constant 0.15 s); both brackets held, or the modifier released, brakes to a stop. Without Alt or Ctrl the brackets do nothing (`palette_drift.rs`) |
+| **Cmd**-scroll | shift the palette phases that are toggled on (below): hue 1/128 turn per notch, lightness 1/32 (recolours only, nothing recomputed) |
+| tap **Alt** / **Ctrl** / **Shift** | toggle which phases the colour controls move: Alt the **hue**, Ctrl the **lightness**, Shift **inverts** the lightness direction (so hue and lightness can go opposite ways). A tap is the modifier pressed and released with no other key, click or scroll in between; in a chord (Shift+`]`, Ctrl-C) it toggles nothing. At start: hue on, lightness off, not inverted |
+| **`]` / `[`** | set the palette **drift** speed one step up / down the ladder …, −1.5×, −1×, 0, +1×, +1.5×, … (×1.5 per step; below 1× is 0); the toggled phases then move continuously, at 1× hue 1/8 turn per second and lightness 1/2. A step past 20× is refused (the top is 1.5⁷ ≈ 17.1×). The speed eases to each new value (time constant 0.15 s) |
+| **`}` / `{`** (Shift+`]` / `[`) | the same by half-steps (×√1.5) |
+| **`0`** | drift speed 0 (eases to a stop) |
 | **↑ / ↓** | double / halve the maximum iterations (default 2048). Tiles are retargeted, not recomputed ([tiles](tiles.md#iterations-not-colours)) |
 | **← / →** | sampling ratio s down / up by 0.5, within 0.5…4 (default 1) ([compositor](compositor.md#sampling-and-antialiasing)). On the web, lowered if the view would not fit the memory ceiling (shown `s 4 (→3)`) |
 | **Space** | reset: drop every tile, the CPU reference lists, and the GPU backend's cached reference, failed-search memory and running search (`Perturbator::reset`), so it searches for a nucleus afresh |
@@ -23,8 +24,10 @@ and on the web.
 - **Letter shortcuts match the character** the layout produces (`logical_key`), not the key
   position: the owner types Dvorak, so Cmd-C is the key labelled C on any layout. Space,
   Escape and the arrows use the physical key.
-- Alt rather than Cmd for the hue, so it works on every platform (the Windows key opens the
-  Start menu); the owner unbound their own Alt binding for it.
+- **Cmd-scroll** for colour (the owner's call, 2026-11-04; Alt and Ctrl are toggles now). On
+  Windows and Linux Cmd is the Windows/Super key, which opens the Start menu or the launcher
+  when released: there colour scrolling is awkward, not yet addressed.
+- The palette state (drift speed, toggled phases) is in the title: `drift +1.50× hue light⇅`.
 - **On the web**, a view can be opened from the URL: `…/mandelbrot/#<Cmd-C string>` is
   applied like a paste.
 
