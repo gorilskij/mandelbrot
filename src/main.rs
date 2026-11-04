@@ -308,10 +308,17 @@ impl App {
             else if upp < crate::tiles::perturb::gpu::FE_THRESHOLD { "fe" }
             else { "f32" };
         let (cx, cy) = self.center_coord_f64();
+        // A crashed thread (the compute thread, say) stops all rendering:
+        // say so instead of freezing silently.
+        let crashed = platform::crashed_thread()
+            .map_or_else(String::new, |t| format!("⚠ thread '{t}' crashed, see the log | "));
+        // At the GPU's ceiling ↑ is refused: say so for as long as it holds.
+        let max = crate::tiles::perturb::gpu::MAX_ITERATIONS.load(std::sync::atomic::Ordering::Relaxed);
+        let at_max = if self.iterations.saturating_mul(2) > max { " (GPU max)" } else { "" };
         platform::show_debug(window, &format!(
-            "Mandelbrot | {} | view {:.4e} (2^{:.2}) | depth {} upp 2^{} | s {} | iters {} \
+            "{crashed}Mandelbrot | {} | view {:.4e} (2^{:.2}) | depth {} upp 2^{} | s {} | iters {} \
              | palette hue {:.3} light {:.3} | centre {:.17}, {:.17} | mods [{}] | key {}",
-            pipe, view, view.log2(), depth, upp, ratio, self.iterations,
+            pipe, view, view.log2(), depth, upp, ratio, format!("{}{at_max}", self.iterations),
             self.palette.hue, self.palette.light, cx, cy,
             mod_symbols(self.modifiers), self.key_debug,
         ));

@@ -10,7 +10,7 @@ and on the web.
 | **Alt**-scroll | shift the palette's **hue** phase, 1/128 turn per notch (recolours only, nothing recomputed) |
 | **Ctrl**-scroll | shift the palette's **lightness** phase, 1/32 turn per notch; **Shift** inverts the direction |
 | Alt+Ctrl-scroll | both |
-| **↑ / ↓** | double / halve the maximum iterations (default 2048). Tiles are retargeted, not recomputed ([tiles](tiles.md#iterations-not-colours)). ↑ is **refused** when the doubled count would not fit the GPU's buffers (`MAX_ITERATIONS`, logged at start: 2²⁷ on an M2 Pro; the title says `refused: GPU limit`); a pasted count above it is capped, with a warning in the log |
+| **↑ / ↓** | double / halve the maximum iterations (default 2048). Tiles are retargeted, not recomputed ([tiles](tiles.md#iterations-not-colours)). ↑ is **refused** when the doubled count would not fit the GPU's buffers (`MAX_ITERATIONS`, logged at start: 2²⁷ on an M2 Pro; the log warns, and the title shows `iters N (GPU max)` while at the ceiling); a pasted count above it is capped, with a warning in the log |
 | **← / →** | sampling ratio s down / up by 0.5, within 0.5…4 (default 1) ([compositor](compositor.md#sampling-and-antialiasing)). On the web, lowered if the view would not fit the memory ceiling (shown `s 4 (→3)`) |
 | **Space** | reset: drop every tile, the CPU reference lists, and the GPU backend's cached reference, failed-search memory and running search (`Perturbator::reset`), so it searches for a nucleus afresh |
 | **Escape** | switch backend CPU ↔ GPU (and reset). The app **starts on the GPU** |
@@ -33,7 +33,9 @@ Diagnostics (marked `DIAG` in the code) in the window title (natively) or the de
 the top of the page (web): backend / pipeline (`cpu`, `f32`, `fe` = floatexp), view, depth,
 upp (units per pixel), iterations, s (with `→` when lowered, `cache 1.4×` when the cache was
 cut), palette phases, centre (f64: too coarse to navigate back with — use Cmd-C), held
-modifiers, and the last key with what it did.
+modifiers, and the last key with what it did. If a thread panicked (the compute thread, say, which stops all
+rendering), the title starts with `⚠ thread 'compute' crashed, see the log`
+(`platform::crashed_thread`, recorded by a panic hook installed in `init_logging`).
 
 ## Logging
 

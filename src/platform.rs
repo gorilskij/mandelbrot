@@ -126,6 +126,24 @@ pub fn init_logging() {
         console_error_panic_hook::set_once();
         console_log::init_with_level(log::Level::Info).ok();
     }
+    // After the platform's hook is set: record which thread panicked (for the
+    // title), then run it as before.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let name = std::thread::current().name().unwrap_or("unnamed").to_string();
+        let _ = CRASHED.set(name); // the first one
+        previous(info);
+    }));
+}
+
+/// The name of the first thread that panicked, if one did: a dead thread (the
+/// compute thread, say) would otherwise just freeze the view. A `OnceLock`:
+/// reading it never blocks (the browser's main thread must not).
+static CRASHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Which thread panicked first, if any (see `init_logging`).
+pub fn crashed_thread() -> Option<String> {
+    CRASHED.get().cloned()
 }
 
 /// DIAG: writes every log line to both stderr and `gpu.log` (flushed per

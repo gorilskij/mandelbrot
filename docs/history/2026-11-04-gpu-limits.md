@@ -36,3 +36,12 @@ all 7 passes (generation 12: pass 0 5.5 s after the nucleus search's 19.2 s, the
 the log reports the ceiling, 134217728. The refusal itself was not reached (2²⁷ would need
 tens of GiB of RAM for the bigfloat orbit first).
 
+**A crashed thread is visible.** A panic hook (`init_logging`, chained to the platform's)
+records the first panicking thread's name in a `OnceLock` (read without blocking, as the
+browser's main thread must), and the title starts with `⚠ thread 'compute' crashed, see the
+log`. At the ceiling the title shows `iters N (GPU max)` (the refusal's own note is replaced by
+the next key event). Checked natively with two temporary, reverted overrides (a ceiling of
+16384 and a panic at generation 3): the title read `⚠ thread 'compute' crashed, see the log`,
+the fourth ↑ was refused at 32768 with the warning logged, and the title showed
+`iters 16384 (GPU max)`.
+
