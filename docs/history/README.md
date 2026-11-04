@@ -12,6 +12,7 @@ say what is true now; this says how it came to be. Newest last.
 | 2026-10-02 – 03 | [Hosting on Workers, and these docs](2026-10-02-workers-and-docs.md) — `gorilskij.com/mandelbrot/`; `docs/` |
 | 2026-10-07 | [Firefox's late readbacks](2026-10-07-firefox-readbacks.md) — the 100 ms poll, the empty-submit nudge |
 | 2026-10-07 | [The CPU work between passes](2026-10-07-pass-overhead.md) — a diagnostic and a `hypot` per pixel, measured |
+| 2026-11-04 | [Palette drift with `[` and `]`, and toggled modifiers](2026-11-04-bracket-palette.md) — a stepped drift speed, Alt/Ctrl/Shift as toggles, Cmd-scroll for colour |
 
 The notes these entries were drawn from are kept verbatim:
 [working notes as of 2026-10-03](working-notes-2026-10-03.md).

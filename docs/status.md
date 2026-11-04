@@ -29,13 +29,14 @@ for the next optimizations).
 |---|---|
 | `master` | the working branch and GitHub's default; everything merged |
 | `test-website`, `pub-website` | deploy branches ([deploy](how-to/deploy.md)) |
+| `bracket-palette` | palette controls: stepped drift (`[` `]` `{` `}` `0`), modifier toggles, Cmd-scroll (2026-11-04), awaiting the owner's check |
 | `pass-overhead` | the next optimizations ([backlog](backlog.md)) |
 | `firefox-nudge`, `bla`, `fix-glitches`, `gpu-recolour`, `interior-fix`, `palette-scroll`, `s-ceiling`, `wasm`, `better-gpu-v2`, `colors`, `continuous-generation`, `delta_performance`, `implement-deltas`, `performance`, `ref_orbit_list_prepend` | merged feature branches, kept as pointers |
 | `deltas` (13 commits), `scaled_precision` (7), `f128` (4), `blur` (2), `better-gpu-v1`, `change-z`, `ill-fated`, `ref_orbit_list`, `simd` (1 each) | **unmerged** experiments, 2025-01 – 2026-06 (e.g. `simd` "BROKEN - WIP", `scaled_precision` "this was not to be") |
 
 ## Tests
 
-`cargo test` (2026-10-07, M2 Pro): **35 passed, 16 ignored** (the GPU tests) in the crate, 2 + 2
+`cargo test` (2026-11-04, M2 Pro): **38 passed, 16 ignored** (the GPU tests) in the crate, 2 + 2
 in the benchmark files, and the docs check. `cargo test --release -- --ignored` (the GPU
 tests and measurements): **16 passed**, 3.4 min (2026-10-07).
 
