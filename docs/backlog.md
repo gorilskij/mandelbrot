@@ -64,6 +64,20 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
     2D ignores `colorSpace: "display-p3"`; WebGL2 accepts `drawingBufferColorSpace =
     "display-p3"` (unchecked whether it shows P3; moot while the window is sRGB).
 
+12. **The compute thread freezes on high iteration counts at depth (web)**, reported and
+    reproduced 2026-11-04 (the owner's view
+    `-1.962806555174172021647685634946390363305838735256282905291651714974987176375827993719362540520237766236256620207342904928884631910114733336316139198285994494676342,-0.000000000000000000000000000000000000000000000000000000000000000042947767643305669232409999573568561541838549727767369923819385466754528090057229022273635574237949421053083159607872189092473578715032590666576834883379438641201333430314048627108223712715224994612480066102195044615076323678|2.346020205021077e-134/4096`,
+    2⁻⁴⁴⁴, then ↑ to 1M): in Chrome the view stayed frozen ~39 s after the last ↑ (progress
+    bar stuck; ↓, zoom and pan wait too). Natively the same sequence finishes, 1M in 7.5 s.
+    Cause: at each new iteration count `initial_reference` computes the view centre's orbit
+    (`Reference::new` → `calculate_orbit`, bigfloat) on the compute thread, and that computation
+    checks no interrupt: 17.5 s at 1M in wasm (2.3 s natively). Then, interrupted by a newer
+    message, it **discarded** the finished orbit (`if int.interrupted() { return None; }`) and
+    the next generation computed it again (11.9 s); the nucleus search took 28 s meanwhile (in
+    the background, but pass 0 waits for it). To talk through: make `calculate_orbit`
+    interruptible (check every ~1000 iterations); keep a finished orbit instead of dropping it;
+    and later extend the centre's orbit on ↑ instead of recomputing it from scratch.
+
 ## Maintenance
 
 - **Move the pinned nightly forward** now and then ([update the toolchain](how-to/update-the-toolchain.md));
