@@ -10,6 +10,7 @@ and on the web.
 | **Alt**-scroll | shift the palette's **hue** phase, 1/128 turn per notch (recolours only, nothing recomputed) |
 | **Ctrl**-scroll | shift the palette's **lightness** phase, 1/32 turn per notch; **Shift** inverts the direction |
 | Alt+Ctrl-scroll | both |
+| **Alt / Ctrl / Alt+Ctrl** + hold **`[` / `]`** | drift the same palette phases continuously, backwards / forwards: hue 1/8 turn per second, lightness 1/2 turn per second; **Shift** inverts the lightness direction (so with Alt+Ctrl+Shift hue and lightness go opposite ways). The speed eases in and out (time constant 0.15 s); both brackets held, or the modifier released, brakes to a stop. Without Alt or Ctrl the brackets do nothing (`palette_drift.rs`) |
 | **↑ / ↓** | double / halve the maximum iterations (default 2048). Tiles are retargeted, not recomputed ([tiles](tiles.md#iterations-not-colours)) |
 | **← / →** | sampling ratio s down / up by 0.5, within 0.5…4 (default 1) ([compositor](compositor.md#sampling-and-antialiasing)). On the web, lowered if the view would not fit the memory ceiling (shown `s 4 (→3)`) |
 | **Space** | reset: drop every tile, the CPU reference lists, and the GPU backend's cached reference, failed-search memory and running search (`Perturbator::reset`), so it searches for a nucleus afresh |

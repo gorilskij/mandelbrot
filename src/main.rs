@@ -4,6 +4,7 @@
 
 mod drawing;
 mod gpu_compositor;
+mod palette_drift;
 mod platform;
 mod rendering;
 mod support;
@@ -93,6 +94,10 @@ struct App {
     iterations: usize,
     /// Palette phases, scrolled with Alt (hue) / Ctrl (lightness).
     palette: PalettePhase,
+    /// `[` / `]` drifting the palette phases continuously.
+    drift: palette_drift::PaletteDrift,
+    /// When `drift` last advanced (None while it is at rest).
+    drift_tick: Option<Instant>,
 
     // Input state.
     cursor_pos: Option<(f64, f64)>,   // physical pixels
@@ -142,6 +147,8 @@ impl App {
             },
             iterations: 2048,
             palette: PalettePhase::default(),
+            drift: Default::default(),
+            drift_tick: None,
             cursor_pos: None,
             mouse_left_down: false,
             dragging: None,
@@ -435,6 +442,13 @@ impl ApplicationHandler for App {
     ) {
         if let WindowEvent::KeyboardInput { event: ref e, .. } = event {
             self.note_key(e);
+            // Held brackets drift the palette (advanced in about_to_wait).
+            if self.drift.key(e) && e.state == ElementState::Pressed {
+                self.note_action("palette drift");
+            }
+        }
+        if let WindowEvent::Focused(false) = event {
+            self.drift.release_all();
         }
         match event {
             WindowEvent::CloseRequested => {
@@ -664,6 +678,21 @@ impl ApplicationHandler for App {
 
         self.bump_precision();
 
+        // Palette drift from held brackets: advance by the time since the
+        // last tick (capped, so a stall does not jump the colours).
+        if self.drift.active() {
+            let now = Instant::now();
+            let dt = self.drift_tick.map_or(Duration::ZERO, |t| (now - t).min(Duration::from_millis(100)));
+            self.drift_tick = Some(now);
+            if self.drift.tick(dt, self.modifiers, &mut self.palette)
+                && let Some(rt) = &self.render_thread
+            {
+                rt.set_palette(self.palette);
+            }
+        } else {
+            self.drift_tick = None;
+        }
+
         // Apply pending drawer update.
         let update = std::mem::take(&mut self.pending_update);
         let cursor = self.cursor_usize();
@@ -695,12 +724,14 @@ impl ApplicationHandler for App {
         // relies on a follow-up about_to_wait after the gesture stops, so while
         // a scroll is in flight we schedule a short wakeup; otherwise we sleep
         // until the next OS event.
-        if self.scrolling {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(150),
-            ));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+        // While the palette drifts, tick at ~60 Hz.
+        let wake = [
+            self.scrolling.then_some(Duration::from_millis(150)),
+            self.drift.active().then_some(Duration::from_millis(16)),
+        ].into_iter().flatten().min();
+        match wake {
+            Some(d) => event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + d)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 }
