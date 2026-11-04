@@ -27,3 +27,12 @@ plain iteration), so level 0 is only needed to build level 1; the upload now sta
 (`BlaTable::gpu_index`, `bla_find`'s index − 2^L). Checked: the layout test compares every
 uploaded entry with its block; all 16 GPU tests pass (BLA against plain iteration, the
 pipeline against exact orbits).
+
+**The adapter's limits, and ↑ refused past them.** The device now requests `adapter.limits()`;
+`max_iterations` (unit-tested against wgpu's defaults, 2²², and 4 GiB, 2²⁷) bounds ↑ (refused,
+with a title note and a warning, the owner's call over degrading the table) and pastes (capped).
+Checked by driving the native app with System Events up to 8M at the owner's view: no panic,
+all 7 passes (generation 12: pass 0 5.5 s after the nucleus search's 19.2 s, the whole 16.7 s);
+the log reports the ceiling, 134217728. The refusal itself was not reached (2²⁷ would need
+tens of GiB of RAM for the bigfloat orbit first).
+

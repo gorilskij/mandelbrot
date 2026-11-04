@@ -48,6 +48,18 @@ After a paste at 2⁻³¹⁴…2⁻³²⁶: first pixels after ~110 ms instead o
 the view's own nucleus. A generation begun on the provisional reference can differ from a
 later one by f32 rounding in a few pixels (1 of 15000 at 2⁻³⁰⁵).
 
+## The device and its limits
+
+The compute device requests the **adapter's limits**, not wgpu's defaults (256 MiB per buffer,
+128 MiB per storage binding), under which an 8M-iteration orbit's BLA table did not fit and
+the validation error killed the compute thread ([history](../history/2026-11-04-gpu-limits.md)).
+`max_iterations` gives the largest count whose floatexp orbit ((n + 1) × 16 bytes) and BLA table
+(`BlaTable::entries_bytes`, (2^⌈log2 n⌉ − 1) × 32 bytes) each fit one buffer bound whole; it is
+published as `MAX_ITERATIONS` when the device is made, and ↑ and pastes stop there. M2 Pro:
+4 GiB for both limits, so 2²⁷ = 134217728 iterations (the table's power of two binds first; at
+wgpu's defaults it would be 2²² = 4194304). At such counts the CPU side (the bigfloat orbit,
+the BLA table's build) needs several GiB of RAM too; that is not limited.
+
 ## Dispatching
 
 - **`GpuRef`**: a reference prepared for dispatching — its orbit and BLA table uploaded once

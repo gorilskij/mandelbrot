@@ -197,6 +197,7 @@ impl BlaTable {
 
     /// Index of block `i` of level `k ≥ 1` in `entries` (no level 0); must
     /// match `bla_find` in perturb_common.wgsl.
+    #[cfg(test)]
     pub fn gpu_index(log2_size: u32, k: u32, i: usize) -> usize {
         Self::index(log2_size, k, i) - (1usize << log2_size)
     }

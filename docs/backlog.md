@@ -90,7 +90,10 @@ the owner's decision. **Talk an item through with the owner before coding it.** 
     of a 134217728 binding). To talk through: request the adapter's limits; check sizes against
     `device.limits()` before creating buffers and degrade (cap the BLA table, refuse or cap the
     iterations, visibly) instead of panicking; drop the unused level 0 from the table; and make
-    a dead compute thread visible instead of a silent freeze.
+    a dead compute thread visible instead of a silent freeze. **Fixed** on `gpu-limits`
+    (2026-11-04: level 0 dropped, the adapter's limits, ↑ refused past them;
+    [history](history/2026-11-04-gpu-limits.md)); still open here: the uninterruptible,
+    discarded centre orbit above.
 
 ## Maintenance
 

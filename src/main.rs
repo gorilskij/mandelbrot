@@ -159,7 +159,11 @@ impl App {
     fn apply_paste(&mut self, contents: &str) {
         if let Ok(new_data) = contents.parse::<ClipBoardData>() {
             self.coords = new_data.coords.into_owned();
-            self.iterations = new_data.iterations;
+            let max = crate::tiles::perturb::gpu::MAX_ITERATIONS.load(std::sync::atomic::Ordering::Relaxed);
+            self.iterations = new_data.iterations.min(max);
+            if new_data.iterations > max {
+                warn!("paste: {} iterations would not fit the GPU's buffers, capped at {max}", new_data.iterations);
+            }
             info!("PASTED: {}", contents.trim());
             self.pending_update = self.pending_update.max(UpdateKind::AroundCenter);
             self.note_action("pasted");
@@ -585,11 +589,18 @@ impl ApplicationHandler for App {
                         self.note_action(if now_gpu { "backend GPU" } else { "backend CPU" });
                     }
                     KeyCode::ArrowUp => {
-                        self.iterations *= 2;
-                        info!("iterations: {}", self.iterations);
-                        self.pending_update =
-                            self.pending_update.max(UpdateKind::AroundCursor);
-                        self.note_action("iterations ×2");
+                        // Refused past what the GPU's buffers hold.
+                        let max = crate::tiles::perturb::gpu::MAX_ITERATIONS.load(std::sync::atomic::Ordering::Relaxed);
+                        if self.iterations * 2 > max {
+                            warn!("iterations: {} would not fit the GPU's buffers (at most {max})", self.iterations * 2);
+                            self.note_action(&format!("iterations ×2 refused: GPU limit {max}"));
+                        } else {
+                            self.iterations *= 2;
+                            info!("iterations: {}", self.iterations);
+                            self.pending_update =
+                                self.pending_update.max(UpdateKind::AroundCursor);
+                            self.note_action("iterations ×2");
+                        }
                     }
                     KeyCode::ArrowDown if self.iterations > 1 => {
                         self.iterations /= 2;
