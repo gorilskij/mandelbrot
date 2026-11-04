@@ -94,6 +94,23 @@ const TARGET_CHUNK_MS: f64 = 30.0;
 /// pixels near a deep minibrot cost ~0.06 ms each, so even this is ~60 ms).
 const MIN_CHUNK_PX: usize = 1024;
 
+/// Largest iteration count whose reference buffers fit the compute device
+/// (set when it is made; ↑ and pastes stop there).
+pub static MAX_ITERATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Largest iteration count n whose reference buffers fit `limits`: the
+/// floatexp orbit (n + 1 values of 16 bytes, the larger of the two orbit
+/// layouts) and the BLA table (`BlaTable::entries_bytes`), each one buffer
+/// bound whole.
+fn max_iterations(limits: &wgpu::Limits) -> usize {
+    let lim = limits.max_buffer_size.min(limits.max_storage_buffer_binding_size);
+    let orbit = (lim / size_of::<[f32; 4]>() as u64).saturating_sub(1);
+    // The table grows in powers of two: the largest power of two that fits.
+    let mut bla = 1u64;
+    while BlaTable::entries_bytes(2 * bla as usize + 1) <= lim { bla *= 2; }
+    orbit.min(bla).min(usize::MAX as u64) as usize
+}
+
 /// Fixed cost per dispatch added to its GPU timestamps when sizing chunks
 /// (the overhead MIN_CHUNK_PX speaks of): timestamps cover only the compute
 /// pass, so a chunk of cheap pixels would otherwise make the next one huge.
@@ -403,10 +420,20 @@ impl GpuState {
             // GPU timestamps per dispatch, where the adapter has them: chunk
             // sizing uses them instead of submit → readback times.
             let ts_feature = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+            // The adapter's limits, not wgpu's defaults (256 MiB per buffer,
+            // 128 MiB per binding: an 8M-iteration orbit's BLA table did not
+            // fit, a fatal error); the M2 Pro allows 4 GiB.
             let (device, queue) = adapter
-                .request_device(&wgpu::DeviceDescriptor { required_features: ts_feature, ..Default::default() })
+                .request_device(&wgpu::DeviceDescriptor {
+                    required_features: ts_feature,
+                    required_limits:   adapter.limits(),
+                    ..Default::default()
+                })
                 .await
                 .expect("failed to create GPU device");
+            let max_iters = max_iterations(&device.limits());
+            MAX_ITERATIONS.store(max_iters, Ordering::Relaxed);
+            log::info!("[diag gpu] buffer limits allow up to {max_iters} iterations");
             let timestamps = (!ts_feature.is_empty()).then(|| device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("dispatch_timestamps"), ty: wgpu::QueryType::Timestamp, count: 2 * TIMESTAMP_SLOTS,
             }));
@@ -607,6 +634,7 @@ impl GpuState {
     }
 
     fn prepare_with(&self, r: &Reference, log2_dc: f64, upp: i64, bla: bool) -> GpuRef {
+        debug_assert!(r.iterations <= max_iterations(&self.device.limits()), "iterations past the buffer limits");
         let table = if bla { BlaTable::build(&r.orbit64, log2_dc) } else { BlaTable::disabled() };
         let buf = |bytes: &[u8]| self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None, contents: bytes, usage: wgpu::BufferUsages::STORAGE,
@@ -1915,6 +1943,23 @@ mod tests {
             }).collect());
         }
         out
+    }
+
+    /// The iteration ceiling from the buffer limits: wgpu's defaults (the
+    /// BLA table's 128 MiB binding) and this M2 Pro's 4 GiB; the orbit and
+    /// table of the ceiling fit, those of its double do not.
+    #[test]
+    fn max_iterations_from_limits() {
+        let d = wgpu::Limits::default();
+        assert_eq!(max_iterations(&d), 1 << 22);
+        let big = wgpu::Limits { max_buffer_size: u32::MAX as u64, max_storage_buffer_binding_size: u32::MAX as u64 - 3, ..d.clone() };
+        assert_eq!(max_iterations(&big), 1 << 27);
+        for l in [&d, &big] {
+            let lim = l.max_buffer_size.min(l.max_storage_buffer_binding_size);
+            let n = max_iterations(l);
+            assert!(BlaTable::entries_bytes(n + 1) <= lim && (n as u64 + 1) * 16 <= lim);
+            assert!(BlaTable::entries_bytes(2 * n + 1) > lim);
+        }
     }
 
     /// Regression for the second view reported on 2026-09-23 (2^-305, 32768

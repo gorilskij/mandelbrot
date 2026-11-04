@@ -167,7 +167,11 @@ impl App {
     fn apply_paste(&mut self, contents: &str) {
         if let Ok(new_data) = contents.parse::<ClipBoardData>() {
             self.coords = new_data.coords.into_owned();
-            self.iterations = new_data.iterations;
+            let max = crate::tiles::perturb::gpu::MAX_ITERATIONS.load(std::sync::atomic::Ordering::Relaxed);
+            self.iterations = new_data.iterations.min(max);
+            if new_data.iterations > max {
+                warn!("paste: {} iterations would not fit the GPU's buffers, capped at {max}", new_data.iterations);
+            }
             info!("PASTED: {}", contents.trim());
             self.pending_update = self.pending_update.max(UpdateKind::AroundCenter);
             self.note_action("pasted");
@@ -312,10 +316,17 @@ impl App {
             else if upp < crate::tiles::perturb::gpu::FE_THRESHOLD { "fe" }
             else { "f32" };
         let (cx, cy) = self.center_coord_f64();
+        // A crashed thread (the compute thread, say) stops all rendering:
+        // say so instead of freezing silently.
+        let crashed = platform::crashed_thread()
+            .map_or_else(String::new, |t| format!("⚠ thread '{t}' crashed, see the log | "));
+        // At the GPU's ceiling ↑ is refused: say so for as long as it holds.
+        let max = crate::tiles::perturb::gpu::MAX_ITERATIONS.load(std::sync::atomic::Ordering::Relaxed);
+        let at_max = if self.iterations.saturating_mul(2) > max { " (GPU max)" } else { "" };
         platform::show_debug(window, &format!(
-            "Mandelbrot | {} | view {:.4e} (2^{:.2}) | depth {} upp 2^{} | s {} | iters {} \
+            "{crashed}Mandelbrot | {} | view {:.4e} (2^{:.2}) | depth {} upp 2^{} | s {} | iters {} \
              | palette hue {:.3} light {:.3} {} | centre {:.17}, {:.17} | mods [{}] | key {}",
-            pipe, view, view.log2(), depth, upp, ratio, self.iterations,
+            pipe, view, view.log2(), depth, upp, ratio, format!("{}{at_max}", self.iterations),
             self.palette.hue, self.palette.light, self.drift.describe(), cx, cy,
             mod_symbols(self.modifiers), self.key_debug,
         ));
@@ -593,11 +604,18 @@ impl ApplicationHandler for App {
                         self.note_action(if now_gpu { "backend GPU" } else { "backend CPU" });
                     }
                     KeyCode::ArrowUp => {
-                        self.iterations *= 2;
-                        info!("iterations: {}", self.iterations);
-                        self.pending_update =
-                            self.pending_update.max(UpdateKind::AroundCursor);
-                        self.note_action("iterations ×2");
+                        // Refused past what the GPU's buffers hold.
+                        let max = crate::tiles::perturb::gpu::MAX_ITERATIONS.load(std::sync::atomic::Ordering::Relaxed);
+                        if self.iterations * 2 > max {
+                            warn!("iterations: {} would not fit the GPU's buffers (at most {max})", self.iterations * 2);
+                            self.note_action(&format!("iterations ×2 refused: GPU limit {max}"));
+                        } else {
+                            self.iterations *= 2;
+                            info!("iterations: {}", self.iterations);
+                            self.pending_update =
+                                self.pending_update.max(UpdateKind::AroundCursor);
+                            self.note_action("iterations ×2");
+                        }
                     }
                     KeyCode::ArrowDown if self.iterations > 1 => {
                         self.iterations /= 2;
